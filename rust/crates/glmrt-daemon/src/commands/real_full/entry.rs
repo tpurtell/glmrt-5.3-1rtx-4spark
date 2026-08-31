@@ -32,13 +32,20 @@ use super::coordinator_kernels::{
     reset_glm_dsa_sparse_mla_transient_state, seal_coordinator_owned_device_buffer_pool,
     with_coordinator_owned_device_buffer_bank, DeviceBf16Output, GLM_DSA_PREFILL_MAX_QUERY_ROWS,
 };
+use super::dflash::{
+    Dflash2BatchedReplayRequest, Dflash2RequestCacheSnapshot, Dflash2RequestEngine,
+    Dflash2RequestState, GLM53_DFLASH2_DRAFT_LAYERS, GLM53_DFLASH2_MAX_DRAFTS,
+    GLM53_DFLASH2_TARGET_CAPTURE_TAPS,
+};
 use super::dspark::{
     dspark_active_max_verify_drafts, dspark_target_hidden_tap_layer_ids,
-    install_qualified_dspark_cost_profile, schedule_dspark_verification_with_minimums,
-    DsparkConfidenceCalibrator, DsparkConfidenceResidual, DsparkDraftPlan,
-    DsparkRequestCacheSnapshot, DsparkRequestEngine, DsparkRequestState, DsparkRuntimeCostModel,
-    DsparkRuntimeCostObservation, DsparkScheduleSearch, DsparkVerificationSchedule,
+    install_qualified_dflash2_cost_profile, install_qualified_dspark_cost_profile,
+    schedule_dspark_verification_with_minimums, DsparkConfidenceCalibrator,
+    DsparkConfidenceResidual, DsparkDraftPlan, DsparkRequestCacheSnapshot, DsparkRequestEngine,
+    DsparkRequestState, DsparkRuntimeCostModel, DsparkRuntimeCostObservation, DsparkScheduleSearch,
+    DsparkSpsProfile, DsparkVerificationSchedule,
 };
+use super::dspark_static::DsparkDraftStep;
 use super::embedding::real_full_embedding_hidden_for_token;
 use super::execution_plan::real_full_execution_plan;
 use super::expert_probe::REAL_NVFP4_PROTOCOL_V2_EXECUTOR;
@@ -76,7 +83,7 @@ use super::scheduler::{
     RealFullSchedulerSparseDispatchTransport, RealFullSchedulerSparseTcpDispatchProbe,
     RealFullSchedulerSparseTcpDispatchWorker,
 };
-use super::sparse_mlp::route::B12X_EXL3_K3_TOPK8_CAPACITY_ROWS;
+use super::sparse_mlp::route::B12X_EXL3_TOPK8_CAPACITY_ROWS;
 use super::types::{
     RealFullCoordinatorResidentPreloadPlan, RealFullSchedulerExecutionDryRun,
     RealFullSchedulerTerminalLmHeadSample, RealGlmFullPreflightReport,
@@ -312,6 +319,10 @@ const REAL_FULL_DSPARK_CONFIDENCE_POLICY_ENV: &str = "GLMRT_REAL_FULL_DSPARK_CON
 const REAL_FULL_DSPARK_FIXED_DRAFTS_ENV: &str = "GLMRT_REAL_FULL_DSPARK_FIXED_DRAFTS";
 const REAL_FULL_DSPARK_PROFILE_AT_STARTUP_ENV: &str = "GLMRT_REAL_FULL_DSPARK_PROFILE_AT_STARTUP";
 const REAL_FULL_DSPARK_PROFILE_SAMPLES_ENV: &str = "GLMRT_REAL_FULL_DSPARK_PROFILE_SAMPLES";
+const REAL_FULL_DFLASH2_ENV: &str = "GLMRT_REAL_FULL_DFLASH2";
+const REAL_FULL_DFLASH2_SNAPSHOT_ENV: &str = "GLMRT_REAL_FULL_DFLASH2_SNAPSHOT";
+const REAL_FULL_DFLASH2_FIXED_DRAFTS_ENV: &str = "GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS";
+const REAL_FULL_DFLASH2_TAIL_CACHE_BYTES_ENV: &str = "GLMRT_REAL_FULL_DFLASH2_TAIL_CACHE_BYTES";
 const REAL_FULL_DSPARK_SPARKINFER_REVISION_ENV: &str = "GLMRT_SPARKINFER_COMMIT";
 const REAL_FULL_DSPARK_COORDINATOR_POWER_LIMIT_WATTS_ENV: &str =
     "GLMRT_COORDINATOR_POWER_LIMIT_WATTS";
@@ -326,6 +337,7 @@ const DEFAULT_REAL_FULL_DSPARK_PROMPT_SWA_CONTEXT_TOKENS: usize = 2 * 1024;
 const REAL_FULL_DSPARK_PAGE_SIZE: usize = 64;
 const REAL_FULL_DSPARK_QUERY_ROWS: usize = 16;
 const REAL_FULL_DSPARK_BF16_KV_BYTES_PER_TOKEN: usize = 81_920;
+const REAL_FULL_DFLASH2_BF16_KV_BYTES_PER_TOKEN: usize = 24_576;
 // Siro emits fifteen proposals. The adaptive policy covers the complete
 // physical M=1..16 range; measured per-width costs decide how many are worth
 // verifying on each cycle.
@@ -392,23 +404,470 @@ struct RealFullSchedulerRequestExecutor {
     engine_commit: String,
 }
 
+enum RealFullDraftEngine {
+    Dspark(DsparkRequestEngine),
+    Dflash2(Dflash2RequestEngine),
+}
+
+enum RealFullDraftRequestState {
+    Dspark(DsparkRequestState),
+    Dflash2(Dflash2RequestState),
+}
+
+enum RealFullDraftCacheSnapshot {
+    Dspark(DsparkRequestCacheSnapshot),
+    Dflash2(Dflash2RequestCacheSnapshot),
+}
+
+impl RealFullDraftRequestState {
+    fn context_tokens(&self) -> usize {
+        match self {
+            Self::Dspark(state) => state.context_tokens(),
+            Self::Dflash2(state) => state.context_tokens(),
+        }
+    }
+}
+
+impl RealFullDraftCacheSnapshot {
+    fn context_tokens(&self) -> usize {
+        match self {
+            Self::Dspark(snapshot) => snapshot.context_tokens,
+            Self::Dflash2(snapshot) => snapshot.context_tokens,
+        }
+    }
+
+    fn cache_context_tokens(&self) -> usize {
+        match self {
+            Self::Dspark(snapshot) => snapshot.cache_context_tokens,
+            Self::Dflash2(snapshot) => snapshot.cache_context_tokens,
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Dspark(snapshot) => snapshot.resident_bytes(),
+            Self::Dflash2(snapshot) => snapshot.resident_bytes(),
+        }
+    }
+}
+
+impl RealFullDraftEngine {
+    fn is_dflash2(&self) -> bool {
+        matches!(self, Self::Dflash2(_))
+    }
+
+    fn checkpoint_revision(&self) -> &'static str {
+        match self {
+            Self::Dspark(engine) => engine.checkpoint_revision(),
+            Self::Dflash2(engine) => engine.checkpoint_revision(),
+        }
+    }
+
+    fn max_verify_drafts(&self) -> usize {
+        match self {
+            Self::Dspark(engine) => engine.max_verify_drafts(),
+            Self::Dflash2(engine) => engine.max_verify_drafts(),
+        }
+    }
+
+    fn target_layer_ids(&self) -> Vec<usize> {
+        match self {
+            Self::Dspark(_) => dspark_target_hidden_tap_layer_ids().to_vec(),
+            Self::Dflash2(engine) => engine.target_layer_ids().to_vec(),
+        }
+    }
+
+    fn allocate_request_state(&mut self) -> Result<RealFullDraftRequestState> {
+        match self {
+            Self::Dspark(engine) => engine
+                .allocate_request_state()
+                .map(RealFullDraftRequestState::Dspark),
+            Self::Dflash2(engine) => engine
+                .allocate_request_state()
+                .map(RealFullDraftRequestState::Dflash2),
+        }
+    }
+
+    fn reset_request_state(&mut self, state: &mut RealFullDraftRequestState) -> Result<()> {
+        match (self, state) {
+            (Self::Dspark(engine), RealFullDraftRequestState::Dspark(state)) => {
+                engine.reset_request_state(state)
+            }
+            (Self::Dflash2(engine), RealFullDraftRequestState::Dflash2(state)) => {
+                engine.reset_request_state(state)
+            }
+            _ => bail!("draft request state does not match its engine"),
+        }
+    }
+
+    fn release_request_state(&mut self, state: RealFullDraftRequestState) {
+        match (self, state) {
+            (Self::Dspark(engine), RealFullDraftRequestState::Dspark(state)) => {
+                engine.release_request_state(state)
+            }
+            (Self::Dflash2(engine), RealFullDraftRequestState::Dflash2(state)) => {
+                engine.release_request_state(state)
+            }
+            _ => debug_assert!(false, "draft request state does not match its engine"),
+        }
+    }
+
+    fn snapshot_request_state(
+        &self,
+        state: &RealFullDraftRequestState,
+    ) -> Result<Option<RealFullDraftCacheSnapshot>> {
+        match (self, state) {
+            (Self::Dspark(engine), RealFullDraftRequestState::Dspark(state)) => engine
+                .snapshot_request_state(state)
+                .map(|snapshot| snapshot.map(RealFullDraftCacheSnapshot::Dspark)),
+            (Self::Dflash2(engine), RealFullDraftRequestState::Dflash2(state)) => engine
+                .snapshot_request_state(state)
+                .map(|snapshot| snapshot.map(RealFullDraftCacheSnapshot::Dflash2)),
+            _ => bail!("draft request state does not match its engine"),
+        }
+    }
+
+    fn snapshot_request_state_at_prefix(
+        &self,
+        state: &RealFullDraftRequestState,
+        prefix_tokens: usize,
+    ) -> Result<Option<RealFullDraftCacheSnapshot>> {
+        match (self, state) {
+            (Self::Dspark(engine), RealFullDraftRequestState::Dspark(state)) => engine
+                .snapshot_request_state_at_prefix(state, prefix_tokens)
+                .map(|snapshot| snapshot.map(RealFullDraftCacheSnapshot::Dspark)),
+            (Self::Dflash2(engine), RealFullDraftRequestState::Dflash2(state)) => engine
+                .snapshot_request_state_at_prefix(state, prefix_tokens)
+                .map(|snapshot| snapshot.map(RealFullDraftCacheSnapshot::Dflash2)),
+            _ => bail!("draft request state does not match its engine"),
+        }
+    }
+
+    fn restore_request_state(
+        &mut self,
+        state: &mut RealFullDraftRequestState,
+        snapshot: &RealFullDraftCacheSnapshot,
+    ) -> Result<()> {
+        match (self, state, snapshot) {
+            (
+                Self::Dspark(engine),
+                RealFullDraftRequestState::Dspark(state),
+                RealFullDraftCacheSnapshot::Dspark(snapshot),
+            ) => engine.restore_request_state(state, snapshot),
+            (
+                Self::Dflash2(engine),
+                RealFullDraftRequestState::Dflash2(state),
+                RealFullDraftCacheSnapshot::Dflash2(snapshot),
+            ) => engine.restore_request_state(state, snapshot),
+            _ => bail!("draft cache snapshot does not match its engine"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_step(
+        &mut self,
+        state: &mut RealFullDraftRequestState,
+        target_hidden_taps: &[DeviceBf16Output],
+        target_row_start: usize,
+        committed_rows: usize,
+        absolute_context_start: Option<usize>,
+        anchor_token: usize,
+    ) -> Result<DsparkDraftStep> {
+        match (self, state) {
+            (Self::Dspark(engine), RealFullDraftRequestState::Dspark(state)) => {
+                let taps: [&DeviceBf16Output; 5] = target_hidden_taps
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|taps: Vec<_>| {
+                        anyhow::anyhow!("dSpark requires 5 target taps, got {}", taps.len())
+                    })?;
+                engine.replay_step(
+                    state,
+                    taps,
+                    target_row_start,
+                    committed_rows,
+                    absolute_context_start,
+                    anchor_token,
+                )
+            }
+            (Self::Dflash2(engine), RealFullDraftRequestState::Dflash2(state)) => {
+                let taps: [&DeviceBf16Output; GLM53_DFLASH2_DRAFT_LAYERS] = target_hidden_taps
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|taps: Vec<_>| {
+                        anyhow::anyhow!(
+                            "DFlash2 requires {GLM53_DFLASH2_DRAFT_LAYERS} target taps, got {}",
+                            taps.len()
+                        )
+                    })?;
+                let step = engine.replay_step(
+                    state,
+                    taps,
+                    target_row_start,
+                    committed_rows,
+                    absolute_context_start,
+                    anchor_token,
+                )?;
+                Ok(dspark_step_from_dflash(step))
+            }
+            _ => bail!("draft request state does not match its engine"),
+        }
+    }
+}
+
+fn dspark_step_from_dflash(step: super::dflash_static::Dflash2DraftStep) -> DsparkDraftStep {
+    DsparkDraftStep {
+        context_tokens: step.context_tokens,
+        committed_rows: step.committed_rows,
+        anchor_token: step.anchor_token,
+        proposal_token_ids: step.proposal_token_ids,
+        conditional_confidence: Vec::new(),
+        update_ms: step.update_ms,
+        suffix_ms: step.suffix_ms,
+        readback_ms: step.readback_ms,
+        total_ms: step.total_ms,
+    }
+}
+
+fn dflash_draft_plan(
+    step: &DsparkDraftStep,
+    target_context_tokens: usize,
+    adaptive: &Dflash2AdaptiveDraftState,
+    sps: Option<&DsparkSpsProfile>,
+) -> Result<DsparkDraftPlan> {
+    let max_drafts = step.proposal_token_ids.len().min(GLM53_DFLASH2_MAX_DRAFTS);
+    anyhow::ensure!(max_drafts > 0, "DFlash2 returned no proposal tokens");
+    if let Some(fixed_drafts) = real_full_dflash2_fixed_drafts()? {
+        let fixed_drafts = fixed_drafts.min(max_drafts);
+        return Ok(DsparkDraftPlan {
+            proposal_token_ids: step.proposal_token_ids[..fixed_drafts].to_vec(),
+            conditional_confidence: Vec::new(),
+            candidate_proposal_token_ids: step.proposal_token_ids[..max_drafts].to_vec(),
+            candidate_conditional_confidence: Vec::new(),
+            candidate_adjusted_confidence: Vec::new(),
+            selected_drafts: fixed_drafts,
+            minimum_drafts: fixed_drafts,
+            target_batch_rows: fixed_drafts + 1,
+            expected_committed_tokens: 0.0,
+            expected_tokens_per_second: 0.0,
+            confidence_logit_bias: 0.0,
+            confidence_context_tokens: target_context_tokens,
+            calibration_eligible: false,
+        });
+    }
+
+    let adjusted_confidence = adaptive.conditional_confidence(max_drafts);
+    let candidate_confidence = adjusted_confidence
+        .iter()
+        .copied()
+        .map(|value| value as f32)
+        .collect::<Vec<_>>();
+    // Seed code-oriented traffic at the already-qualified K5 reference. Four
+    // observed cycles are enough to distinguish its high-survival regime from
+    // the lower-acceptance general blend without overreacting to one framing
+    // miss.
+    let minimum_drafts = if adaptive.cold_start() {
+        DFLASH2_ADAPTIVE_START_DRAFTS.min(max_drafts)
+    } else {
+        0
+    };
+    let (selected_drafts, target_batch_rows, expected_committed_tokens, expected_tokens_per_second) =
+        if let Some(sps) = sps {
+            let schedule = if adaptive.cold_start() {
+                let selected = DFLASH2_ADAPTIVE_START_DRAFTS.min(max_drafts);
+                let mut survival = 1.0;
+                let expected = 1.0
+                    + adjusted_confidence
+                        .iter()
+                        .take(selected)
+                        .map(|confidence| {
+                            survival *= confidence;
+                            survival
+                        })
+                        .sum::<f64>();
+                DsparkVerificationSchedule {
+                    prefix_lengths: vec![selected],
+                    target_batch_rows: selected + 1,
+                    expected_committed_tokens: expected,
+                    expected_tokens_per_second: expected * sps.get(selected + 1)?,
+                }
+            } else {
+                let candidate = schedule_dspark_verification_with_minimums(
+                    std::slice::from_ref(&adjusted_confidence),
+                    &[0],
+                    sps,
+                    DsparkScheduleSearch::GlobalMaximum,
+                )?;
+                let reference_width = DFLASH2_ADAPTIVE_START_DRAFTS.min(max_drafts);
+                let reference_confidence = adjusted_confidence[..reference_width].to_vec();
+                let reference = schedule_dspark_verification_with_minimums(
+                    std::slice::from_ref(&reference_confidence),
+                    std::slice::from_ref(&reference_width),
+                    sps,
+                    DsparkScheduleSearch::GlobalMaximum,
+                )?;
+                if candidate.prefix_lengths[0] != reference_width
+                    && candidate.expected_tokens_per_second
+                        < reference.expected_tokens_per_second * DFLASH2_ADAPTIVE_REFERENCE_MARGIN
+                {
+                    reference
+                } else {
+                    candidate
+                }
+            };
+            (
+                schedule.prefix_lengths[0],
+                schedule.target_batch_rows,
+                schedule.expected_committed_tokens,
+                schedule.expected_tokens_per_second,
+            )
+        } else {
+            // Batched cycles are replanned jointly after all request-local
+            // posterior vectors are available. This width is only the safe
+            // placeholder carried between draft replay and joint scheduling.
+            let selected = DFLASH2_ADAPTIVE_START_DRAFTS
+                .max(minimum_drafts)
+                .min(max_drafts);
+            let mut survival = 1.0;
+            let expected = 1.0
+                + adjusted_confidence
+                    .iter()
+                    .take(selected)
+                    .map(|confidence| {
+                        survival *= confidence;
+                        survival
+                    })
+                    .sum::<f64>();
+            (selected, selected + 1, expected, 0.0)
+        };
+    Ok(DsparkDraftPlan {
+        proposal_token_ids: step.proposal_token_ids[..selected_drafts].to_vec(),
+        conditional_confidence: candidate_confidence[..selected_drafts].to_vec(),
+        candidate_proposal_token_ids: step.proposal_token_ids[..max_drafts].to_vec(),
+        candidate_conditional_confidence: candidate_confidence,
+        candidate_adjusted_confidence: adjusted_confidence,
+        selected_drafts,
+        minimum_drafts,
+        target_batch_rows,
+        expected_committed_tokens,
+        expected_tokens_per_second,
+        confidence_logit_bias: 0.0,
+        confidence_context_tokens: target_context_tokens,
+        calibration_eligible: true,
+    })
+}
+
+fn dflash_batch_group_size(remaining: usize) -> Option<usize> {
+    if remaining >= 4 {
+        Some(4)
+    } else if remaining >= 2 {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn real_full_draft_absolute_context_start(
+    generated_tokens: usize,
+    cache_mode: Option<RealFullDsparkCacheMode>,
+    token_prefix_tokens: usize,
+    target_row_start: usize,
+) -> Option<usize> {
+    (generated_tokens == 0 && cache_mode == Some(RealFullDsparkCacheMode::PromptSwa))
+        .then(|| token_prefix_tokens + target_row_start)
+}
+
 struct RealFullDsparkRuntime {
     mode: RealFullDsparkServingMode,
     confidence_policy: RealFullDsparkConfidencePolicy,
     cache_mode: RealFullDsparkCacheMode,
     context_tokens: usize,
-    engine: DsparkRequestEngine,
+    engine: RealFullDraftEngine,
     requests: HashMap<String, RealFullDsparkRequestRuntime>,
     tail_cache: RealFullDsparkTailCache,
     cost_model: DsparkRuntimeCostModel,
 }
 
 struct RealFullDsparkRequestRuntime {
-    cache: DsparkRequestState,
+    cache: RealFullDraftRequestState,
     confidence_calibrator: DsparkConfidenceCalibrator,
     confidence_residual: DsparkConfidenceResidual,
+    dflash_adaptive_draft: Dflash2AdaptiveDraftState,
     pending_verification: Option<DsparkDraftPlan>,
     pending_windows: VecDeque<RealFullDsparkShadowWindow>,
+}
+
+const DFLASH2_ADAPTIVE_HISTORY_LIMIT: usize = 16;
+const DFLASH2_ADAPTIVE_COLD_START_CYCLES: usize = 4;
+const DFLASH2_ADAPTIVE_START_DRAFTS: usize = 5;
+const DFLASH2_ADAPTIVE_PRIOR_SUCCESSES: usize = 3;
+const DFLASH2_ADAPTIVE_PRIOR_TRIALS: usize = 4;
+const DFLASH2_ADAPTIVE_REFERENCE_MARGIN: f64 = 1.02;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Dflash2AdaptiveDraftObservation {
+    proposed: usize,
+    accepted: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Dflash2AdaptiveDraftState {
+    history: VecDeque<Dflash2AdaptiveDraftObservation>,
+}
+
+impl Dflash2AdaptiveDraftState {
+    fn reset(&mut self) {
+        self.history.clear();
+    }
+
+    fn cold_start(&self) -> bool {
+        self.history.len() < DFLASH2_ADAPTIVE_COLD_START_CYCLES
+    }
+
+    fn observe(&mut self, proposed: usize, accepted: usize) {
+        if proposed == 0 {
+            return;
+        }
+        self.history.push_back(Dflash2AdaptiveDraftObservation {
+            proposed,
+            accepted: accepted.min(proposed),
+        });
+        while self.history.len() > DFLASH2_ADAPTIVE_HISTORY_LIMIT {
+            self.history.pop_front();
+        }
+    }
+
+    fn conditional_confidence(&self, max_drafts: usize) -> Vec<f64> {
+        (1..=max_drafts)
+            .map(|position| {
+                // A position is observed only when every preceding proposal
+                // matched. Later positions after the first mismatch are
+                // censored, not failures.
+                let mut trials = DFLASH2_ADAPTIVE_PRIOR_TRIALS;
+                let mut successes = DFLASH2_ADAPTIVE_PRIOR_SUCCESSES;
+                for observation in &self.history {
+                    if observation.proposed >= position
+                        && observation.accepted >= position.saturating_sub(1)
+                    {
+                        trials += 1;
+                        successes += usize::from(observation.accepted >= position);
+                    }
+                }
+                successes as f64 / trials as f64
+            })
+            .collect()
+    }
+}
+
+struct RealFullBatchedDraftReplayInput<'a> {
+    sequence_id: &'a str,
+    target_hidden_taps: &'a [DeviceBf16Output],
+    target_row_start: usize,
+    committed_rows: usize,
+    absolute_context_start: Option<usize>,
+    anchor_token: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -419,7 +878,7 @@ struct RealFullDsparkTailKey {
 
 struct RealFullDsparkTailEntry {
     key: RealFullDsparkTailKey,
-    snapshot: DsparkRequestCacheSnapshot,
+    snapshot: RealFullDraftCacheSnapshot,
     confidence_calibrator: DsparkConfidenceCalibrator,
     confidence_residual: DsparkConfidenceResidual,
 }
@@ -574,6 +1033,18 @@ struct RealFullDsparkShadowWindow {
 }
 
 impl RealFullDsparkRuntime {
+    fn batched_dflash_enabled(&self) -> bool {
+        self.mode == RealFullDsparkServingMode::Active && self.engine.is_dflash2()
+    }
+
+    fn is_dflash2(&self) -> bool {
+        self.engine.is_dflash2()
+    }
+
+    fn target_layer_ids(&self) -> Vec<usize> {
+        self.engine.target_layer_ids()
+    }
+
     fn trace_shadow_window(
         sequence_id: &str,
         window: &RealFullDsparkShadowWindow,
@@ -642,6 +1113,7 @@ impl RealFullDsparkRuntime {
                     cache,
                     confidence_calibrator: DsparkConfidenceCalibrator::default(),
                     confidence_residual: DsparkConfidenceResidual::default(),
+                    dflash_adaptive_draft: Dflash2AdaptiveDraftState::default(),
                     pending_verification: None,
                     pending_windows: VecDeque::new(),
                 },
@@ -672,9 +1144,10 @@ impl RealFullDsparkRuntime {
         if initial_decode {
             request.pending_verification = None;
             request.pending_windows.clear();
+            request.dflash_adaptive_draft.reset();
             if let Some(entry) = reusable_tail {
                 let prefix_tokens = entry.key.prefix_tokens;
-                let cache_tokens = entry.snapshot.cache_context_tokens;
+                let cache_tokens = entry.snapshot.cache_context_tokens();
                 let snapshot_bytes = entry.snapshot.resident_bytes();
                 if let Err(error) = self
                     .engine
@@ -706,6 +1179,7 @@ impl RealFullDsparkRuntime {
         }
         if self.mode == RealFullDsparkServingMode::Active && !initial_decode {
             if let Some(draft_tokens) = startup_draft_tokens {
+                let draft_tokens = draft_tokens.min(self.engine.max_verify_drafts());
                 // Startup width capture must replace the ordinary adaptive
                 // plan, including the common empty plan produced by the seed
                 // step. Otherwise every nominal width sweep remains scalar.
@@ -742,12 +1216,12 @@ impl RealFullDsparkRuntime {
     fn replay_step(
         &mut self,
         sequence_id: &str,
-        target_hidden_taps: [&DeviceBf16Output; 5],
+        target_hidden_taps: &[DeviceBf16Output],
         target_row_start: usize,
         committed_rows: usize,
         absolute_context_start: Option<usize>,
         anchor_token: usize,
-    ) -> Result<(super::dspark_static::DsparkDraftStep, DsparkDraftPlan)> {
+    ) -> Result<(DsparkDraftStep, DsparkDraftPlan)> {
         let request = self
             .requests
             .get_mut(sequence_id)
@@ -793,44 +1267,59 @@ impl RealFullDsparkRuntime {
             anchor_token,
         )?;
         let target_context_tokens = request.cache.context_tokens();
-        let sps = self.cost_model.profile(1, &[target_context_tokens])?;
-        let (confidence_logit_bias, position_logit_bias, force_probe) = match self.confidence_policy
-        {
-            RealFullDsparkConfidencePolicy::Calibrated => (
-                request.confidence_calibrator.logit_bias(),
-                &[][..],
-                request.confidence_calibrator.force_probe_due(),
-            ),
-            RealFullDsparkConfidencePolicy::Raw => (0.0, &[][..], false),
-            RealFullDsparkConfidencePolicy::Residual => (
-                request
-                    .confidence_residual
-                    .global_logit_bias(target_context_tokens),
-                request.confidence_residual.position_logit_bias(),
-                false,
-            ),
+        let mut plan = if self.engine.is_dflash2() {
+            let sps = self.cost_model.profile(1, &[target_context_tokens])?;
+            dflash_draft_plan(
+                &step,
+                target_context_tokens,
+                &request.dflash_adaptive_draft,
+                Some(&sps),
+            )?
+        } else {
+            let sps = self.cost_model.profile(1, &[target_context_tokens])?;
+            let (confidence_logit_bias, position_logit_bias, force_probe) =
+                match self.confidence_policy {
+                    RealFullDsparkConfidencePolicy::Calibrated => (
+                        request.confidence_calibrator.logit_bias(),
+                        &[][..],
+                        request.confidence_calibrator.force_probe_due(),
+                    ),
+                    RealFullDsparkConfidencePolicy::Raw => (0.0, &[][..], false),
+                    RealFullDsparkConfidencePolicy::Residual => (
+                        request
+                            .confidence_residual
+                            .global_logit_bias(target_context_tokens),
+                        request.confidence_residual.position_logit_bias(),
+                        false,
+                    ),
+                };
+            let RealFullDraftEngine::Dspark(engine) = &self.engine else {
+                unreachable!("DFlash2 was handled above")
+            };
+            engine.plan_verification(
+                &step,
+                REAL_FULL_DSPARK_ADAPTIVE_MAX_VERIFY_DRAFTS,
+                confidence_logit_bias,
+                position_logit_bias,
+                target_context_tokens,
+                force_probe,
+                &sps,
+            )?
         };
-        let mut plan = self.engine.plan_verification(
-            &step,
-            REAL_FULL_DSPARK_ADAPTIVE_MAX_VERIFY_DRAFTS,
-            confidence_logit_bias,
-            position_logit_bias,
-            target_context_tokens,
-            force_probe,
-            &sps,
-        )?;
-        if let Some(fixed_drafts) = real_full_dspark_fixed_drafts()? {
-            plan.proposal_token_ids = step.proposal_token_ids[..fixed_drafts].to_vec();
-            plan.conditional_confidence = step.conditional_confidence[..fixed_drafts].to_vec();
-            plan.candidate_proposal_token_ids = plan.proposal_token_ids.clone();
-            plan.candidate_conditional_confidence = plan.conditional_confidence.clone();
-            plan.candidate_adjusted_confidence.truncate(fixed_drafts);
-            plan.selected_drafts = fixed_drafts;
-            plan.minimum_drafts = fixed_drafts;
-            plan.target_batch_rows = fixed_drafts + 1;
-            plan.expected_committed_tokens = 0.0;
-            plan.expected_tokens_per_second = 0.0;
-            plan.calibration_eligible = false;
+        if !self.engine.is_dflash2() {
+            if let Some(fixed_drafts) = real_full_dspark_fixed_drafts()? {
+                plan.proposal_token_ids = step.proposal_token_ids[..fixed_drafts].to_vec();
+                plan.conditional_confidence = step.conditional_confidence[..fixed_drafts].to_vec();
+                plan.candidate_proposal_token_ids = plan.proposal_token_ids.clone();
+                plan.candidate_conditional_confidence = plan.conditional_confidence.clone();
+                plan.candidate_adjusted_confidence.truncate(fixed_drafts);
+                plan.selected_drafts = fixed_drafts;
+                plan.minimum_drafts = fixed_drafts;
+                plan.target_batch_rows = fixed_drafts + 1;
+                plan.expected_committed_tokens = 0.0;
+                plan.expected_tokens_per_second = 0.0;
+                plan.calibration_eligible = false;
+            }
         }
         if self.mode == RealFullDsparkServingMode::Active {
             request.pending_verification = Some(plan.clone());
@@ -845,6 +1334,121 @@ impl RealFullDsparkRuntime {
                 });
         }
         Ok((step, plan))
+    }
+
+    fn replay_batched_dflash_steps(
+        &mut self,
+        inputs: &[RealFullBatchedDraftReplayInput<'_>],
+    ) -> Result<Vec<(DsparkDraftStep, DsparkDraftPlan)>> {
+        anyhow::ensure!(
+            self.mode == RealFullDsparkServingMode::Active && self.engine.is_dflash2(),
+            "batched DFlash2 replay requires the active DFlash2 runtime"
+        );
+        anyhow::ensure!(
+            matches!(inputs.len(), 2 | 4),
+            "batched DFlash2 replay requires exactly 2 or 4 requests"
+        );
+        for (index, input) in inputs.iter().enumerate() {
+            anyhow::ensure!(
+                !inputs[..index]
+                    .iter()
+                    .any(|prior| prior.sequence_id == input.sequence_id),
+                "batched DFlash2 replay contains duplicate sequence {}",
+                input.sequence_id
+            );
+        }
+
+        let mut removed = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let Some(runtime) = self.requests.remove(input.sequence_id) else {
+                for (sequence_id, runtime) in removed.drain(..) {
+                    self.requests.insert(sequence_id, runtime);
+                }
+                bail!("DFlash2 request state is missing for {}", input.sequence_id);
+            };
+            removed.push((input.sequence_id.to_owned(), runtime));
+        }
+
+        let result = (|| {
+            let tap_arrays = inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .target_hidden_taps
+                        .iter()
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .map_err(|taps: Vec<_>| {
+                            anyhow::anyhow!(
+                                "DFlash2 requires {GLM53_DFLASH2_DRAFT_LAYERS} target taps, got {}",
+                                taps.len()
+                            )
+                        })
+                })
+                .collect::<Result<Vec<[&DeviceBf16Output; GLM53_DFLASH2_DRAFT_LAYERS]>>>()?;
+            let RealFullDraftEngine::Dflash2(engine) = &mut self.engine else {
+                unreachable!("the DFlash2 runtime was checked above")
+            };
+            let mut replay_requests = Vec::with_capacity(inputs.len());
+            for (((_, runtime), input), taps) in removed.iter_mut().zip(inputs).zip(tap_arrays) {
+                let RealFullDraftRequestState::Dflash2(state) = &mut runtime.cache else {
+                    bail!("DFlash2 runtime contains a non-DFlash request cache")
+                };
+                replay_requests.push(Dflash2BatchedReplayRequest {
+                    state,
+                    target_hidden_taps: taps,
+                    target_row_start: input.target_row_start,
+                    committed_rows: input.committed_rows,
+                    absolute_context_start: input.absolute_context_start,
+                    anchor_token: input.anchor_token,
+                });
+            }
+            let steps = engine.replay_batched_steps(&mut replay_requests)?;
+            drop(replay_requests);
+            anyhow::ensure!(
+                steps.len() == removed.len(),
+                "DFlash2 engine returned the wrong batched step count"
+            );
+            if real_full_dspark_trace_enabled() {
+                eprintln!(
+                    "real_full_dflash2_batch requests={} committed_rows={:?} packed_update_rows={} update_ms_sum={:.3} suffix_ms={:.3} readback_ms={:.3} batch_total_ms={:.3}",
+                    steps.len(),
+                    steps
+                        .iter()
+                        .map(|step| step.committed_rows)
+                        .collect::<Vec<_>>(),
+                    steps.first().map_or(0, |step| step.packed_update_rows),
+                    steps.iter().map(|step| step.update_ms).sum::<f64>(),
+                    steps.first().map_or(0.0, |step| step.suffix_ms),
+                    steps.first().map_or(0.0, |step| step.readback_ms),
+                    steps.first().map_or(0.0, |step| step.total_ms),
+                );
+            }
+            removed
+                .iter_mut()
+                .zip(steps)
+                .map(|((_, runtime), step)| {
+                    let target_context_tokens = runtime.cache.context_tokens();
+                    let step = dspark_step_from_dflash(step);
+                    let plan = dflash_draft_plan(
+                        &step,
+                        target_context_tokens,
+                        &runtime.dflash_adaptive_draft,
+                        None,
+                    )?;
+                    runtime.pending_verification = Some(plan.clone());
+                    Ok((step, plan))
+                })
+                .collect::<Result<Vec<_>>>()
+        })();
+        for (sequence_id, runtime) in removed {
+            // This insertion is required in optimized builds too. Keeping the
+            // mutation inside debug_assert! compiled it out in release mode,
+            // dropping every request state after a successful batched replay.
+            let replaced = self.requests.insert(sequence_id, runtime);
+            debug_assert!(replaced.is_none());
+        }
+        result
     }
 
     fn record_issued_plan(&mut self, sequence_id: &str, plan: &DsparkDraftPlan) {
@@ -888,12 +1492,40 @@ impl RealFullDsparkRuntime {
             .map(|(plan, max_useful_drafts)| plan.minimum_drafts.min(*max_useful_drafts))
             .collect::<Vec<_>>();
         let sps = self.cost_model.profile(plans.len(), context_tokens)?;
-        schedule_dspark_verification_with_minimums(
+        let candidate = schedule_dspark_verification_with_minimums(
             &conditional_confidence,
             &minimum_prefix_lengths,
             &sps,
             DsparkScheduleSearch::GlobalMaximum,
-        )
+        )?;
+        if !self.engine.is_dflash2() {
+            return Ok(candidate);
+        }
+        let reference_widths = plans
+            .iter()
+            .map(|(_, max_useful_drafts)| DFLASH2_ADAPTIVE_START_DRAFTS.min(*max_useful_drafts))
+            .collect::<Vec<_>>();
+        let reference_confidence = conditional_confidence
+            .iter()
+            .zip(&reference_widths)
+            .map(|(confidence, width)| confidence[..*width].to_vec())
+            .collect::<Vec<_>>();
+        let reference = schedule_dspark_verification_with_minimums(
+            &reference_confidence,
+            &reference_widths,
+            &sps,
+            DsparkScheduleSearch::GlobalMaximum,
+        )?;
+        let cold_start = plans.iter().any(|(plan, _)| plan.minimum_drafts > 0);
+        if cold_start
+            || (candidate.prefix_lengths != reference.prefix_lengths
+                && candidate.expected_tokens_per_second
+                    < reference.expected_tokens_per_second * DFLASH2_ADAPTIVE_REFERENCE_MARGIN)
+        {
+            Ok(reference)
+        } else {
+            Ok(candidate)
+        }
     }
 
     fn observe_runtime_cost(
@@ -929,6 +1561,11 @@ impl RealFullDsparkRuntime {
         let Some(request) = self.requests.get_mut(sequence_id) else {
             return (0.0, 0.0, 0);
         };
+        if self.engine.is_dflash2() {
+            request
+                .dflash_adaptive_draft
+                .observe(plan.selected_drafts, accepted_drafts);
+        }
         if plan.calibration_eligible && accepted_drafts <= plan.conditional_confidence.len() {
             match self.confidence_policy {
                 RealFullDsparkConfidencePolicy::Calibrated => request
@@ -986,15 +1623,15 @@ impl RealFullDsparkRuntime {
             return Ok(false);
         };
         anyhow::ensure!(
-            snapshot.context_tokens == prefix_tokens,
+            snapshot.context_tokens() == prefix_tokens,
             "dSpark reusable snapshot ends at token {}, expected {prefix_tokens}",
-            snapshot.context_tokens,
+            snapshot.context_tokens(),
         );
         let key = RealFullDsparkTailKey {
             prefix_tokens,
             prefix_sha256: real_full_dspark_prefix_fingerprint(&prompt_token_ids[..prefix_tokens]),
         };
-        let cache_tokens = snapshot.cache_context_tokens;
+        let cache_tokens = snapshot.cache_context_tokens();
         let snapshot_bytes = snapshot.resident_bytes();
         let retained = self.tail_cache.insert(RealFullDsparkTailEntry {
             key,
@@ -1042,19 +1679,19 @@ impl RealFullDsparkRuntime {
                         return Ok(None);
                     };
                     anyhow::ensure!(
-                        snapshot.context_tokens <= committed_token_ids.len(),
+                        snapshot.context_tokens() <= committed_token_ids.len(),
                         "dSpark tail ends at token {} but the target committed frontier has only {} tokens",
-                        snapshot.context_tokens,
+                        snapshot.context_tokens(),
                         committed_token_ids.len(),
                     );
                     let key = RealFullDsparkTailKey {
-                        prefix_tokens: snapshot.context_tokens,
+                        prefix_tokens: snapshot.context_tokens(),
                         prefix_sha256: real_full_dspark_prefix_fingerprint(
-                            &committed_token_ids[..snapshot.context_tokens],
+                            &committed_token_ids[..snapshot.context_tokens()],
                         ),
                     };
                     let snapshot_bytes = snapshot.resident_bytes();
-                    let cache_tokens = snapshot.cache_context_tokens;
+                    let cache_tokens = snapshot.cache_context_tokens();
                     let retained = self.tail_cache.insert(RealFullDsparkTailEntry {
                         key,
                         snapshot,
@@ -2557,6 +3194,7 @@ impl RealFullSchedulerRequestExecutor {
         mut prepared: PreparedBatchedDsparkCycle,
         execution: RealFullSchedulerDeviceExecution,
         paired_target_samples: Option<RealLmHeadBatchScoreForHidden>,
+        precomputed_draft_replay: Option<(DsparkDraftStep, DsparkDraftPlan)>,
     ) -> std::result::Result<glmrt_api::RealFullDecodeCycle, String> {
         let target_submit_ms = elapsed_ms(prepared.scheduler_start);
         let mut report = execution.report;
@@ -2694,7 +3332,7 @@ impl RealFullSchedulerRequestExecutor {
                     .map_err(format_error_chain)?;
                 if taps.rows != prepared.dspark_target_hidden_tap_rows
                     || committed_rows > taps.rows
-                    || taps.layer_ids != dspark_target_hidden_tap_layer_ids()
+                    || taps.layer_ids != real_full_active_draft_target_layer_ids()
                 {
                     let error = format!(
                         "paired dSpark expected {} target rows with {} committed, got rows={} layers={:?}",
@@ -2706,32 +3344,66 @@ impl RealFullSchedulerRequestExecutor {
                     self.restore_prepared_batched_dspark_cycle(prepared);
                     return Err(error);
                 }
-                let tap_refs = std::array::from_fn(|index| &taps.values[index]);
-                let mut dspark = match self
-                    .dspark
-                    .as_ref()
-                    .expect("paired dSpark taps have a request executor")
-                    .lock()
-                {
-                    Ok(dspark) => dspark,
-                    Err(error) => {
-                        self.restore_prepared_batched_dspark_cycle(prepared);
-                        return Err(format!("locking dSpark request executor failed: {error}"));
-                    }
+                let replay = if let Some((step, plan)) = precomputed_draft_replay {
+                    self.dspark
+                        .as_ref()
+                        .expect("paired DFlash2 taps have a request executor")
+                        .lock()
+                        .map_err(|error| {
+                            format!("locking precomputed DFlash2 request state failed: {error}")
+                        })
+                        .and_then(|dspark| {
+                            dspark
+                                .request_context_tokens(&prepared.sequence_id)
+                                .map(|context| (step, plan, dspark.mode, context))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "precomputed DFlash2 request state is missing for {}",
+                                        prepared.sequence_id
+                                    )
+                                })
+                        })
+                } else {
+                    self.dspark
+                        .as_ref()
+                        .expect("paired dSpark taps have a request executor")
+                        .lock()
+                        .map_err(|error| format!("locking dSpark request executor failed: {error}"))
+                        .and_then(|mut dspark| {
+                            let absolute_context_start = real_full_draft_absolute_context_start(
+                                prepared.generated_tokens,
+                                Some(dspark.cache_mode),
+                                prepared.token_prefix_tokens,
+                                taps.row_start,
+                            );
+                            dspark
+                                .replay_step(
+                                    &prepared.sequence_id,
+                                    &taps.values,
+                                    0,
+                                    committed_rows,
+                                    absolute_context_start,
+                                    anchor_token,
+                                )
+                                .map_err(format_error_chain)
+                                .and_then(|(step, plan)| {
+                                    dspark
+                                        .request_context_tokens(&prepared.sequence_id)
+                                        .map(|context| (step, plan, dspark.mode, context))
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "replayed dSpark request state is missing for {}",
+                                                prepared.sequence_id
+                                            )
+                                        })
+                                })
+                        })
                 };
-                let (step, plan) = match dspark.replay_step(
-                    &prepared.sequence_id,
-                    tap_refs,
-                    0,
-                    committed_rows,
-                    None,
-                    anchor_token,
-                ) {
-                    Ok(step) => step,
+                let (step, plan, draft_mode, draft_context_after) = match replay {
+                    Ok(replay) => replay,
                     Err(error) => {
-                        drop(dspark);
                         self.restore_prepared_batched_dspark_cycle(prepared);
-                        return Err(format_error_chain(error));
+                        return Err(error);
                     }
                 };
                 if real_full_dspark_trace_enabled() {
@@ -2739,13 +3411,11 @@ impl RealFullSchedulerRequestExecutor {
                         "real_full_dspark_step request_id={} sequence_id={} mode={:?} target_context={} draft_context_before={} committed_rows={} draft_context_after={} anchor_token={} selected_drafts={} target_batch_rows={} expected_tokens={:.4} expected_tps={:.3} update_ms={:.3} suffix_ms={:.3} readback_ms={:.3} dspark_total_ms={:.3} selected_proposals={:?} proposals={:?} confidence={:?} paired=true",
                         prepared.request.request_id,
                         prepared.sequence_id,
-                        dspark.mode,
+                        draft_mode,
                         prepared.token_prefix_tokens + prepared.token_prefill_tokens,
                         step.context_tokens,
                         step.committed_rows,
-                        dspark
-                            .request_context_tokens(&prepared.sequence_id)
-                            .expect("the replayed paired dSpark request has live state"),
+                        draft_context_after,
                         step.anchor_token,
                         plan.selected_drafts,
                         plan.target_batch_rows,
@@ -2954,6 +3624,7 @@ impl RealFullSchedulerRequestExecutor {
                         .map_err(|error| format!("locking dSpark prefix cache failed: {error}"))?;
                     if dspark.mode == RealFullDsparkServingMode::Active
                         && dspark.cache_mode == RealFullDsparkCacheMode::PromptSwa
+                        && (!dspark.is_dflash2() || request.greedy_sampling)
                     {
                         let target_match = reservation.matched_prefix_tokens();
                         let aligned_match = dspark
@@ -3050,14 +3721,23 @@ impl RealFullSchedulerRequestExecutor {
             .map(|runtime| {
                 runtime
                     .lock()
-                    .map(|runtime| (runtime.mode, runtime.cache_mode, runtime.context_tokens))
+                    .map(|runtime| {
+                        (
+                            runtime.mode,
+                            runtime.cache_mode,
+                            runtime.context_tokens,
+                            runtime.is_dflash2(),
+                        )
+                    })
                     .map_err(|error| format!("locking dSpark request executor failed: {error}"))
             })
             .transpose()?;
         let dspark_mode = dspark_configuration.map(|configuration| configuration.0);
         let dspark_cache_mode = dspark_configuration.map(|configuration| configuration.1);
         let dspark_context_tokens = dspark_configuration.map(|configuration| configuration.2);
+        let dflash2_active = dspark_configuration.is_some_and(|configuration| configuration.3);
         let dspark_active = dspark_mode == Some(RealFullDsparkServingMode::Active)
+            && (!dflash2_active || request.greedy_sampling)
             && !request.disable_speculation
             && request.decode_budget.saturating_sub(generated_tokens) > 1
             && self.sparse_tcp_dispatch_worker.is_some()
@@ -3936,22 +4616,24 @@ impl RealFullSchedulerRequestExecutor {
                     };
                     if taps.rows != dspark_target_hidden_tap_rows
                         || committed_rows > taps.rows
-                        || taps.layer_ids != dspark_target_hidden_tap_layer_ids()
+                        || taps.layer_ids != real_full_active_draft_target_layer_ids()
                     {
                         let _ = self.store_scheduler_state(&sequence_id, state);
                         return Err(format!(
                             "real-full dSpark expected {} physical target rows with {} committed at layers {:?}, got rows={} layers={:?}",
                             dspark_target_hidden_tap_rows,
                             committed_rows,
-                            dspark_target_hidden_tap_layer_ids(),
+                            real_full_active_draft_target_layer_ids(),
                             taps.rows,
                             taps.layer_ids
                         ));
                     }
-                    let tap_refs = std::array::from_fn(|index| &taps.values[index]);
-                    let absolute_context_start = (generated_tokens == 0
-                        && dspark_cache_mode == Some(RealFullDsparkCacheMode::PromptSwa))
-                    .then(|| token_rows.prefix_tokens + taps.row_start);
+                    let absolute_context_start = real_full_draft_absolute_context_start(
+                        generated_tokens,
+                        dspark_cache_mode,
+                        token_rows.prefix_tokens,
+                        taps.row_start,
+                    );
                     let mut dspark = match self
                         .dspark
                         .as_ref()
@@ -3966,7 +4648,7 @@ impl RealFullSchedulerRequestExecutor {
                     };
                     let (step, plan) = match dspark.replay_step(
                         &sequence_id,
-                        tap_refs,
+                        &taps.values,
                         0,
                         committed_rows,
                         absolute_context_start,
@@ -4402,6 +5084,24 @@ fn real_full_batched_dspark_prewarm_sequence(sequence_id: &str) -> bool {
         && real_full_batched_dspark_prewarm_buffer_bank(sequence_id).is_some()
 }
 
+const REAL_FULL_DFLASH2_DSA_PREWARM_PROMPT_REPEATS: usize = 2_048;
+
+fn real_full_draft_width_prewarm_prompt_repeats(dflash2: bool) -> usize {
+    if dflash2 {
+        REAL_FULL_DFLASH2_DSA_PREWARM_PROMPT_REPEATS
+    } else {
+        8
+    }
+}
+
+fn real_full_draft_width_prewarm_passes(dflash2: bool) -> usize {
+    if dflash2 {
+        2
+    } else {
+        1
+    }
+}
+
 const REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_BASE: u64 = 92_000;
 const REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_STRIDE: u64 = 100;
 const REAL_FULL_SCALAR_DSPARK_PREWARM_WIDTH_REQUEST_BASE: u64 = 91_000;
@@ -4673,15 +5373,192 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
             }
         }
 
+        let batched_dflash_cache_mode = self
+            .dspark
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok())
+            .and_then(|runtime| {
+                runtime
+                    .batched_dflash_enabled()
+                    .then_some(runtime.cache_mode)
+            });
+        let mut precomputed_draft_replays = (0..prepared.len()).map(|_| None).collect::<Vec<_>>();
+        if let Some(dflash_cache_mode) = batched_dflash_cache_mode {
+            // The target sampler is still request-shaped. Resolve any samples
+            // not already handled by the paired LM-head path before deriving
+            // the committed DFlash2 cache rows for the collective suffix.
+            for index in 0..prepared.len() {
+                if prepared[index].pending_dspark_draft_token_ids.is_empty()
+                    || paired_target_samples[index].is_some()
+                {
+                    continue;
+                }
+                let suffix_rows = prepared[index].decode_rows
+                    + prepared[index].pending_dspark_draft_token_ids.len();
+                let sample = with_coordinator_owned_device_buffer_bank(
+                    prepared[index].buffer_bank,
+                    || {
+                        let hidden = executions[index]
+                            .final_target_device_hidden
+                            .as_ref()
+                            .with_context(|| {
+                                format!(
+                                    "batched DFlash2 request {index} has no retained target hidden rows"
+                                )
+                            })?;
+                        real_full_target_token_samples(&self.catalog, hidden, suffix_rows)
+                    },
+                );
+                match sample {
+                    Ok(sample) => paired_target_samples[index] = Some(sample),
+                    Err(error) => {
+                        let error = format_error_chain(error);
+                        let request_count = prepared.len();
+                        for cycle in prepared {
+                            self.restore_prepared_batched_dspark_cycle(cycle);
+                        }
+                        return (0..request_count).map(|_| Err(error.clone())).collect();
+                    }
+                }
+            }
+
+            let mut candidates = Vec::new();
+            for index in 0..prepared.len() {
+                let cycle = &prepared[index];
+                let cache_update = if cycle.pending_dspark_draft_token_ids.is_empty() {
+                    executions[index]
+                        .report
+                        .terminal_lm_head_sample
+                        .top_token_id
+                        .context("paired DFlash2 scalar step requires a target token")
+                        .map(|anchor_token| (1, anchor_token))
+                } else {
+                    let target_samples = paired_target_samples[index]
+                        .as_ref()
+                        .expect("DFlash2 target sampling was completed above");
+                    real_full_mtp_acceptance(
+                        &cycle.pending_dspark_draft_token_ids,
+                        &target_samples.top_token_ids,
+                        true,
+                        cycle
+                            .request
+                            .decode_budget
+                            .saturating_sub(cycle.generated_tokens),
+                    )
+                    .map(|acceptance| {
+                        (
+                            acceptance.accepted_draft_tokens + 1,
+                            target_samples.top_token_ids[acceptance.terminal_target_index],
+                        )
+                    })
+                };
+                let (committed_rows, anchor_token) = match cache_update {
+                    Ok(update) => update,
+                    Err(error) => {
+                        let error = format_error_chain(error);
+                        let request_count = prepared.len();
+                        for cycle in prepared {
+                            self.restore_prepared_batched_dspark_cycle(cycle);
+                        }
+                        return (0..request_count).map(|_| Err(error.clone())).collect();
+                    }
+                };
+                let final_decode_step =
+                    cycle.generated_tokens + committed_rows >= cycle.request.decode_budget;
+                let taps_match = executions[index]
+                    .target_device_hidden_taps
+                    .as_ref()
+                    .is_some_and(|taps| {
+                        taps.rows == cycle.dspark_target_hidden_tap_rows
+                            && committed_rows <= taps.rows
+                            && taps.layer_ids == real_full_active_draft_target_layer_ids()
+                    });
+                if !final_decode_step && taps_match {
+                    let taps = executions[index]
+                        .target_device_hidden_taps
+                        .as_ref()
+                        .expect("a matched DFlash2 candidate has target taps");
+                    let absolute_context_start = real_full_draft_absolute_context_start(
+                        cycle.generated_tokens,
+                        Some(dflash_cache_mode),
+                        cycle.token_prefix_tokens,
+                        taps.row_start,
+                    );
+                    candidates.push((index, committed_rows, anchor_token, absolute_context_start));
+                }
+            }
+
+            let mut cursor = 0;
+            while let Some(group_size) =
+                dflash_batch_group_size(candidates.len().saturating_sub(cursor))
+            {
+                let remaining = candidates.len() - cursor;
+                debug_assert!(group_size <= remaining);
+                let group = &candidates[cursor..cursor + group_size];
+                let inputs = group
+                    .iter()
+                    .map(
+                        |(index, committed_rows, anchor_token, absolute_context_start)| {
+                            let taps = executions[*index]
+                                .target_device_hidden_taps
+                                .as_ref()
+                                .expect("a DFlash2 batch candidate has target taps");
+                            RealFullBatchedDraftReplayInput {
+                                sequence_id: &prepared[*index].sequence_id,
+                                target_hidden_taps: &taps.values,
+                                target_row_start: 0,
+                                committed_rows: *committed_rows,
+                                absolute_context_start: *absolute_context_start,
+                                anchor_token: *anchor_token,
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let replay = self
+                    .dspark
+                    .as_ref()
+                    .expect("DFlash2 batching requires a runtime")
+                    .lock()
+                    .map_err(|error| format!("locking batched DFlash2 runtime failed: {error}"))
+                    .and_then(|mut runtime| {
+                        runtime
+                            .replay_batched_dflash_steps(&inputs)
+                            .map_err(format_error_chain)
+                    });
+                let replay = match replay {
+                    Ok(replay) => replay,
+                    Err(error) => {
+                        let request_count = prepared.len();
+                        for cycle in prepared {
+                            self.restore_prepared_batched_dspark_cycle(cycle);
+                        }
+                        return (0..request_count).map(|_| Err(error.clone())).collect();
+                    }
+                };
+                for ((index, _, _, _), replay) in group.iter().zip(replay) {
+                    precomputed_draft_replays[*index] = Some(replay);
+                }
+                cursor += group_size;
+            }
+        }
+
         let results = prepared
             .into_iter()
             .zip(executions)
             .zip(paired_target_samples)
-            .map(|((cycle, execution), target_samples)| {
-                with_coordinator_owned_device_buffer_bank(cycle.buffer_bank, || {
-                    self.finish_batched_dspark_cycle(cycle, execution, target_samples)
-                })
-            })
+            .zip(precomputed_draft_replays)
+            .map(
+                |(((cycle, execution), target_samples), precomputed_replay)| {
+                    with_coordinator_owned_device_buffer_bank(cycle.buffer_bank, || {
+                        self.finish_batched_dspark_cycle(
+                            cycle,
+                            execution,
+                            target_samples,
+                            precomputed_replay,
+                        )
+                    })
+                },
+            )
             .collect::<Vec<_>>();
         let runtime_cost_clean = results.iter().all(|result| {
             result
@@ -4718,6 +5595,215 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
         results
     }
 
+    fn prewarm_dflash2_dsa_lane_graphs(
+        &self,
+        max_draft_tokens: usize,
+    ) -> std::result::Result<(), String> {
+        let prompts = vec![
+            REAL_FULL_SERVE_PREWARM_PROMPT_TOKEN
+                .repeat(real_full_draft_width_prewarm_prompt_repeats(true));
+            self.max_execution_lanes
+        ];
+        let prompt_tokens = {
+            let tokenizer = self.tokenizer.lock().map_err(|error| {
+                format!("locking DFlash2 DSA prewarm tokenizer failed: {error}")
+            })?;
+            prompts
+                .iter()
+                .map(|prompt| {
+                    tokenizer
+                        .encode_text(prompt, false)
+                        .map_err(format_error_chain)
+                        .map(|encoded| encoded.token_count)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if prompt_tokens
+            .iter()
+            .any(|prompt_tokens| *prompt_tokens <= 2_048)
+        {
+            return Err(format!(
+                "DFlash2 startup width prewarm must cross the 2,048-token DSA selector boundary, got prompt token counts {prompt_tokens:?}"
+            ));
+        }
+
+        // Seed all production lanes together so each persistent scheduler
+        // state owns the same buffer bank that it will use while serving.
+        // Run the width passes one lane at a time afterward: a multi-request
+        // suffix is intentionally classified as direct DSA prefill, whereas
+        // speculative verification uses the scalar-QA/batched-QB decode path
+        // whose per-layer pointer identities must be retained here.
+        let sequence_ids = (1..=self.max_execution_lanes)
+            .map(|buffer_bank| {
+                format!(
+                    "real-full-startup-dspark-width-{max_draft_tokens}-batched-bank-{buffer_bank}-dflash2-dsa-sequence"
+                )
+            })
+            .collect::<Vec<_>>();
+        let decode_budget = 1_024;
+        let start = Instant::now();
+        eprintln!(
+            "real_full_startup_prewarm_start stage=dflash2-dsa-lane-widths lanes={} prompt_tokens={} max_drafts={} passes={}",
+            self.max_execution_lanes,
+            prompt_tokens.iter().sum::<usize>(),
+            max_draft_tokens,
+            real_full_draft_width_prewarm_passes(true),
+        );
+
+        let prewarm_result = (|| {
+            let seed_requests = sequence_ids
+                .iter()
+                .zip(&prompts)
+                .zip(&prompt_tokens)
+                .enumerate()
+                .map(|(lane_index, ((sequence_id, prompt), prompt_tokens))| {
+                    glmrt_api::RealFullRequest::new_decode_step_for_sequence(
+                        90_100 + lane_index as u64,
+                        sequence_id,
+                        prompt,
+                        *prompt_tokens,
+                        1,
+                        Vec::new(),
+                        0,
+                        decode_budget,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let seed_start = Instant::now();
+            let initial_cycles =
+                glmrt_api::RealFullRequestExecutor::execute_real_full_decode_cycle_batch(
+                    self,
+                    seed_requests,
+                )
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut generated_token_ids = Vec::with_capacity(sequence_ids.len());
+            for (lane_index, initial_cycle) in initial_cycles.into_iter().enumerate() {
+                if initial_cycle.info.status != "ready" {
+                    return Err(format!(
+                        "DFlash2 DSA lane seed {lane_index} failed: status={} blocker={} failed={:?}",
+                        initial_cycle.info.status,
+                        initial_cycle.info.blocker,
+                        initial_cycle.info.failed_requirements,
+                    ));
+                }
+                let token_id = initial_cycle
+                    .generated_tokens
+                    .first()
+                    .map(|token| token.token_id)
+                    .or(initial_cycle
+                        .info
+                        .scheduler_terminal_lm_head_sampled_token_id)
+                    .ok_or_else(|| {
+                        format!("DFlash2 DSA lane seed {lane_index} produced no token")
+                    })?;
+                generated_token_ids.push(vec![token_id]);
+            }
+            eprintln!(
+                "real_full_startup_prewarm_step_done stage=dflash2-dsa-lane-seed lanes={} elapsed_ms={:.3} total_ms={:.3}",
+                self.max_execution_lanes,
+                elapsed_ms(seed_start),
+                elapsed_ms(start),
+            );
+
+            let width_passes = real_full_draft_width_prewarm_passes(true);
+            for draft_tokens in (0..=max_draft_tokens).rev() {
+                for pass_index in 0..width_passes {
+                    for lane_index in 0..self.max_execution_lanes {
+                        let width_start = Instant::now();
+                        let request_index = REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_BASE
+                            + (draft_tokens as u64)
+                                * REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_STRIDE
+                            + (pass_index * 10 + lane_index) as u64;
+                        let decode_step_index = generated_token_ids[lane_index].len();
+                        let cycle = self.execute_real_full_decode_cycle_inner(
+                            glmrt_api::RealFullRequest::new_decode_step_for_sequence(
+                                request_index,
+                                &sequence_ids[lane_index],
+                                &prompts[lane_index],
+                                prompt_tokens[lane_index],
+                                1,
+                                generated_token_ids[lane_index].clone(),
+                                decode_step_index,
+                                decode_budget,
+                            ),
+                        )?;
+                        if cycle.info.status != "ready"
+                            || cycle.info.request_mtp_verify_rows != draft_tokens
+                        {
+                            return Err(format!(
+                                "DFlash2 DSA M={} pass {} lane {} failed: status={} verify_rows={} expected_rows={} blocker={} failed={:?}",
+                                draft_tokens + 1,
+                                pass_index + 1,
+                                lane_index,
+                                cycle.info.status,
+                                cycle.info.request_mtp_verify_rows,
+                                draft_tokens,
+                                cycle.info.blocker,
+                                cycle.info.failed_requirements,
+                            ));
+                        }
+                        if cycle.generated_tokens.is_empty() {
+                            return Err(format!(
+                                "DFlash2 DSA M={} pass {} lane {} emitted no tokens",
+                                draft_tokens + 1,
+                                pass_index + 1,
+                                lane_index,
+                            ));
+                        }
+                        generated_token_ids[lane_index].extend(
+                            cycle
+                                .generated_tokens
+                                .into_iter()
+                                .map(|token| token.token_id),
+                        );
+                        eprintln!(
+                            "real_full_startup_prewarm_step_done stage=dflash2-dsa-lane-width lane={} pass={} physical_m={} reported_capture_delta={} elapsed_ms={:.3} total_ms={:.3}",
+                            lane_index + 1,
+                            pass_index + 1,
+                            draft_tokens + 1,
+                            cycle.info.request_coordinator_graph_captures,
+                            elapsed_ms(width_start),
+                            elapsed_ms(start),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        let cleanup_errors = sequence_ids
+            .iter()
+            .filter_map(|sequence_id| {
+                self.finish_real_full_sequence(sequence_id)
+                    .err()
+                    .map(|error| format!("{sequence_id}: {error}"))
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = prewarm_result {
+            if cleanup_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(format!(
+                "{error}; DFlash2 DSA startup cleanup also failed: {}",
+                cleanup_errors.join("; ")
+            ));
+        }
+        if !cleanup_errors.is_empty() {
+            return Err(format!(
+                "DFlash2 DSA startup cleanup failed: {}",
+                cleanup_errors.join("; ")
+            ));
+        }
+        eprintln!(
+            "real_full_startup_prewarm_done stage=dflash2-dsa-lane-widths lanes={} max_physical_m={} elapsed_ms={:.3}",
+            self.max_execution_lanes,
+            max_draft_tokens + 1,
+            elapsed_ms(start),
+        );
+        Ok(())
+    }
+
     fn prewarm_batched_dspark_graphs(&self) -> std::result::Result<(), String> {
         let startup_profile_mode =
             real_full_dspark_startup_profile_mode().map_err(format_error_chain)?;
@@ -4727,17 +5813,29 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
             } else {
                 real_full_dspark_startup_profile_samples().map_err(format_error_chain)?
             };
-        let checkpoint_max_drafts = dspark_active_max_verify_drafts();
-        let max_draft_tokens = match real_full_dspark_fixed_drafts().map_err(format_error_chain)? {
-            Some(draft_tokens) => {
-                if draft_tokens > checkpoint_max_drafts {
-                    return Err(format!(
+        let Some(dspark) = self.dspark.as_ref() else {
+            return Ok(());
+        };
+        let (checkpoint_max_drafts, dflash2) = dspark
+            .lock()
+            .map(|runtime| (runtime.engine.max_verify_drafts(), runtime.is_dflash2()))
+            .map_err(|error| format!("locking draft startup prewarm failed: {error}"))?;
+        let max_draft_tokens = if dflash2 {
+            real_full_dflash2_fixed_drafts()
+                .map_err(format_error_chain)?
+                .unwrap_or(checkpoint_max_drafts)
+        } else {
+            match real_full_dspark_fixed_drafts().map_err(format_error_chain)? {
+                Some(draft_tokens) => {
+                    if draft_tokens > checkpoint_max_drafts {
+                        return Err(format!(
                             "fixed dSpark width {draft_tokens} exceeds the active checkpoint maximum {checkpoint_max_drafts}"
                         ));
+                    }
+                    draft_tokens
                 }
-                draft_tokens
+                None => checkpoint_max_drafts,
             }
-            None => checkpoint_max_drafts,
         };
         // Serial width capture explicitly finishes each sequence. Defensively
         // drain any other internal prewarm states before materializing the
@@ -4779,9 +5877,6 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
                 self.max_execution_lanes
             ));
         }
-        let Some(dspark) = self.dspark.as_ref() else {
-            return Ok(());
-        };
         {
             let mut dspark = dspark
                 .lock()
@@ -4906,88 +6001,93 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
             );
 
             // Each width uses the same live request/lane state, avoiding 4*C
-            // redundant seed prefills. Layer-parity fused-hidden pools keep
-            // each recurrent graph input address stable, so one pass captures
-            // the complete working set for every physical M=1..max.
+            // redundant seed prefills. Long-context DFlash2 DSA identities
+            // are captured separately through scalar lane-pinned execution.
+            let width_passes = real_full_draft_width_prewarm_passes(false);
             for (width_index, draft_tokens) in (0..=max_draft_tokens).rev().enumerate() {
-                let requests = sequence_ids
-                    .iter()
-                    .zip(&prompts)
-                    .zip(&prompt_tokens)
-                    .zip(generated_token_ids.iter())
-                    .enumerate()
-                    .map(
-                        |(
-                            lane_index,
-                            (((sequence_id, prompt), prompt_tokens), generated_tokens),
-                        )| {
-                            glmrt_api::RealFullRequest::new_decode_step_for_sequence(
-                                REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_BASE
-                                    + (draft_tokens as u64)
-                                        * REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_STRIDE
-                                    + lane_index as u64,
-                                sequence_id,
-                                prompt,
-                                *prompt_tokens,
-                                1,
-                                generated_tokens.clone(),
-                                1 + width_index,
-                                decode_budget,
-                            )
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                let width_start = Instant::now();
-                let cycles = self
-                    .execute_real_full_decode_cycle_batch(requests)
-                    .into_iter()
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let reported_capture_delta = cycles
-                    .iter()
-                    .map(|cycle| cycle.info.request_coordinator_graph_captures)
-                    .max()
-                    .unwrap_or(0);
-                for (lane_index, cycle) in cycles.iter().enumerate() {
-                    if cycle.info.status != "ready"
-                        || cycle.info.request_mtp_verify_rows != draft_tokens
+                for pass_index in 0..width_passes {
+                    let requests = sequence_ids
+                        .iter()
+                        .zip(&prompts)
+                        .zip(&prompt_tokens)
+                        .zip(generated_token_ids.iter())
+                        .enumerate()
+                        .map(
+                            |(
+                                lane_index,
+                                (((sequence_id, prompt), prompt_tokens), generated_tokens),
+                            )| {
+                                glmrt_api::RealFullRequest::new_decode_step_for_sequence(
+                                    REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_BASE
+                                        + (draft_tokens as u64)
+                                            * REAL_FULL_BATCHED_DSPARK_PREWARM_WIDTH_REQUEST_STRIDE
+                                        + (pass_index * 10 + lane_index) as u64,
+                                    sequence_id,
+                                    prompt,
+                                    *prompt_tokens,
+                                    1,
+                                    generated_tokens.clone(),
+                                    1 + width_index * width_passes + pass_index,
+                                    decode_budget,
+                                )
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    let width_start = Instant::now();
+                    let cycles = self
+                        .execute_real_full_decode_cycle_batch(requests)
+                        .into_iter()
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let reported_capture_delta = cycles
+                        .iter()
+                        .map(|cycle| cycle.info.request_coordinator_graph_captures)
+                        .max()
+                        .unwrap_or(0);
+                    for (lane_index, cycle) in cycles.iter().enumerate() {
+                        if cycle.info.status != "ready"
+                            || cycle.info.request_mtp_verify_rows != draft_tokens
+                        {
+                            return Err(format!(
+                                "batched dSpark M={} startup pass {} lane {} failed: status={} verify_rows={} expected_rows={} blocker={} failed={:?}",
+                                draft_tokens + 1,
+                                pass_index + 1,
+                                lane_index,
+                                cycle.info.status,
+                                cycle.info.request_mtp_verify_rows,
+                                draft_tokens,
+                                cycle.info.blocker,
+                                cycle.info.failed_requirements,
+                            ));
+                        }
+                        if cycle.generated_tokens.is_empty() {
+                            return Err(format!(
+                                "batched dSpark M={} startup pass {} lane {} emitted no tokens",
+                                draft_tokens + 1,
+                                pass_index + 1,
+                                lane_index,
+                            ));
+                        }
+                    }
+                    for (generated_tokens, cycle) in
+                        generated_token_ids.iter_mut().zip(cycles.into_iter())
                     {
-                        return Err(format!(
-                            "batched dSpark M={} startup lane {} failed: status={} verify_rows={} expected_rows={} blocker={} failed={:?}",
-                            draft_tokens + 1,
-                            lane_index,
-                            cycle.info.status,
-                            cycle.info.request_mtp_verify_rows,
-                            draft_tokens,
-                            cycle.info.blocker,
-                            cycle.info.failed_requirements,
-                        ));
+                        generated_tokens.extend(
+                            cycle
+                                .generated_tokens
+                                .into_iter()
+                                .map(|token| token.token_id),
+                        );
                     }
-                    if cycle.generated_tokens.is_empty() {
-                        return Err(format!(
-                            "batched dSpark M={} startup lane {} emitted no tokens",
-                            draft_tokens + 1,
-                            lane_index,
-                        ));
-                    }
-                }
-                for (generated_tokens, cycle) in
-                    generated_token_ids.iter_mut().zip(cycles.into_iter())
-                {
-                    generated_tokens.extend(
-                        cycle
-                            .generated_tokens
-                            .into_iter()
-                            .map(|token| token.token_id),
+                    eprintln!(
+                        "real_full_startup_prewarm_step_done stage=batched-dspark-widths pass={} lanes={} physical_m={} reported_capture_delta={} elapsed_ms={:.3} total_ms={:.3}",
+                        pass_index + 1,
+                        self.max_execution_lanes,
+                        draft_tokens + 1,
+                        reported_capture_delta,
+                        elapsed_ms(width_start),
+                        elapsed_ms(start),
                     );
                 }
-                eprintln!(
-                    "real_full_startup_prewarm_step_done stage=batched-dspark-widths lanes={} physical_m={} reported_capture_delta={} elapsed_ms={:.3} total_ms={:.3}",
-                    self.max_execution_lanes,
-                    draft_tokens + 1,
-                    reported_capture_delta,
-                    elapsed_ms(width_start),
-                    elapsed_ms(start),
-                );
             }
             if startup_profile_mode != RealFullDsparkStartupProfileMode::Disabled {
                 self.profile_batched_dspark_sps(
@@ -5033,6 +6133,9 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
             max_draft_tokens + 1,
             elapsed_ms(start),
         );
+        if dflash2 {
+            self.prewarm_dflash2_dsa_lane_graphs(max_draft_tokens)?;
+        }
         Ok(())
     }
 
@@ -5101,7 +6204,7 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
                     );
                 }
             }
-            let max_sampler_rows = 2 * (REAL_FULL_DSPARK_MAX_VERIFY_DRAFTS + 1);
+            let max_sampler_rows = 2 * (real_full_active_max_verify_drafts() + 1);
             for buffer_bank in 1..=self.max_execution_lanes {
                 let start = Instant::now();
                 eprintln!(
@@ -5120,7 +6223,7 @@ impl glmrt_api::RealFullRequestExecutor for RealFullSchedulerRequestExecutor {
                 );
             }
             let Some((min_paired_rows, max_paired_rows)) = real_full_paired_lm_head_prewarm_range(
-                real_full_dspark_fixed_drafts().map_err(format_error_chain)?,
+                real_full_active_fixed_drafts().map_err(format_error_chain)?,
             ) else {
                 return Ok(());
             };
@@ -5990,8 +7093,8 @@ fn real_full_validate_sparse_wave_capacity(
         .and_then(|rows| rows.checked_add(mtp_rows))
         .context("real-full sparse wave row count overflow")?;
     anyhow::ensure!(
-        physical_rows <= B12X_EXL3_K3_TOPK8_CAPACITY_ROWS,
-        "real-full sparse wave rows prefill={prefill_rows} decode={decode_rows} mtp={mtp_rows} total={physical_rows} exceed the EXL3 AOT capacity {B12X_EXL3_K3_TOPK8_CAPACITY_ROWS}"
+        physical_rows <= B12X_EXL3_TOPK8_CAPACITY_ROWS,
+        "real-full sparse wave rows prefill={prefill_rows} decode={decode_rows} mtp={mtp_rows} total={physical_rows} exceed the EXL3 AOT capacity {B12X_EXL3_TOPK8_CAPACITY_ROWS}"
     );
     Ok(())
 }
@@ -6135,6 +7238,29 @@ fn real_full_dspark_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn real_full_dflash2_enabled() -> bool {
+    env::var(REAL_FULL_DFLASH2_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn real_full_draft_runtime_enabled() -> bool {
+    real_full_dspark_enabled() || real_full_dflash2_enabled()
+}
+
+fn real_full_active_draft_target_layer_ids() -> Vec<usize> {
+    if real_full_dflash2_enabled() {
+        GLM53_DFLASH2_TARGET_CAPTURE_TAPS.to_vec()
+    } else {
+        dspark_target_hidden_tap_layer_ids().to_vec()
+    }
+}
+
 fn real_full_dspark_shadow_enabled() -> bool {
     env::var(REAL_FULL_DSPARK_SHADOW_ENV)
         .map(|value| {
@@ -6236,6 +7362,89 @@ fn real_full_dspark_fixed_drafts() -> Result<Option<usize>> {
         "{REAL_FULL_DSPARK_FIXED_DRAFTS_ENV} must be in 0..={REAL_FULL_DSPARK_MAX_VERIFY_DRAFTS}, got {drafts}"
     );
     Ok(Some(drafts))
+}
+
+fn real_full_dflash2_fixed_drafts() -> Result<Option<usize>> {
+    let Some(value) =
+        env::var_os(REAL_FULL_DFLASH2_FIXED_DRAFTS_ENV).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{REAL_FULL_DFLASH2_FIXED_DRAFTS_ENV} is not valid UTF-8"))?;
+    if value.trim().eq_ignore_ascii_case("adaptive") {
+        return Ok(None);
+    }
+    let drafts = value
+        .parse::<usize>()
+        .with_context(|| format!("parsing {REAL_FULL_DFLASH2_FIXED_DRAFTS_ENV}={value}"))?;
+    anyhow::ensure!(
+        (1..=GLM53_DFLASH2_MAX_DRAFTS).contains(&drafts),
+        "{REAL_FULL_DFLASH2_FIXED_DRAFTS_ENV} must be adaptive or in 1..={GLM53_DFLASH2_MAX_DRAFTS}, got {drafts}; use speculation=plain for the target-only baseline"
+    );
+    Ok(Some(drafts))
+}
+
+fn real_full_active_fixed_drafts() -> Result<Option<usize>> {
+    if real_full_dflash2_enabled() {
+        real_full_dflash2_fixed_drafts()
+    } else {
+        real_full_dspark_fixed_drafts()
+    }
+}
+
+fn real_full_active_max_verify_drafts() -> usize {
+    if real_full_dflash2_enabled() {
+        GLM53_DFLASH2_MAX_DRAFTS
+    } else {
+        dspark_active_max_verify_drafts()
+    }
+}
+
+fn real_full_dflash2_snapshot() -> Result<Option<PathBuf>> {
+    if !real_full_dflash2_enabled() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        !real_full_dspark_enabled() && !real_full_dspark_shadow_enabled(),
+        "{REAL_FULL_DFLASH2_ENV}=1 cannot be combined with dSpark serving"
+    );
+    anyhow::ensure!(
+        !real_full_mtp_enabled(),
+        "{REAL_FULL_DFLASH2_ENV}=1 and {REAL_FULL_MTP_ENV}=1 cannot both be enabled"
+    );
+    let snapshot = env::var_os(REAL_FULL_DFLASH2_SNAPSHOT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .with_context(|| format!("DFlash2 serving requires {REAL_FULL_DFLASH2_SNAPSHOT_ENV}"))?;
+    anyhow::ensure!(
+        snapshot.is_dir(),
+        "configured DFlash2 snapshot does not exist: {}",
+        snapshot.display()
+    );
+    Ok(Some(snapshot))
+}
+
+fn real_full_dflash2_tail_cache_bytes(max_execution_lanes: usize) -> Result<usize> {
+    let page_size = 64_usize;
+    let retained_tokens = (super::dflash::GLM53_DFLASH2_SLIDING_WINDOW + page_size - 1)
+        .div_ceil(page_size)
+        .checked_mul(page_size)
+        .context("DFlash2 tail snapshot page rounding overflow")?;
+    let default_bytes = retained_tokens
+        .checked_mul(REAL_FULL_DFLASH2_BF16_KV_BYTES_PER_TOKEN)
+        .and_then(|bytes| bytes.checked_mul(max_execution_lanes))
+        .context("DFlash2 tail-cache default byte count overflow")?;
+    match env::var(REAL_FULL_DFLASH2_TAIL_CACHE_BYTES_ENV) {
+        Ok(value) => value.parse::<usize>().with_context(|| {
+            format!("{REAL_FULL_DFLASH2_TAIL_CACHE_BYTES_ENV}={value} must be a byte count")
+        }),
+        Err(env::VarError::NotPresent) => Ok(default_bytes),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading {REAL_FULL_DFLASH2_TAIL_CACHE_BYTES_ENV}"))
+        }
+    }
 }
 
 fn real_full_dspark_mode_and_snapshot() -> Result<Option<(RealFullDsparkServingMode, PathBuf)>> {
@@ -6668,7 +7877,94 @@ pub(crate) fn load_real_full_serving(
     // residency. Size this pool for the lanes that can actually execute;
     // submitted requests beyond that limit must wait without owning pages.
     let dspark_load_started = Instant::now();
-    let dspark = real_full_dspark_mode_and_snapshot()?
+    let dspark = if let Some(snapshot) = real_full_dflash2_snapshot()? {
+        let tail_cache_bytes = real_full_dflash2_tail_cache_bytes(max_execution_lanes)?;
+        let fixed_drafts = real_full_dflash2_fixed_drafts()?;
+        let engine = Dflash2RequestEngine::load(
+            &snapshot,
+            &catalog,
+            kv_config.max_tokens,
+            max_execution_lanes,
+            // DFlash2 emits all seven candidates in one local suffix replay.
+            // Keep proposal generation at the checkpoint maximum so the
+            // target verifier can select a cheaper prefix without recapturing
+            // or switching the draft graph family.
+            GLM53_DFLASH2_MAX_DRAFTS,
+        )
+        .with_context(|| {
+            format!(
+                "loading DFlash2 request executor from {}",
+                snapshot.display()
+            )
+        })?;
+        let max_verify_drafts = engine.max_verify_drafts();
+        if let Some(fixed_drafts) = fixed_drafts {
+            anyhow::ensure!(
+                fixed_drafts <= max_verify_drafts,
+                "fixed DFlash2 width {fixed_drafts} exceeds the captured internal width {max_verify_drafts}"
+            );
+        }
+        let selector = if fixed_drafts.is_some() {
+            "greedy-fixed-width"
+        } else {
+            "empirical-survival-adaptive"
+        };
+        let verify_width = fixed_drafts
+            .map(|drafts| drafts.to_string())
+            .unwrap_or_else(|| "adaptive".to_owned());
+        let mut cost_model =
+            DsparkRuntimeCostModel::new(REAL_FULL_MAX_ACTIVE_REQUESTS, max_verify_drafts)?;
+        let sparkinfer_revision = env::var(REAL_FULL_DSPARK_SPARKINFER_REVISION_ENV).ok();
+        let coordinator_power_limit_watts =
+            env::var(REAL_FULL_DSPARK_COORDINATOR_POWER_LIMIT_WATTS_ENV)
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().with_context(|| {
+                        format!(
+                            "parsing {REAL_FULL_DSPARK_COORDINATOR_POWER_LIMIT_WATTS_ENV}={value}"
+                        )
+                    })
+                })
+                .transpose()?;
+        let cost_profile = install_qualified_dflash2_cost_profile(
+            &mut cost_model,
+            &catalog.model_id,
+            Path::new(&catalog.snapshot_path),
+            engine.checkpoint_model_id(),
+            engine.checkpoint_revision(),
+            sparkinfer_revision.as_deref(),
+            coordinator_power_limit_watts,
+            max_execution_lanes,
+            max_verify_drafts,
+        )?;
+        println!(
+            "real-full DFlash2 ready mode=Active selector={} snapshot={} window_tokens={} proposal_drafts={} verify_drafts={} internal_query_rows={} gpu_request_slots={} host_tail_cache_bytes={} non_greedy=fallback-target cost_profile={} cost_profile_source={} cost_profile_sparkinfer={} cost_profile_topology={} cost_profile_power_watts={}",
+            selector,
+            snapshot.display(),
+            super::dflash::GLM53_DFLASH2_SLIDING_WINDOW,
+            max_verify_drafts,
+            verify_width,
+            max_verify_drafts + 1,
+            max_execution_lanes,
+            tail_cache_bytes,
+            cost_profile.map_or("unqualified-runtime-prior", |profile| profile.profile_id),
+            cost_profile.map_or("none", |profile| profile.source_sha256),
+            cost_profile.map_or("unqualified", |profile| profile.sparkinfer_revision),
+            cost_profile.map_or("unqualified", |profile| profile.topology),
+            cost_profile.map_or(0, |profile| profile.power_limit_watts),
+        );
+        Some(Mutex::new(RealFullDsparkRuntime {
+            mode: RealFullDsparkServingMode::Active,
+            confidence_policy: RealFullDsparkConfidencePolicy::Raw,
+            cache_mode: RealFullDsparkCacheMode::PromptSwa,
+            context_tokens: super::dflash::GLM53_DFLASH2_SLIDING_WINDOW,
+            engine: RealFullDraftEngine::Dflash2(engine),
+            requests: HashMap::new(),
+            tail_cache: RealFullDsparkTailCache::new(tail_cache_bytes),
+            cost_model,
+        }))
+    } else {
+        real_full_dspark_mode_and_snapshot()?
         .map(|(mode, snapshot)| {
             let cache_mode = real_full_dspark_cache_mode()?;
             let confidence_policy = real_full_dspark_confidence_policy()?;
@@ -6742,13 +8038,14 @@ pub(crate) fn load_real_full_serving(
                 confidence_policy,
                 cache_mode,
                 context_tokens,
-                engine,
+                engine: RealFullDraftEngine::Dspark(engine),
                 requests: HashMap::new(),
                 tail_cache: RealFullDsparkTailCache::new(tail_cache_bytes),
                 cost_model,
             }))
         })
-        .transpose()?;
+        .transpose()?
+    };
     eprintln!(
         "real_full_dspark_preload elapsed_ms={:.3} enabled={}",
         dspark_load_started.elapsed().as_secs_f64() * 1_000.0,
@@ -6847,7 +8144,7 @@ pub(crate) fn load_real_full_serving(
             );
             if let Some(prompts) = prewarm_prompts.as_ref() {
                 for worker_index in 0..executor.worker_count() {
-                    if max_execution_lanes > 1 && real_full_dspark_enabled() {
+                    if max_execution_lanes > 1 && real_full_draft_runtime_enabled() {
                         executor
                             .finish_real_full_sequence_on_worker(
                                 worker_index,
@@ -6888,7 +8185,7 @@ pub(crate) fn load_real_full_serving(
                         startup_started,
                         &mut phase_started,
                     );
-                    if max_execution_lanes > 1 && real_full_dspark_enabled() {
+                    if max_execution_lanes > 1 && real_full_draft_runtime_enabled() {
                         executor
                             .finish_real_full_sequence_on_worker(
                                 worker_index,
@@ -6947,7 +8244,7 @@ pub(crate) fn load_real_full_serving(
                 &mut phase_started,
             );
             if let Some(prompts) = prewarm_prompts.as_ref() {
-                if max_execution_lanes > 1 && real_full_dspark_enabled() {
+                if max_execution_lanes > 1 && real_full_draft_runtime_enabled() {
                     glmrt_api::RealFullRequestExecutor::finish_real_full_sequence(
                         &scheduler_executor,
                         REAL_FULL_STARTUP_PREWARM_PAIRED_LM_HEAD_PREFIX,
@@ -6980,7 +8277,7 @@ pub(crate) fn load_real_full_serving(
                     serving_kv_dtype,
                 )?;
                 report_real_full_startup_phase("prewarm-main", startup_started, &mut phase_started);
-                if max_execution_lanes > 1 && real_full_dspark_enabled() {
+                if max_execution_lanes > 1 && real_full_draft_runtime_enabled() {
                     glmrt_api::RealFullRequestExecutor::finish_real_full_sequence(
                         &scheduler_executor,
                         REAL_FULL_STARTUP_PREWARM_BATCHED_DSPARK_PREFIX,
@@ -8121,7 +9418,7 @@ fn prewarm_real_full_serving_requests(
     // after scratch has reached its final size. FP8 needs only its q8/q16
     // identities in the selector regime. The first width pass already
     // captures all other exact-width kernels.
-    if real_full_dspark_enabled() {
+    if real_full_draft_runtime_enabled() {
         let required_attention_prompt_tokens = if kv_dtype == KvCacheDType::Nvfp4 {
             &[9, 145, 513, 1_025, 2_049][..]
         } else {
@@ -8141,8 +9438,8 @@ fn prewarm_real_full_serving_requests(
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let checkpoint_max_drafts = dspark_active_max_verify_drafts();
-        let maximum_drafts = match real_full_dspark_fixed_drafts()? {
+        let checkpoint_max_drafts = real_full_active_max_verify_drafts();
+        let maximum_drafts = match real_full_active_fixed_drafts()? {
             Some(drafts) => {
                 anyhow::ensure!(
                     drafts <= checkpoint_max_drafts,
@@ -8547,7 +9844,7 @@ fn prewarm_real_full_dspark_widths(
     prewarm_start: Instant,
     draft_widths_override: Option<&[usize]>,
 ) -> Result<()> {
-    if !real_full_dspark_enabled() {
+    if !real_full_draft_runtime_enabled() {
         return Ok(());
     }
 
@@ -8565,13 +9862,13 @@ fn prewarm_real_full_dspark_widths(
     // capacity first, then retain all narrower DSA and attention identities.
     let draft_widths = match draft_widths_override {
         Some(draft_widths) => draft_widths.to_vec(),
-        None => match real_full_dspark_fixed_drafts()? {
+        None => match real_full_active_fixed_drafts()? {
             // The final cycle truncates to the remaining output budget, so a
             // fixed-width request can still reach every narrower M. Include
             // D=0/M=1 explicitly: the adaptive policy can choose target-only
             // decode, and that decode graph must exist before capture closes.
             Some(draft_tokens) => (0..=draft_tokens).rev().collect(),
-            None => (0..=dspark_active_max_verify_drafts()).rev().collect(),
+            None => (0..=real_full_active_max_verify_drafts()).rev().collect(),
         },
     };
     if draft_widths_override.is_some() && draft_widths.len() > 1 {
@@ -8587,7 +9884,7 @@ fn prewarm_real_full_dspark_widths(
     }
     for draft_tokens in draft_widths {
         let request_index = 30_000 + draft_tokens as u64 * 3;
-        let capture_budget = dspark_active_max_verify_drafts() + 4;
+        let capture_budget = real_full_active_max_verify_drafts() + 4;
         let sequence_id = format!(
             "real-full-startup-dspark-width-{draft_tokens}-{dspark_prompt_tokens}-sequence-{worker_index}"
         );
@@ -9671,13 +10968,14 @@ fn load_catalog(path: &Path) -> Result<TensorCatalog> {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_real_full_dspark_width_prewarm_sequence, parse_real_full_dspark_confidence_policy,
-        real_full_batched_dspark_prewarm_buffer_bank,
+        dflash_batch_group_size, finish_real_full_dspark_width_prewarm_sequence,
+        parse_real_full_dspark_confidence_policy, real_full_batched_dspark_prewarm_buffer_bank,
         real_full_batched_dspark_prewarm_requested_draft_tokens,
         real_full_batched_dspark_prewarm_sequence, real_full_capture_arena_sequence,
-        real_full_dspark_prefix_fingerprint, real_full_dspark_startup_draft_tokens,
-        real_full_mtp_acceptance, real_full_mtp_draft_policy_from_values,
-        real_full_mtp_draft_tokens_after_cycle_with_limit,
+        real_full_draft_absolute_context_start, real_full_draft_width_prewarm_passes,
+        real_full_draft_width_prewarm_prompt_repeats, real_full_dspark_prefix_fingerprint,
+        real_full_dspark_startup_draft_tokens, real_full_mtp_acceptance,
+        real_full_mtp_draft_policy_from_values, real_full_mtp_draft_tokens_after_cycle_with_limit,
         real_full_mtp_draft_tokens_for_cycle_with_policy, real_full_mtp_physical_padding_rows,
         real_full_mtp_startup_forced_draft_tokens, real_full_native_mtp_sequence_enabled,
         real_full_nvfp4_short_k_graph_audit, real_full_nvfp4_short_k_prefill_capture_plan,
@@ -9690,9 +10988,10 @@ mod tests {
         real_full_startup_target_radix_publish_tokens,
         real_full_startup_workspace_is_final_capture_set,
         real_full_startup_workspace_sizing_sequence, real_full_validate_sparse_wave_capacity,
-        request_prompt_token_ids, retain_graph_bound_scheduler_arena, DsparkConfidenceCalibrator,
-        DsparkConfidenceResidual, DsparkRequestCacheSnapshot, RealFullContextTokenBudget,
-        RealFullContextTokenExtent, RealFullDsparkConfidencePolicy, RealFullDsparkTailCache,
+        request_prompt_token_ids, retain_graph_bound_scheduler_arena, Dflash2AdaptiveDraftState,
+        DsparkConfidenceCalibrator, DsparkConfidenceResidual, DsparkRequestCacheSnapshot,
+        RealFullContextTokenBudget, RealFullContextTokenExtent, RealFullDraftCacheSnapshot,
+        RealFullDsparkCacheMode, RealFullDsparkConfidencePolicy, RealFullDsparkTailCache,
         RealFullDsparkTailEntry, RealFullDsparkTailKey, TargetKvRadixManager,
         REAL_FULL_MAX_ACTIVE_REQUESTS, REAL_FULL_SERVE_NVFP4_SHORT_K_PREFILL_QUERY_ROWS,
         REAL_FULL_SHARED_KV_PAGE_TOKENS,
@@ -9723,6 +11022,89 @@ mod tests {
     }
 
     #[test]
+    fn dflash_adaptive_confidence_treats_unreached_positions_as_censored() {
+        let mut state = Dflash2AdaptiveDraftState::default();
+        assert_eq!(state.conditional_confidence(5), vec![0.75; 5]);
+        state.observe(5, 2);
+        assert_eq!(
+            state.conditional_confidence(5),
+            vec![0.8, 0.8, 0.6, 0.75, 0.75]
+        );
+    }
+
+    #[test]
+    fn dflash_adaptive_starts_at_k5_then_uses_a_bounded_recent_history() {
+        let mut state = Dflash2AdaptiveDraftState::default();
+        for _ in 0..3 {
+            state.observe(5, 5);
+            assert!(state.cold_start());
+        }
+        state.observe(5, 5);
+        assert!(!state.cold_start());
+        for _ in 0..64 {
+            state.observe(7, 7);
+        }
+        assert_eq!(state.history.len(), super::DFLASH2_ADAPTIVE_HISTORY_LIMIT);
+        assert!(state
+            .conditional_confidence(7)
+            .into_iter()
+            .all(|confidence| confidence > 0.94));
+    }
+
+    #[test]
+    fn dflash_batches_four_then_two_and_leaves_only_a_scalar_tail() {
+        assert_eq!(dflash_batch_group_size(0), None);
+        assert_eq!(dflash_batch_group_size(1), None);
+        assert_eq!(dflash_batch_group_size(2), Some(2));
+        assert_eq!(dflash_batch_group_size(3), Some(2));
+        assert_eq!(dflash_batch_group_size(4), Some(4));
+        assert_eq!(dflash_batch_group_size(7), Some(4));
+    }
+
+    #[test]
+    fn dflash_width_prewarm_covers_dsa_and_the_settled_output_rotation() {
+        assert_eq!(real_full_draft_width_prewarm_prompt_repeats(false), 8);
+        assert_eq!(real_full_draft_width_prewarm_passes(false), 1);
+        assert_eq!(real_full_draft_width_prewarm_prompt_repeats(true), 2_048);
+        assert_eq!(real_full_draft_width_prewarm_passes(true), 2);
+    }
+
+    #[test]
+    fn prompt_swa_replay_uses_the_absolute_prompt_suffix_position_only_once() {
+        assert_eq!(
+            real_full_draft_absolute_context_start(
+                0,
+                Some(RealFullDsparkCacheMode::PromptSwa),
+                32_768,
+                7,
+            ),
+            Some(32_775)
+        );
+        assert_eq!(
+            real_full_draft_absolute_context_start(
+                1,
+                Some(RealFullDsparkCacheMode::PromptSwa),
+                32_768,
+                7,
+            ),
+            None
+        );
+        assert_eq!(
+            real_full_draft_absolute_context_start(
+                0,
+                Some(RealFullDsparkCacheMode::RequestLocal),
+                32_768,
+                7,
+            ),
+            None
+        );
+        assert_eq!(
+            real_full_draft_absolute_context_start(0, None, 32_768, 7),
+            None
+        );
+    }
+
+    #[test]
     fn dspark_confidence_policy_supports_calibrated_raw_and_residual_modes() {
         assert_eq!(
             parse_real_full_dspark_confidence_policy(None).unwrap(),
@@ -9745,11 +11127,11 @@ mod tests {
                 prefix_tokens: token_ids.len(),
                 prefix_sha256: real_full_dspark_prefix_fingerprint(token_ids),
             },
-            snapshot: DsparkRequestCacheSnapshot {
+            snapshot: RealFullDraftCacheSnapshot::Dspark(DsparkRequestCacheSnapshot {
                 context_tokens: token_ids.len(),
                 cache_context_tokens: token_ids.len(),
                 kv_bytes: vec![0_u8; bytes],
-            },
+            }),
             confidence_calibrator: DsparkConfidenceCalibrator::default(),
             confidence_residual: DsparkConfidenceResidual::default(),
         }
@@ -10161,6 +11543,18 @@ mod tests {
         assert_eq!(
             real_full_request_prefill_chunk_tokens_for_shape_with(2_048, 4_096, 1_024, 0, 4_096,),
             1_024
+        );
+        // The largest published prefill-grid suffix is still executed as
+        // eight 2,048-row sparse waves, not one 16K expert launch.
+        assert_eq!(
+            real_full_request_prefill_chunk_tokens_for_shape_with(2_048, 4_096, 1_024, 0, 16_384,),
+            2_048
+        );
+        assert_eq!(
+            real_full_request_prefill_chunk_tokens_for_shape_with(
+                2_048, 4_096, 1_024, 32_768, 16_384,
+            ),
+            2_048
         );
         assert_eq!(
             real_full_request_prefill_chunk_tokens_for_shape_with(2_048, 4_096, 1_024, 0, 5_157,),

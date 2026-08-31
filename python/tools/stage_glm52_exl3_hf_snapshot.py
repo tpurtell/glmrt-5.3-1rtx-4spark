@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage an accepted GLM-5.2 EXL3 artifact in the Hugging Face cache.
+"""Stage an accepted GLM-5 EXL3 artifact in the Hugging Face cache.
 
 Hardlink mode creates no second tensor payload on the coordinator.  Snapshot
 entries use the normal Hugging Face blob/symlink layout, so GLMRT can qualify
@@ -23,15 +23,19 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from validate_glm52_exl3_artifact import (  # noqa: E402
+    ArtifactContract,
     ARTIFACT_SCHEMA,
+    GLM53_MODEL_ID,
     MODEL_ID,
     SCHEMA as VALIDATION_SCHEMA,
     SHA256_RE,
+    _artifact_contract,
     _canonical_json,
     _json_object,
 )
 from validate_glm52_exl3_quant_evidence import (  # noqa: E402
     EXPECTED_PROJECTIONS,
+    GLM53_SCHEMA as GLM53_QUANT_EVIDENCE_SCHEMA,
     SCHEMA as QUANT_EVIDENCE_SCHEMA,
 )
 
@@ -39,6 +43,7 @@ from validate_glm52_exl3_quant_evidence import (  # noqa: E402
 SCHEMA = "glmrt-hf-staged-snapshot-v1"
 PUBLICATION_SCHEMA = "glmrt-hf-standard-publication-v3"
 MODEL_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+SUPPORTED_MODEL_IDS = frozenset({MODEL_ID, GLM53_MODEL_ID})
 
 
 class StagingError(RuntimeError):
@@ -79,10 +84,14 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact_entries(artifact: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _artifact_entries(
+    artifact: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any], ArtifactContract]:
+    plan = _json_object(artifact / "glmrt-gptqmodel-plan.json")
+    contract = _artifact_contract(plan)
     manifest = _json_object(artifact / "glmrt-gptqmodel-artifact.json")
     records = manifest.get("files")
-    if manifest.get("schema") != ARTIFACT_SCHEMA or not isinstance(records, dict):
+    if manifest.get("schema") != contract.artifact_schema or not isinstance(records, dict):
         raise StagingError("artifact manifest is not a complete GLMRT artifact")
     entries: list[dict[str, Any]] = []
     for relative, record in records.items():
@@ -115,7 +124,7 @@ def _artifact_entries(artifact: Path) -> tuple[list[dict[str, Any]], dict[str, A
     }
     if actual != {entry["path"] for entry in entries}:
         raise StagingError("artifact file set changed after validation")
-    return entries, manifest
+    return entries, manifest, contract
 
 
 def _validation_evidence(
@@ -123,7 +132,12 @@ def _validation_evidence(
     *,
     artifact: Path,
     artifact_manifest_sha256: str,
+    contract: ArtifactContract | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if contract is None:
+        contract = _artifact_contract(
+            _json_object(artifact / "glmrt-gptqmodel-plan.json")
+        )
     report_path = report_path.expanduser().resolve(strict=True)
     if report_path.is_symlink() or not report_path.is_file():
         raise StagingError("validation report is not a regular file")
@@ -177,6 +191,64 @@ def _validation_evidence(
             and tokenizer_evidence["total_tokens"] > 0
         )
     )
+    source_metadata = report.get("source_metadata")
+    source_metadata_by_name = (
+        {
+            record.get("name"): record
+            for record in source_metadata
+            if isinstance(record, dict)
+        }
+        if isinstance(source_metadata, list)
+        else {}
+    )
+    valid_source_metadata = (
+        isinstance(source_metadata, list)
+        and len(source_metadata) == 3
+        and set(source_metadata_by_name)
+        == {"tokenizer.json", "tokenizer_config.json", "generation_config.json"}
+        and all(
+            set(record) == {"name", "bytes", "sha256"}
+            and isinstance(record.get("bytes"), int)
+            and not isinstance(record.get("bytes"), bool)
+            and record["bytes"] > 0
+            and SHA256_RE.fullmatch(str(record.get("sha256", ""))) is not None
+            for record in source_metadata_by_name.values()
+        )
+        and all(
+            source_metadata_by_name.get(record["name"])
+            == {
+                "name": record.get("name"),
+                "bytes": record.get("bytes"),
+                "sha256": record.get("sha256"),
+            }
+            for record in tokenizer_files or []
+            if isinstance(record, dict)
+        )
+    )
+    if contract.model_id != GLM53_MODEL_ID:
+        valid_source_metadata = True
+    quantization_config = report.get("quantization_config")
+    quantize_config_path = artifact / "quantize_config.json"
+    valid_quantization_config = (
+        isinstance(quantization_config, dict)
+        and quantization_config.get("tensor_storage_entries")
+        == EXPECTED_PROJECTIONS
+        and quantization_config.get("stored_tensor_descriptions")
+        == EXPECTED_PROJECTIONS * 4
+        and SHA256_RE.fullmatch(
+            str(quantization_config.get("sha256", ""))
+        )
+        is not None
+        and SHA256_RE.fullmatch(
+            str(quantization_config.get("ledger_provenance_sha256", ""))
+        )
+        is not None
+        and not quantize_config_path.is_symlink()
+        and quantize_config_path.is_file()
+        and _hash_file(quantize_config_path) == quantization_config["sha256"]
+    )
+    if contract.model_id != GLM53_MODEL_ID:
+        valid_quantization_config = True
     checkpoint = report.get("projection_checkpoint")
     valid_checkpoint = (
         report.get("projection_checkpoint_bytes_verified") is True
@@ -198,11 +270,11 @@ def _validation_evidence(
         and SHA256_RE.fullmatch(execution_upgrade_sha256) is not None
     )
     if (
-        report.get("schema") != VALIDATION_SCHEMA
+        report.get("schema") != contract.validation_schema
         or report.get("status") != "accepted"
         or not isinstance(report_digest, str)
         or hashlib.sha256(_canonical_json(report_body)).hexdigest() != report_digest
-        or report.get("model_id") != MODEL_ID
+        or report.get("model_id") != contract.model_id
         or reported_artifact != artifact
         or report.get("artifact_manifest_sha256") != artifact_manifest_sha256
         or SHA256_RE.fullmatch(str(report.get("plan_sha256", ""))) is None
@@ -210,6 +282,8 @@ def _validation_evidence(
         or report.get("artifact_manifest_file_hashes_verified") is not True
         or not valid_checkpoint
         or not valid_tokenizer_evidence
+        or not valid_source_metadata
+        or not valid_quantization_config
         or not valid_execution_upgrade
     ):
         raise StagingError("validation report does not accept this exact artifact")
@@ -217,7 +291,7 @@ def _validation_evidence(
         "path": "artifact-validation.json",
         "bytes": report_path.stat().st_size,
         "sha256": _hash_file(report_path),
-        "schema": VALIDATION_SCHEMA,
+        "schema": contract.validation_schema,
     }
     return identity, report
 
@@ -226,7 +300,13 @@ def _quant_evidence(
     report_path: Path,
     *,
     plan_sha256: str,
+    contract: ArtifactContract | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected_schema = (
+        QUANT_EVIDENCE_SCHEMA
+        if contract is None or contract.exl3_bits == 3
+        else GLM53_QUANT_EVIDENCE_SCHEMA
+    )
     report_path = report_path.expanduser().resolve(strict=True)
     if report_path.is_symlink() or not report_path.is_file():
         raise StagingError("quant-evidence report is not a regular file")
@@ -288,7 +368,7 @@ def _quant_evidence(
         )
     expected_experts = 75 * 256
     if (
-        report.get("schema") != QUANT_EVIDENCE_SCHEMA
+        report.get("schema") != expected_schema
         or report.get("status") != "accepted"
         or report.get("quality_scope")
         != "projection-quantizer-evidence-not-end-to-end-model-quality"
@@ -326,7 +406,7 @@ def _quant_evidence(
         "path": "quant-evidence.json",
         "bytes": report_path.stat().st_size,
         "sha256": _hash_file(report_path),
-        "schema": QUANT_EVIDENCE_SCHEMA,
+        "schema": expected_schema,
         "report_sha256": report_digest,
     }
     return identity, report
@@ -336,6 +416,7 @@ def _publication_evidence(
     report_path: Path,
     *,
     publication: Path,
+    model_id: str = MODEL_ID,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     report_path = report_path.expanduser().resolve(strict=True)
     if report_path.is_symlink() or not report_path.is_file():
@@ -359,7 +440,7 @@ def _publication_evidence(
     if (
         report.get("schema") != PUBLICATION_SCHEMA
         or report.get("status") != "ready"
-        or report.get("model_id") != MODEL_ID
+        or report.get("model_id") != model_id
         or Path(str(report.get("output", ""))).expanduser().resolve() != publication
         or SHA256_RE.fullmatch(str(report.get("plan_sha256", ""))) is None
         or SHA256_RE.fullmatch(
@@ -490,8 +571,11 @@ def stage(
     link_mode: str,
     update_ref: bool,
 ) -> dict[str, Any]:
-    if model_id != MODEL_ID:
-        raise StagingError(f"this artifact must be staged as {MODEL_ID}")
+    if model_id not in SUPPORTED_MODEL_IDS:
+        raise StagingError(
+            "unsupported model ID; expected one of "
+            + ", ".join(sorted(SUPPORTED_MODEL_IDS))
+        )
     if (validation_report_path is None) == (publication_report_path is None):
         raise StagingError(
             "select exactly one of an artifact validation or standard publication report"
@@ -506,11 +590,16 @@ def stage(
         raise StagingError("artifact is not a regular directory")
     if publication_report_path is None:
         assert validation_report_path is not None
-        entries, artifact_manifest = _artifact_entries(artifact)
+        entries, artifact_manifest, contract = _artifact_entries(artifact)
+        if model_id != contract.model_id:
+            raise StagingError(
+                f"this artifact must be staged as {contract.model_id}, got {model_id}"
+            )
         qualification, validation = _validation_evidence(
             validation_report_path,
             artifact=artifact,
             artifact_manifest_sha256=artifact_manifest["manifest_sha256"],
+            contract=contract,
         )
         artifact_manifest_sha256 = artifact_manifest["manifest_sha256"]
         plan_sha256 = validation["plan_sha256"]
@@ -518,6 +607,7 @@ def stage(
         quant_qualification, quant_report = _quant_evidence(
             quant_evidence_report_path,
             plan_sha256=plan_sha256,
+            contract=contract,
         )
         if (
             validation["projection_checkpoint"]["checkpoint_inventory_sha256"]
@@ -540,6 +630,7 @@ def stage(
         entries, qualification, validation = _publication_evidence(
             publication_report_path,
             publication=artifact,
+            model_id=model_id,
         )
         artifact_manifest_sha256 = validation["source_artifact_manifest_sha256"]
         plan_sha256 = validation["plan_sha256"]
@@ -660,7 +751,11 @@ def main() -> None:
     evidence.add_argument("--validation-report", type=Path)
     evidence.add_argument("--publication-report", type=Path)
     parser.add_argument("--quant-evidence-report", type=Path)
-    parser.add_argument("--model-id", default=MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        required=True,
+        help="exact accepted Hugging Face repository ID; never inferred from a legacy default",
+    )
     parser.add_argument(
         "--hf-home",
         type=Path,

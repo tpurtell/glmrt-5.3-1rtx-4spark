@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 import re
 import statistics
-from typing import Any
+from typing import Any, Callable
 
 from _b12x_exl3_k3_profile import (
     exl3_k3_capacity_rows,
@@ -38,10 +38,16 @@ from validate_glm52_exl3_artifact import (
 
 SCHEMA = "glmrt-glm52-exl3-serving-qualification-v1"
 STARTUP_SCHEMA = "glmrt-glm52-expert-startup-v2"
-DEPLOYMENT_SCHEMA = "glmrt-wip-deployment-evidence-v1"
+DEPLOYMENT_SCHEMA = "glmrt-wip-deployment-evidence-v2"
+DFLASH2_MODEL_ID = "incoai/GLM-5.3-DFlash2"
+DFLASH2_REVISION = "425aa615ce320caac34400208b30808c8f14f76c"
 NATIVE_VALIDATION_SCHEMA = "glmrt-b12x-exl3-native-validation-v1"
+NATIVE_VALIDATOR_SOURCE = Path(__file__).resolve().with_name(
+    "validate_b12x_exl3_native.py"
+)
 TOOL_EVAL_VERSION = "2.3.2.dev3+g5df1e9e0c"
 QUALITY_CONTRACT_VERSION = "glmrt-semantic-decode-contract-v2"
+WEIGHTED_QUALITY_CONTRACT_VERSION = "glmrt-semantic-decode-contract-v3"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REVISION_RE = re.compile(r"^[0-9a-f]{40,64}$")
 BASELINE_MODELS = {
@@ -163,9 +169,21 @@ def sha256_canonical(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
-def require_model(model: Any, *, candidate: bool, field: str) -> str:
+def require_model(
+    model: Any,
+    *,
+    candidate: bool,
+    field: str,
+    expected_model: str | None = None,
+) -> str:
     if not isinstance(model, str):
         raise QualificationError(f"{field} has no model identity")
+    if expected_model is not None:
+        if model != expected_model:
+            raise QualificationError(
+                f"{field} model is {model!r}, not {expected_model!r}"
+            )
+        return model
     if candidate and model != MODEL_ID:
         raise QualificationError(f"{field} candidate model is {model!r}, not {MODEL_ID}")
     if not candidate and model not in BASELINE_MODELS:
@@ -173,15 +191,32 @@ def require_model(model: Any, *, candidate: bool, field: str) -> str:
     return model
 
 
-def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
+def blended(
+    path: Path, *, candidate: bool, expected_model: str | None = None
+) -> dict[str, Any]:
     resolved, records = read_jsonl(path)
     aggregates = [record.get("aggregate") for record in records if "aggregate" in record]
     if len(aggregates) != 1 or not isinstance(aggregates[0], dict):
         raise QualificationError(f"{resolved} must contain one blended aggregate")
     aggregate = aggregates[0]
-    if aggregate.get("schema") != "glmrt-mtp-acceptance-aggregate-v3":
+    aggregate_schema = aggregate.get("schema")
+    if aggregate_schema not in {
+        "glmrt-mtp-acceptance-aggregate-v3",
+        "glmrt-mtp-acceptance-aggregate-v4",
+    }:
         raise QualificationError(f"{resolved} does not use the prompt-bound blended schema")
-    require_model(aggregate.get("model"), candidate=candidate, field=os.fspath(resolved))
+    weighted_contract = aggregate_schema == "glmrt-mtp-acceptance-aggregate-v4"
+    quality_contract_version = (
+        WEIGHTED_QUALITY_CONTRACT_VERSION
+        if weighted_contract
+        else QUALITY_CONTRACT_VERSION
+    )
+    require_model(
+        aggregate.get("model"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
+    )
     measurements = [record for record in records if "aggregate" not in record]
     if len(measurements) != aggregate.get("cases") or not measurements:
         raise QualificationError(f"{resolved} blended measurement count differs")
@@ -204,6 +239,27 @@ def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
         or len(measurements) != cases_per_repeat * corpus_repeats
     ):
         raise QualificationError(f"{resolved} has an invalid blended case schedule")
+    raw_case_weights = aggregate.get("case_weights")
+    if weighted_contract:
+        if (
+            not isinstance(raw_case_weights, dict)
+            or set(raw_case_weights) != set(selected_case_ids)
+            or any(
+                isinstance(raw_case_weights.get(case_id), bool)
+                or not isinstance(raw_case_weights.get(case_id), (int, float))
+                or not math.isfinite(float(raw_case_weights[case_id]))
+                or float(raw_case_weights[case_id]) <= 0.0
+                for case_id in selected_case_ids
+            )
+        ):
+            raise QualificationError(f"{resolved} has invalid blended case weights")
+        case_weights = {
+            case_id: float(raw_case_weights[case_id]) for case_id in selected_case_ids
+        }
+    else:
+        if raw_case_weights is not None:
+            raise QualificationError(f"{resolved} legacy blended evidence has case weights")
+        case_weights = {case_id: 1.0 for case_id in selected_case_ids}
     prompt_contract = aggregate.get("prompt_contract")
     contract = aggregate.get("prompt_contract_sha256")
     if (
@@ -213,16 +269,29 @@ def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
         or sha256_canonical(prompt_contract) != contract
         or prompt_contract.get("repeats") != corpus_repeats
         or prompt_contract.get("nonce_seed") != aggregate.get("nonce_seed")
-        or prompt_contract.get("quality_contract_version") != QUALITY_CONTRACT_VERSION
+        or prompt_contract.get("quality_contract_version") != quality_contract_version
         or [
             case.get("id") if isinstance(case, dict) else None
             for case in prompt_contract.get("cases", [])
         ]
         != selected_case_ids
+        or (
+            weighted_contract
+            and any(
+                not isinstance(case, dict)
+                or case.get("weight") != case_weights[case_id]
+                or "response_format" not in case
+                for case_id, case in zip(
+                    selected_case_ids,
+                    prompt_contract.get("cases", []),
+                    strict=True,
+                )
+            )
+        )
     ):
         raise QualificationError(f"{resolved} has an invalid blended prompt contract")
     prompts: list[dict[str, Any]] = []
-    total_timed_tokens = 0
+    total_timed_tokens = 0.0
     total_decode_ms = 0.0
     total_drafts = 0
     total_accepted = 0
@@ -244,7 +313,7 @@ def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
         quality_passed = record.get("quality_contract_passed")
         quality_issues = record.get("quality_contract_issues")
         if (
-            record.get("quality_contract_version") != QUALITY_CONTRACT_VERSION
+            record.get("quality_contract_version") != quality_contract_version
             or not isinstance(quality_passed, bool)
             or not isinstance(quality_issues, list)
             or any(not isinstance(issue, str) or not issue for issue in quality_issues)
@@ -289,8 +358,9 @@ def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
         )
         if completion_tokens < 1:
             raise QualificationError(f"{resolved} has an empty blended generation")
-        total_timed_tokens += completion_tokens - 1
-        total_decode_ms += decode_ms
+        weight = case_weights[expected_case]
+        total_timed_tokens += weight * (completion_tokens - 1)
+        total_decode_ms += weight * decode_ms
         total_drafts += drafts
         total_accepted += accepted
         prompts.append(
@@ -298,28 +368,35 @@ def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
                 "case": record.get("case"),
                 "repeat": record.get("repeat"),
                 "prompt_sha256": prompt_sha256,
+                "prompt": record.get("prompt"),
+                "request_sha256": record.get("request_sha256"),
+                "nonce": record.get("nonce"),
             }
         )
         if (index + 1) % cases_per_repeat == 0:
             repeat_records = measurements[index + 1 - cases_per_repeat : index + 1]
             repeat_tokens = sum(
-                integer(
-                    item.get("completion_tokens"),
-                    f"{resolved}: repeat completion_tokens",
-                    minimum=2,
+                case_weights[str(item.get("case"))]
+                * (
+                    integer(
+                        item.get("completion_tokens"),
+                        f"{resolved}: repeat completion_tokens",
+                        minimum=2,
+                    )
+                    - 1
                 )
-                - 1
                 for item in repeat_records
             )
             repeat_ms = sum(
-                finite_positive(
+                case_weights[str(item.get("case"))]
+                * finite_positive(
                     item.get("decode_ms"), f"{resolved}: repeat decode_ms"
                 )
                 for item in repeat_records
             )
             repeat_wall_tps.append(repeat_tokens * 1_000.0 / repeat_ms)
     if (
-        aggregate.get("quality_contract_version") != QUALITY_CONTRACT_VERSION
+        aggregate.get("quality_contract_version") != quality_contract_version
         or aggregate.get("all_quality_contracts_passed")
         != (not quality_contract_failures)
         or aggregate.get("quality_contract_failures") != quality_contract_failures
@@ -357,21 +434,66 @@ def blended(path: Path, *, candidate: bool) -> dict[str, Any]:
     )
     if total_drafts <= 0 or not 0.0 < accepted_draft_rate <= 1.0:
         raise QualificationError(f"{resolved} has no usable draft acceptance evidence")
+    case_results = []
+    contract_cases = prompt_contract["cases"]
+    for case_index, case_id in enumerate(selected_case_ids):
+        case_records = measurements[case_index::cases_per_repeat]
+        contract_case = contract_cases[case_index]
+        category = contract_case.get("category") if isinstance(contract_case, dict) else None
+        if (
+            len(case_records) != corpus_repeats
+            or not isinstance(category, str)
+            or not category
+            or any(
+                record.get("category", category) != category
+                for record in case_records
+            )
+        ):
+            raise QualificationError(f"{resolved} has inconsistent per-case evidence")
+        case_tokens = sum(record["completion_tokens"] - 1 for record in case_records)
+        case_decode_ms = sum(float(record["decode_ms"]) for record in case_records)
+        case_drafts = sum(record["draft_tokens"] for record in case_records)
+        case_accepted = sum(record["accepted_draft_tokens"] for record in case_records)
+        case_results.append(
+            {
+                "case": case_id,
+                "category": category,
+                "samples": len(case_records),
+                "timed_tokens": case_tokens,
+                "decode_ms": case_decode_ms,
+                "decode_tps": case_tokens * 1_000.0 / case_decode_ms,
+                "draft_tokens": case_drafts,
+                "accepted_draft_tokens": case_accepted,
+                "accepted_draft_rate": (
+                    case_accepted / case_drafts if case_drafts else 0.0
+                ),
+            }
+        )
     return {
-        "identity": evidence_identity(resolved, "glmrt-mtp-acceptance-jsonl-v3"),
+        "identity": evidence_identity(
+            resolved,
+            "glmrt-mtp-acceptance-jsonl-v4"
+            if weighted_contract
+            else "glmrt-mtp-acceptance-jsonl-v3",
+        ),
         "model": aggregate["model"],
         "contract": contract,
+        "prompt_contract": prompt_contract,
+        "case_weights": case_weights,
         "prompts": prompts,
         "wall_decode_tps": wall_decode_tps,
         "median_repeat_wall_decode_tps": median_repeat_wall_decode_tps,
         "accepted_draft_rate": accepted_draft_rate,
         "cases": len(measurements),
+        "case_results": case_results,
         "all_quality_contracts_passed": not quality_contract_failures,
         "quality_contract_failures": quality_contract_failures,
     }
 
 
-def repeat_decode(path: Path, *, candidate: bool) -> dict[str, Any]:
+def repeat_decode(
+    path: Path, *, candidate: bool, expected_model: str | None = None
+) -> dict[str, Any]:
     resolved, records = read_jsonl(path)
     meta = [record for record in records if record.get("record") == "meta"]
     summaries = [record for record in records if record.get("record") == "summary"]
@@ -384,7 +506,12 @@ def repeat_decode(path: Path, *, candidate: bool) -> dict[str, Any]:
     summary = summaries[0]
     if metadata.get("schema") != "glmrt-repeat-decode-v2":
         raise QualificationError(f"{resolved} does not use the prompt-bound repeat schema")
-    require_model(metadata.get("model"), candidate=candidate, field=os.fspath(resolved))
+    require_model(
+        metadata.get("model"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
+    )
     contract = metadata.get("prompt_contract_sha256")
     tokenizer = metadata.get("tokenizer_sha256")
     warmups = integer(
@@ -424,6 +551,7 @@ def repeat_decode(path: Path, *, candidate: bool) -> dict[str, Any]:
         "repeats": repeats,
         "nonce_seed": nonce_seed,
         "temperature": 0,
+        "enable_thinking": False,
         "tokenizer_sha256": tokenizer,
     }
     if sha256_canonical(expected_contract) != contract:
@@ -537,7 +665,9 @@ def repeat_decode(path: Path, *, candidate: bool) -> dict[str, Any]:
     }
 
 
-def prefill(path: Path, *, candidate: bool) -> dict[str, Any]:
+def prefill(
+    path: Path, *, candidate: bool, expected_model: str | None = None
+) -> dict[str, Any]:
     resolved, records = read_jsonl(path)
     summaries = [
         record
@@ -552,7 +682,12 @@ def prefill(path: Path, *, candidate: bool) -> dict[str, Any]:
     if len(summaries) != 1 or len(measurements) + 1 != len(records):
         raise QualificationError(f"{resolved} has an invalid prefill record set")
     summary = summaries[0]
-    require_model(summary.get("model"), candidate=candidate, field=os.fspath(resolved))
+    require_model(
+        summary.get("model"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
+    )
     contract = summary.get("prompt_contract_sha256")
     corpus = summary.get("corpus_sha256")
     tokenizer = summary.get("tokenizer_sha256")
@@ -578,6 +713,15 @@ def prefill(path: Path, *, candidate: bool) -> dict[str, Any]:
         repeat = integer(
             record.get("repeat"), f"{resolved}: prefill repeat", minimum=1
         )
+        prompt_tokens = integer(
+            record.get("prompt_tokens"),
+            f"{resolved}: prefill prompt tokens",
+            minimum=1,
+        )
+        cached_prompt_tokens = integer(
+            record.get("cached_prompt_tokens"),
+            f"{resolved}: cached prefill prefix",
+        )
         if (
             record.get("model") != summary["model"]
             or record.get("profile") != profile
@@ -592,6 +736,11 @@ def prefill(path: Path, *, candidate: bool) -> dict[str, Any]:
             or record.get("numeric_progression_passed") is not True
             or record.get("attention_complete") is not True
             or record.get("prefill_rows") != suffix_tokens
+            or prompt_tokens - cached_prompt_tokens - 1 != suffix_tokens
+            or (
+                base_context_tokens > 0
+                and cached_prompt_tokens < base_context_tokens
+            )
         ):
             raise QualificationError(f"{resolved} failed prefill runtime correctness")
         finite_positive(record.get("prefill_ms"), f"{resolved}: prefill ms")
@@ -675,7 +824,13 @@ def prefill(path: Path, *, candidate: bool) -> dict[str, Any]:
     }
 
 
-def tool_eval(path: Path, *, candidate: bool, expected_version: str) -> dict[str, Any]:
+def tool_eval(
+    path: Path,
+    *,
+    candidate: bool,
+    expected_version: str,
+    expected_model: str | None = None,
+) -> dict[str, Any]:
     resolved = path.expanduser().resolve(strict=True)
     report = _json_object(resolved)
     config = report.get("config")
@@ -691,8 +846,18 @@ def tool_eval(path: Path, *, candidate: bool, expected_version: str) -> dict[str
         or metadata.get("tool_version") != expected_version
     ):
         raise QualificationError(f"{resolved} is not a completed matched tool evaluation")
-    require_model(config.get("model"), candidate=candidate, field=os.fspath(resolved))
-    require_model(metadata.get("model"), candidate=candidate, field=os.fspath(resolved))
+    require_model(
+        config.get("model"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
+    )
+    require_model(
+        metadata.get("model"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
+    )
     scenario_results = scores.get("scenario_results")
     if not isinstance(scenario_results, list) or not scenario_results:
         raise QualificationError(f"{resolved} has no tool-evaluation scenarios")
@@ -732,6 +897,7 @@ def tool_eval(path: Path, *, candidate: bool, expected_version: str) -> dict[str
         or scores.get("excluded_scenarios", []) != []
         or scores.get("completion_rate", 100.0) != 100.0
         or config.get("error_rate") != 0.0
+        or config.get("temperature") != 0.0
     ):
         raise QualificationError(f"{resolved} has invalid tool-evaluation totals")
     return {
@@ -749,28 +915,37 @@ def tool_eval(path: Path, *, candidate: bool, expected_version: str) -> dict[str
     }
 
 
-def startup(path: Path, *, candidate: bool) -> dict[str, Any]:
+def startup(
+    path: Path,
+    *,
+    candidate: bool,
+    expected_model: str | None = None,
+    expected_weight_format: str | None = None,
+    expected_preload_modes: set[str] | None = None,
+    expected_include_mtp: bool = False,
+    expected_schema: str = STARTUP_SCHEMA,
+) -> dict[str, Any]:
     resolved = path.expanduser().resolve(strict=True)
     report = _json_object(resolved)
     digest = report.get("report_sha256")
     body = {key: value for key, value in report.items() if key != "report_sha256"}
     hosts = report.get("hosts")
     summary = report.get("summary")
-    expected_format = "exl3" if candidate else "nvfp4"
-    expected_preload_modes = (
+    expected_format = expected_weight_format or ("exl3" if candidate else "nvfp4")
+    accepted_preload_modes = expected_preload_modes or (
         {"direct-resident", "cooperative-coalesced"}
         if candidate
         else {"nvfp4-production"}
     )
     expert_runtime_fingerprint = report.get("expert_runtime_fingerprint")
     if (
-        report.get("schema") != STARTUP_SCHEMA
+        report.get("schema") != expected_schema
         or report.get("status") != "accepted"
         or report.get("weight_format") != expected_format
-        or report.get("preload_mode") not in expected_preload_modes
+        or report.get("preload_mode") not in accepted_preload_modes
         or SHA256_RE.fullmatch(str(expert_runtime_fingerprint or "")) is None
         or report.get("cache_state") not in {"cold", "warm"}
-        or report.get("include_mtp") is not False
+        or report.get("include_mtp") is not expected_include_mtp
         or not isinstance(digest, str)
         or hashlib.sha256(canonical_json(body)).hexdigest() != digest
         or not isinstance(hosts, list)
@@ -778,7 +953,12 @@ def startup(path: Path, *, candidate: bool) -> dict[str, Any]:
         or not isinstance(summary, dict)
     ):
         raise QualificationError(f"{resolved} is not accepted expert-startup evidence")
-    require_model(report.get("model"), candidate=candidate, field=os.fspath(resolved))
+    require_model(
+        report.get("model"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
+    )
     host_names = [host.get("host") if isinstance(host, dict) else None for host in hosts]
     if any(not isinstance(host, str) or not host for host in host_names) or len(
         set(host_names)
@@ -793,7 +973,7 @@ def startup(path: Path, *, candidate: bool) -> dict[str, Any]:
         f"{resolved}: maximum expert startup",
     )
     return {
-        "identity": evidence_identity(resolved, STARTUP_SCHEMA),
+        "identity": evidence_identity(resolved, expected_schema),
         "model": report["model"],
         "preload_mode": report["preload_mode"],
         "expert_runtime_fingerprint": expert_runtime_fingerprint,
@@ -805,13 +985,20 @@ def startup(path: Path, *, candidate: bool) -> dict[str, Any]:
     }
 
 
-def deployment(path: Path, *, candidate: bool) -> dict[str, Any]:
+def deployment(
+    path: Path,
+    *,
+    candidate: bool,
+    expected_model: str | None = None,
+    expected_speculation: str = "dspark",
+) -> dict[str, Any]:
     resolved = path.expanduser().resolve(strict=True)
     report = _json_object(resolved)
     digest = report.get("report_sha256")
     body = {key: value for key, value in report.items() if key != "report_sha256"}
     fingerprints = report.get("fingerprints")
     inputs = report.get("inputs")
+    speculation_settings = report.get("speculation_settings", {})
     required_fingerprints = {
         "coordinator_slot",
         "expert_slot",
@@ -839,7 +1026,10 @@ def deployment(path: Path, *, candidate: bool) -> dict[str, Any]:
         or not isinstance(report.get("slot"), str)
         or not report["slot"]
         or report.get("profile") not in {"balanced", "long", "accuracy"}
-        or report.get("speculation") != "dspark"
+        or report.get("speculation") != expected_speculation
+        or isinstance(report.get("launch_started_ns"), bool)
+        or not isinstance(report.get("launch_started_ns"), int)
+        or report["launch_started_ns"] <= 0
         or isinstance(report.get("power_limit_w"), bool)
         or not isinstance(report.get("power_limit_w"), int)
         or report["power_limit_w"] <= 0
@@ -857,10 +1047,64 @@ def deployment(path: Path, *, candidate: bool) -> dict[str, Any]:
             f"{fingerprints['expert_slot'][:12]}"
         )
         or not valid_inputs
+        or not isinstance(speculation_settings, dict)
     ):
         raise QualificationError(f"{resolved} is not valid WIP deployment evidence")
+    if expected_speculation == "dflash2":
+        legacy_keys = {
+            "checkpoint_model_id",
+            "checkpoint_revision",
+            "fixed_drafts",
+            "topk_backend",
+        }
+        policy_keys = legacy_keys | {"draft_policy", "proposal_drafts"}
+        settings_keys = set(speculation_settings)
+        fixed_drafts = speculation_settings.get("fixed_drafts")
+        proposal_drafts = speculation_settings.get("proposal_drafts")
+        draft_policy = speculation_settings.get("draft_policy")
+        valid_fixed_drafts = (
+            not isinstance(fixed_drafts, bool) and isinstance(fixed_drafts, int)
+        )
+        valid_policy = settings_keys == policy_keys and (
+            (
+                draft_policy == "adaptive"
+                and fixed_drafts is None
+                and not isinstance(proposal_drafts, bool)
+                and isinstance(proposal_drafts, int)
+                and 1 <= proposal_drafts <= 7
+            )
+            or (
+                draft_policy == "fixed"
+                and valid_fixed_drafts
+                and not isinstance(proposal_drafts, bool)
+                and isinstance(proposal_drafts, int)
+                and 1 <= fixed_drafts <= proposal_drafts <= 7
+            )
+        )
+        valid_legacy = (
+            settings_keys == legacy_keys
+            and valid_fixed_drafts
+            and 0 <= fixed_drafts <= 7
+        )
+        if (
+            not (valid_legacy or valid_policy)
+            or speculation_settings.get("checkpoint_model_id") != DFLASH2_MODEL_ID
+            or speculation_settings.get("checkpoint_revision") != DFLASH2_REVISION
+            or speculation_settings.get("topk_backend")
+            not in {"torch", "flashinfer", "flashinfer-dsa"}
+        ):
+            raise QualificationError(
+                f"{resolved} has invalid DFlash2 deployment settings"
+            )
+    elif speculation_settings:
+        raise QualificationError(
+            f"{resolved} has settings for inactive DFlash2 speculation"
+        )
     model = require_model(
-        report.get("model_id"), candidate=candidate, field=os.fspath(resolved)
+        report.get("model_id"),
+        candidate=candidate,
+        field=os.fspath(resolved),
+        expected_model=expected_model,
     )
     return {
         "identity": evidence_identity(resolved, DEPLOYMENT_SCHEMA),
@@ -869,6 +1113,8 @@ def deployment(path: Path, *, candidate: bool) -> dict[str, Any]:
         "slot": report["slot"],
         "profile": report["profile"],
         "speculation": report["speculation"],
+        "speculation_settings": speculation_settings,
+        "launch_started_ns": report["launch_started_ns"],
         "power_limit_w": report["power_limit_w"],
         "engine_identity": report["engine_identity"],
         "sparkinfer_revision": report["sparkinfer_revision"],
@@ -881,7 +1127,28 @@ def native_validations(
     *,
     expected_sparkinfer_revision: str,
     expected_checkpoint_root: Path,
+    expected_expert_slot_fingerprint: str,
+    expected_trellis_bits: int = 3,
+    expected_required_rows: frozenset[int] = REQUIRED_NATIVE_ROWS,
+    capacity_rows_for_live_rows: Callable[[int], int] = exl3_k3_capacity_rows,
+    route_block_rows_for_capacity: Callable[[int], int] = exl3_k3_route_block_rows,
+    expected_artifact_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
+    if SHA256_RE.fullmatch(expected_expert_slot_fingerprint) is None:
+        raise QualificationError("native EXL3 expert-slot fingerprint is invalid")
+    if expected_trellis_bits not in {3, 4}:
+        raise QualificationError("native EXL3 trellis bits must be 3 or 4")
+    if (
+        expected_artifact_manifest_sha256 is not None
+        and SHA256_RE.fullmatch(expected_artifact_manifest_sha256) is None
+    ):
+        raise QualificationError("native EXL3 artifact-manifest digest is invalid")
+    artifact_backed = expected_artifact_manifest_sha256 is not None
+    expected_weight_kind = (
+        "finalized-exl3-artifact"
+        if artifact_backed
+        else "calibrated-projection-checkpoints"
+    )
     if len(paths) != 4:
         raise QualificationError("native EXL3 qualification requires exactly four TP-rank reports")
     reports: list[dict[str, Any]] = []
@@ -906,12 +1173,16 @@ def native_validations(
         if (
             report.get("schema") != NATIVE_VALIDATION_SCHEMA
             or report.get("status") != "accepted"
+            or report.get("script_sha256") != hash_file(NATIVE_VALIDATOR_SOURCE)
+            or report.get("expert_slot_fingerprint")
+            != expected_expert_slot_fingerprint
+            or report.get("trellis_bits") != expected_trellis_bits
             or not isinstance(digest, str)
             or not SHA256_RE.fullmatch(digest)
             or hashlib.sha256(canonical_json(body)).hexdigest() != digest
             or report.get("sparkinfer_revision") != expected_sparkinfer_revision
             or not isinstance(weight_source, dict)
-            or weight_source.get("kind") != "calibrated-projection-checkpoints"
+            or weight_source.get("kind") != expected_weight_kind
             or not isinstance(native_library, dict)
             or not isinstance(device, dict)
             or device.get("compute_capability") not in {"12.0", "12.1"}
@@ -919,8 +1190,8 @@ def native_validations(
         ):
             raise QualificationError(f"{resolved} is not accepted native EXL3 evidence")
         if Path(str(weight_source.get("root", ""))).expanduser().resolve() != expected_checkpoint_root:
-            raise QualificationError(f"{resolved} uses another projection-checkpoint root")
-        if (
+            raise QualificationError(f"{resolved} uses another real-weight root")
+        common_source_invalid = (
             weight_source.get("tp_world_size") != 4
             or not isinstance(weight_source.get("tp_rank"), int)
             or isinstance(weight_source.get("tp_rank"), bool)
@@ -928,15 +1199,48 @@ def native_validations(
             or not isinstance(weight_source.get("layer_id"), int)
             or not 3 <= weight_source["layer_id"] <= 77
             or weight_source.get("projection_count") != 768
+        )
+        if artifact_backed:
+            authenticated_files = weight_source.get("authenticated_files")
+            artifact_source_invalid = (
+                weight_source.get("artifact_manifest_sha256")
+                != expected_artifact_manifest_sha256
+                or SHA256_RE.fullmatch(str(weight_source.get("plan_sha256", "")))
+                is None
+                or weight_source.get("tensor_count") != 3_072
+                or not isinstance(authenticated_files, list)
+                or len(authenticated_files) < 3
+                or any(
+                    not isinstance(record, dict)
+                    or not isinstance(record.get("name"), str)
+                    or integer(
+                        record.get("bytes"),
+                        f"{resolved}: authenticated artifact bytes",
+                        minimum=1,
+                    )
+                    <= 0
+                    or SHA256_RE.fullmatch(str(record.get("sha256", ""))) is None
+                    for record in authenticated_files
+                )
+            )
+            if common_source_invalid or artifact_source_invalid:
+                raise QualificationError(
+                    f"{resolved} has invalid finalized-artifact coverage"
+                )
+        elif (
+            common_source_invalid
             or integer(
                 weight_source.get("tensor_bytes"),
                 f"{resolved}: native checkpoint tensor bytes",
                 minimum=1,
             )
             <= 0
-            or SHA256_RE.fullmatch(str(weight_source.get("inventory_sha256", ""))) is None
+            or SHA256_RE.fullmatch(str(weight_source.get("inventory_sha256", "")))
+            is None
         ):
-            raise QualificationError(f"{resolved} has invalid calibrated checkpoint coverage")
+            raise QualificationError(
+                f"{resolved} has invalid calibrated checkpoint coverage"
+            )
         if (
             not isinstance(native_library.get("path"), str)
             or integer(
@@ -956,8 +1260,8 @@ def native_validations(
             if rows in observed_rows:
                 raise QualificationError(f"{resolved} duplicates native rows {rows}")
             observed_rows.add(rows)
-            expected_capacity = exl3_k3_capacity_rows(rows)
-            expected_route_block = exl3_k3_route_block_rows(expected_capacity)
+            expected_capacity = capacity_rows_for_live_rows(rows)
+            expected_route_block = route_block_rows_for_capacity(expected_capacity)
             packed_route_count = integer(
                 case.get("packed_route_count"),
                 f"{resolved}: native packed route count",
@@ -1001,8 +1305,8 @@ def native_validations(
             finite_nonnegative(
                 case.get("max_abs"), f"{resolved}: native maximum absolute error"
             )
-        if not REQUIRED_NATIVE_ROWS.issubset(observed_rows):
-            missing = sorted(REQUIRED_NATIVE_ROWS - observed_rows)
+        if not expected_required_rows.issubset(observed_rows):
+            missing = sorted(expected_required_rows - observed_rows)
             raise QualificationError(f"{resolved} misses required native row cases {missing}")
         reports.append(report)
         identities.append(evidence_identity(resolved, NATIVE_VALIDATION_SCHEMA))
@@ -1010,10 +1314,15 @@ def native_validations(
     ranks = [report["weight_source"]["tp_rank"] for report in reports]
     if sorted(ranks) != [0, 1, 2, 3]:
         raise QualificationError(f"native EXL3 reports do not cover TP ranks 0..3: {ranks}")
-    for field in ("root", "layer_id", "projection_count", "tensor_bytes", "inventory_sha256"):
+    shared_source_fields = (
+        ("root", "layer_id", "projection_count", "tensor_count", "artifact_manifest_sha256", "plan_sha256")
+        if artifact_backed
+        else ("root", "layer_id", "projection_count", "tensor_bytes", "inventory_sha256")
+    )
+    for field in shared_source_fields:
         values = {str(report["weight_source"][field]) for report in reports}
         if len(values) != 1:
-            raise QualificationError(f"native EXL3 reports disagree on checkpoint {field}")
+            raise QualificationError(f"native EXL3 reports disagree on weight source {field}")
     library_identities = {
         (report["native_library"]["bytes"], report["native_library"]["sha256"])
         for report in reports
@@ -1022,13 +1331,15 @@ def native_validations(
         raise QualificationError("native EXL3 reports used different native libraries")
     return {
         "identities": identities,
+        "expert_slot_fingerprint": expected_expert_slot_fingerprint,
+        "trellis_bits": expected_trellis_bits,
         "tp_ranks": sorted(ranks),
         "layer_id": reports[0]["weight_source"]["layer_id"],
         "checkpoint_inventory_sha256": reports[0]["weight_source"][
-            "inventory_sha256"
+            "artifact_manifest_sha256" if artifact_backed else "inventory_sha256"
         ],
         "native_library": reports[0]["native_library"],
-        "required_rows": sorted(REQUIRED_NATIVE_ROWS),
+        "required_rows": sorted(expected_required_rows),
     }
 
 
@@ -1037,6 +1348,11 @@ def revalidate_native_evidence(
     *,
     expected_sparkinfer_revision: str,
     expected_checkpoint_root: Path,
+    expected_expert_slot_fingerprint: str,
+    expected_trellis_bits: int = 3,
+    expected_required_rows: frozenset[int] = REQUIRED_NATIVE_ROWS,
+    capacity_rows_for_live_rows: Callable[[int], int] = exl3_k3_capacity_rows,
+    route_block_rows_for_capacity: Callable[[int], int] = exl3_k3_route_block_rows,
 ) -> dict[str, Any]:
     """Re-read all four native reports and match their embedded summary."""
 
@@ -1067,8 +1383,15 @@ def revalidate_native_evidence(
         [Path(identity["path"]) for identity in raw_identities],
         expected_sparkinfer_revision=expected_sparkinfer_revision,
         expected_checkpoint_root=expected_checkpoint_root,
+        expected_expert_slot_fingerprint=expected_expert_slot_fingerprint,
+        expected_trellis_bits=expected_trellis_bits,
+        expected_required_rows=expected_required_rows,
+        capacity_rows_for_live_rows=capacity_rows_for_live_rows,
+        route_block_rows_for_capacity=route_block_rows_for_capacity,
     )
     expected_summary = {
+        "expert_slot_fingerprint": native["expert_slot_fingerprint"],
+        "trellis_bits": native["trellis_bits"],
         "tp_ranks": native["tp_ranks"],
         "layer_id": native["layer_id"],
         "checkpoint_inventory_sha256": native["checkpoint_inventory_sha256"],
@@ -1178,6 +1501,9 @@ def qualify(
         expected_checkpoint_root=Path(
             validation["projection_checkpoint"]["root"]
         ).expanduser().resolve(),
+        expected_expert_slot_fingerprint=candidate_deployment["fingerprints"][
+            "expert_slot"
+        ],
     )
 
     baseline_blended = blended(baseline_blended_path, candidate=False)
@@ -1436,6 +1762,8 @@ def qualify(
                 "startup_ratio": expert_startup_ratio,
             },
             "native_kernel": {
+                "expert_slot_fingerprint": native["expert_slot_fingerprint"],
+                "trellis_bits": native["trellis_bits"],
                 "tp_ranks": native["tp_ranks"],
                 "layer_id": native["layer_id"],
                 "checkpoint_inventory_sha256": native[

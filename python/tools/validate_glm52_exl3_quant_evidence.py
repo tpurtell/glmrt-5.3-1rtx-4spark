@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Validate and summarize GLM-5.2 EXL3 projection quality evidence.
+"""Validate and summarize GLM-5 EXL3 projection quality evidence.
 
 This tool is independent of GPTQModel.  It authenticates the immutable plan,
 projection manifests, packed payloads, and append-only error journal; requires
-complete GLM-5.2 routed-expert coverage by default; checks the arithmetic and
+complete routed-expert coverage by default; checks the arithmetic and
 shape invariants in every quantizer report; and writes a content-bound summary.
 It deliberately does not set a model-quality threshold: held-out end-to-end
 qualification remains a separate release gate.
@@ -20,6 +20,7 @@ import re
 import sys
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,6 +34,7 @@ from glm52_execution_upgrade import (  # noqa: E402
 
 
 SCHEMA = "glmrt-glm52-exl3-quant-evidence-validation-v2"
+GLM53_SCHEMA = "glmrt-glm5-exl3-quant-evidence-validation-v1"
 PLAN_SCHEMAS = {
     "glmrt-glm52-gptqmodel-plan-v1",
     "glmrt-glm52-gptqmodel-plan-v2",
@@ -59,6 +61,80 @@ MCG_SHA256 = "ade4fb124dda0f3537386cdd4a3cdcea3a223d386e506a4be89394bb33ee13fe"
 
 class EvidenceValidationError(RuntimeError):
     """The projection evidence cannot be accepted."""
+
+
+@dataclass(frozen=True)
+class QuantEvidenceContract:
+    report_schema: str
+    release: str
+    recipe: str
+    source_format: str
+    bits: int
+    first_layer: int = FIRST_LAYER
+    last_layer: int = LAST_LAYER
+    experts: int = EXPERTS
+
+    @property
+    def expected_projections(self) -> int:
+        return (self.last_layer - self.first_layer + 1) * self.experts * len(
+            PROJECTIONS
+        )
+
+    @property
+    def expected_experts(self) -> int:
+        return (self.last_layer - self.first_layer + 1) * self.experts
+
+    @property
+    def scope(self) -> str:
+        return (
+            f"{self.release}-base-routed-experts-layers-"
+            f"{self.first_layer}-through-{self.last_layer}"
+        )
+
+
+def quant_evidence_contract(plan: dict[str, Any]) -> QuantEvidenceContract:
+    schema = plan.get("schema")
+    recipe = plan.get("recipe")
+    source = plan.get("source")
+    if schema in PLAN_SCHEMAS and recipe in {
+        None,
+        "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1",
+    }:
+        return QuantEvidenceContract(
+            report_schema=SCHEMA,
+            release="glm-5.2",
+            recipe="glm52_exl3_trellis_3bpw_calibrated_natural_route_v1",
+            source_format="bf16",
+            bits=3,
+        )
+    if (
+        schema == "glmrt-glm5-gptqmodel-plan-v3"
+        and recipe == "glm53_exl3_trellis_4bpw_calibrated_natural_route_v1"
+        and isinstance(source, dict)
+        and source.get("release") == "glm-5.3"
+        and source.get("format") == "fp8-e4m3-block128x128-dynamic"
+    ):
+        geometry = source.get("geometry")
+        if not isinstance(geometry, dict) or any(
+            geometry.get(field) != expected
+            for field, expected in {
+                "first_target_layer": FIRST_LAYER,
+                "last_target_layer": LAST_LAYER,
+                "n_routed_experts": EXPERTS,
+                "mtp_layer_index": 78,
+            }.items()
+        ):
+            raise EvidenceValidationError(
+                "GLM-5.3 quantization plan has the wrong routed-expert geometry"
+            )
+        return QuantEvidenceContract(
+            report_schema=GLM53_SCHEMA,
+            release="glm-5.3",
+            recipe=recipe,
+            source_format="fp8-e4m3-block128x128-dynamic",
+            bits=4,
+        )
+    raise EvidenceValidationError("unsupported GLM-5 EXL3 quantization plan")
 
 
 def canonical_json(value: Any) -> bytes:
@@ -138,22 +214,29 @@ def close(
 def validate_plan(path: Path) -> dict[str, Any]:
     plan = json_object(path)
     bound_body(plan, "plan_sha256", "quantization plan")
+    contract = quant_evidence_contract(plan)
     checkpoint = plan.get("projection_checkpoint")
     provenance = plan.get("ledger_provenance")
     family = provenance.get("family_join") if isinstance(provenance, dict) else None
     numerics = family.get("quantizer_numerics") if isinstance(family, dict) else None
     if (
-        plan.get("schema") not in PLAN_SCHEMAS
-        or not isinstance(checkpoint, dict)
+        not isinstance(checkpoint, dict)
         or checkpoint.get("contract") != "ds4rt.exl3-projection-checkpoint-v1"
         or not isinstance(checkpoint.get("root"), str)
         or not isinstance(plan.get("run_state_dir"), str)
         or not isinstance(family, dict)
-        or family.get("bits") != 3
+        or family.get("bits") != contract.bits
         or family.get("codebook") != "mcg"
         or not isinstance(numerics, dict)
     ):
         raise EvidenceValidationError("quantization plan has the wrong EXL3 contract")
+    exl3 = plan.get("exl3")
+    if plan.get("schema") == "glmrt-glm5-gptqmodel-plan-v3" and (
+        not isinstance(exl3, dict)
+        or exl3.get("bits") != contract.bits
+        or exl3.get("codebook") != "mcg"
+    ):
+        raise EvidenceValidationError("quantization plan EXL3 declaration is invalid")
     finite_number(numerics.get("sigma_reg"), "plan sigma_reg", minimum=1.0e-300)
     return plan
 
@@ -218,16 +301,23 @@ def checkpoint_paths(root: Path) -> list[tuple[str, Path, Path]]:
     return [(digest, manifests[digest], tensors[digest]) for digest in sorted(manifests)]
 
 
-def expected_tensor_specs(input_shape: list[int]) -> dict[str, tuple[list[int], str, int]]:
+def expected_tensor_specs(
+    input_shape: list[int], bits: int = 3
+) -> dict[str, tuple[list[int], str, int]]:
     if (
         len(input_shape) != 2
         or any(isinstance(value, bool) or not isinstance(value, int) for value in input_shape)
         or any(value <= 0 or value % 16 for value in input_shape)
+        or bits not in {3, 4}
     ):
         raise EvidenceValidationError("projection input weight shape is invalid")
     rows, columns = input_shape
     return {
-        "trellis": ([rows // 16, columns // 16, 48], "torch.int16", rows * columns * 3 // 8),
+        "trellis": (
+            [rows // 16, columns // 16, 16 * bits],
+            "torch.int16",
+            rows * columns * bits // 8,
+        ),
         "suh": ([rows], "torch.float16", rows * 2),
         "svh": ([columns], "torch.float16", columns * 2),
         "mcg": ([], "torch.int32", 4),
@@ -235,9 +325,9 @@ def expected_tensor_specs(input_shape: list[int]) -> dict[str, tuple[list[int], 
 
 
 def validate_tensor_specs(
-    specs: Any, input_shape: list[int], encoded_bytes: Any
+    specs: Any, input_shape: list[int], encoded_bytes: Any, *, bits: int = 3
 ) -> int:
-    expected = expected_tensor_specs(input_shape)
+    expected = expected_tensor_specs(input_shape, bits)
     if not isinstance(specs, dict) or set(specs) != set(expected):
         raise EvidenceValidationError("checkpoint tensor set is invalid")
     total = 0
@@ -438,13 +528,18 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     by_projection: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_layer: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    by_route_evidence: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         by_projection[record["projection"]].append(record)
         by_layer[record["layer"]].append(record)
+        by_route_evidence[record["route_evidence"]].append(record)
     return {
         "percentile_method": "linear-r7",
         "global": one(records),
         "by_projection": {name: one(by_projection[name]) for name in sorted(by_projection)},
+        "by_route_evidence": {
+            name: one(by_route_evidence[name]) for name in sorted(by_route_evidence)
+        },
         "by_layer": [
             {"layer": layer, **one(by_layer[layer])} for layer in sorted(by_layer)
         ],
@@ -458,11 +553,17 @@ def validate_evidence(
     journal_path: Path,
     require_complete: bool,
     verify_tensor_hashes: bool,
+    live_journal_snapshot: bool = False,
 ) -> dict[str, Any]:
+    if require_complete and live_journal_snapshot:
+        raise EvidenceValidationError(
+            "a live journal snapshot cannot prove complete release evidence"
+        )
     plan_path = plan_path.expanduser().resolve(strict=True)
     checkpoint_root = checkpoint_root.expanduser().resolve(strict=True)
     journal_path = journal_path.expanduser().resolve(strict=True)
     plan = validate_plan(plan_path)
+    contract = quant_evidence_contract(plan)
     planned_root = Path(plan["projection_checkpoint"]["root"]).expanduser().resolve()
     planned_journal = (
         Path(plan["run_state_dir"]).expanduser().resolve()
@@ -492,12 +593,14 @@ def validate_evidence(
         raise EvidenceValidationError("projection checkpoint store is empty")
 
     modules: set[str] = set()
+    checkpoint_modules: set[str] = set()
     ledger_digests: set[str] = set()
     experts: dict[tuple[int, int], tuple[Any, Any, int]] = {}
     records: list[dict[str, Any]] = []
     inventory = hashlib.sha256()
     packed_bytes = 0
     encoded_bytes = 0
+    post_snapshot_checkpoint_count = 0
     for request_digest, manifest_path, tensor_path in pairs:
         manifest = json_object(manifest_path)
         bound_body(manifest, "manifest_sha256", f"checkpoint {request_digest}")
@@ -522,15 +625,17 @@ def validate_evidence(
 
         module = request.get("module")
         match = MODULE_RE.fullmatch(module) if isinstance(module, str) else None
-        if match is None or module in modules:
+        if match is None or module in checkpoint_modules:
             raise EvidenceValidationError("checkpoint module identity is invalid")
-        modules.add(module)
+        checkpoint_modules.add(module)
         layer = int(match.group("layer"))
         expert = int(match.group("expert"))
         projection_name = match.group("projection")
         projection = PROJECTIONS[projection_name]
-        if not FIRST_LAYER <= layer <= LAST_LAYER or not 0 <= expert < EXPERTS:
-            raise EvidenceValidationError("checkpoint module is outside the GLM-5.2 scope")
+        if not contract.first_layer <= layer <= contract.last_layer or not (
+            0 <= expert < contract.experts
+        ):
+            raise EvidenceValidationError("checkpoint module is outside the GLM-5 scope")
         route = request.get("route_evidence")
         recovery = request.get("zero_route_recovery")
         sample_count = positive_int(request.get("sample_count"), "projection sample count")
@@ -545,7 +650,7 @@ def validate_evidence(
             or input_weight.get("dtype") != "torch.float32"
             or not isinstance(input_weight.get("shape"), list)
             or not isinstance(quantizer_contract, dict)
-            or quantizer_contract.get("bits") != 3
+            or quantizer_contract.get("bits") != contract.bits
             or quantizer_contract.get("codebook") != "mcg"
             or not isinstance(route, dict)
             or route.get("logical_layer") != layer
@@ -564,9 +669,17 @@ def validate_evidence(
         if not isinstance(ledger, dict):
             raise EvidenceValidationError("checkpoint has no error-ledger record")
         ledger_digest = sha256_bytes(canonical_json(ledger))
+        if live_journal_snapshot and ledger_digest not in journal:
+            # Projection checkpoints become durable immediately before their
+            # corresponding append-only journal commit.  When inspecting a
+            # running quantizer, authenticate the exact journal frontier read
+            # above and report (but do not claim) any newer checkpoint pairs.
+            post_snapshot_checkpoint_count += 1
+            continue
         if ledger_digest in ledger_digests or journal.get(ledger_digest) != ledger:
             raise EvidenceValidationError("checkpoint ledger record is absent or duplicated")
         ledger_digests.add(ledger_digest)
+        modules.add(module)
         if (
             ledger.get("schema") != "ds4rt.exl3-error-ledger"
             or ledger.get("schema_version") != 1
@@ -576,7 +689,7 @@ def validate_evidence(
             or ledger.get("processor_layer_index") != layer
             or ledger.get("expert") != expert
             or ledger.get("projection") != projection
-            or ledger.get("bits") != 3
+            or ledger.get("bits") != contract.bits
             or ledger.get("codebook") != "mcg"
             or ledger.get("sample_count") != sample_count
             or ledger.get("route_evidence") != route
@@ -618,7 +731,10 @@ def validate_evidence(
                 )
             projection_execution_counts[digest] += 1
         logical_bytes = validate_tensor_specs(
-            manifest.get("tensors"), input_weight["shape"], ledger.get("encoded_bytes")
+            manifest.get("tensors"),
+            input_weight["shape"],
+            ledger.get("encoded_bytes"),
+            bits=contract.bits,
         )
         values = validate_metrics(
             metrics,
@@ -646,6 +762,9 @@ def validate_evidence(
                 "layer": layer,
                 "expert": expert,
                 "projection": projection,
+                "route_evidence": (
+                    "zero-route-recovery" if recovery is not None else "natural-route"
+                ),
                 **values,
             }
         )
@@ -654,8 +773,8 @@ def validate_evidence(
         raise EvidenceValidationError("error journal and checkpoint inventory differ")
     expected_modules = {
         f"model.layers.{layer}.mlp.experts.{expert}.{projection}"
-        for layer in range(FIRST_LAYER, LAST_LAYER + 1)
-        for expert in range(EXPERTS)
+        for layer in range(contract.first_layer, contract.last_layer + 1)
+        for expert in range(contract.experts)
         for projection in PROJECTIONS
     }
     if not modules <= expected_modules or (require_complete and modules != expected_modules):
@@ -669,9 +788,17 @@ def validate_evidence(
     complete_experts = sum(value == 3 for value in expert_projection_counts.values())
     recovered_experts = sum(recovery is not None for _route, recovery, _count in experts.values())
     report = {
-        "schema": SCHEMA,
-        "status": "accepted" if require_complete else "partial-accepted",
-        "scope": "glm-5.2-base-routed-experts-layers-3-through-77",
+        "schema": contract.report_schema,
+        "status": (
+            "accepted"
+            if require_complete
+            else (
+                "partial-live-snapshot-accepted"
+                if live_journal_snapshot
+                else "partial-accepted"
+            )
+        ),
+        "scope": contract.scope,
         "quality_scope": "projection-quantizer-evidence-not-end-to-end-model-quality",
         "plan": {
             "path": os.fspath(plan_path),
@@ -682,9 +809,9 @@ def validate_evidence(
             "error_journal": os.fspath(journal_path),
         },
         "coverage": {
-            "expected_projection_count": EXPECTED_PROJECTIONS,
+            "expected_projection_count": contract.expected_projections,
             "projection_count": len(records),
-            "expected_expert_count": (LAST_LAYER - FIRST_LAYER + 1) * EXPERTS,
+            "expected_expert_count": contract.expected_experts,
             "observed_expert_count": len(experts),
             "complete_expert_count": complete_experts,
             "recovered_expert_count": recovered_experts,
@@ -696,6 +823,9 @@ def validate_evidence(
             "packed_tensor_file_bytes": packed_bytes,
             "logical_encoded_tensor_bytes": encoded_bytes,
             "journal_record_count": len(journal),
+            "live_journal_snapshot": live_journal_snapshot,
+            "checkpoint_pairs_seen": len(pairs),
+            "post_snapshot_checkpoint_count": post_snapshot_checkpoint_count,
         },
         "execution_upgrade": (
             {
@@ -753,13 +883,24 @@ def main() -> None:
         action="store_true",
         help="skip packed payload hashing (not acceptable for final release)",
     )
+    parser.add_argument(
+        "--live-journal-snapshot",
+        action="store_true",
+        help=(
+            "validate the exact journal frontier of a running quantizer and "
+            "report newer durable checkpoints; requires --allow-incomplete"
+        ),
+    )
     args = parser.parse_args()
+    if args.live_journal_snapshot and not args.allow_incomplete:
+        parser.error("--live-journal-snapshot requires --allow-incomplete")
     report = validate_evidence(
         plan_path=args.plan,
         checkpoint_root=args.projection_checkpoint_dir,
         journal_path=args.error_journal,
         require_complete=not args.allow_incomplete,
         verify_tensor_hashes=not args.skip_tensor_hashes,
+        live_journal_snapshot=args.live_journal_snapshot,
     )
     atomic_json(args.output, report)
     print(

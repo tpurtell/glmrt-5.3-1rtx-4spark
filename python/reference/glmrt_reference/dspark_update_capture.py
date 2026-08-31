@@ -31,6 +31,7 @@ class _DsparkUpdateState:
     target_features: int
     heads: int
     head_dim: int
+    rope_theta: float
     total_pages: int
     page_size: int
     max_pages_per_request: int
@@ -89,6 +90,7 @@ def _update_state(
     target_features = int(kwargs["target_features"])
     heads = int(kwargs["heads"])
     head_dim = int(kwargs["head_dim"])
+    rope_theta = float(kwargs.get("rope_theta", 8_000_000.0))
     total_pages = int(kwargs["total_pages"])
     page_size = int(kwargs["page_size"])
     max_pages_per_request = int(kwargs["max_pages_per_request"])
@@ -96,26 +98,41 @@ def _update_state(
     initialize_target_hidden = bool(kwargs.get("initialize_target_hidden", True))
     initialize_kv = bool(kwargs.get("initialize_kv", True))
     cache_dtype = str(kwargs.get("cache_dtype", "bf16")).lower()
-    if rows < 1 or rows > 1024 or rows & (rows - 1):
-        raise ValueError(
-            f"dSpark context update rows must be a power of two no larger than 1024, got {rows}"
-        )
+    if rows < 1 or rows > 1024:
+        raise ValueError(f"context update rows must be in 1..1024, got {rows}")
     if active_requests not in (1, 2, 4):
         raise ValueError(
             "dSpark context update active_requests must be 1/2/4, "
             f"got {active_requests}"
         )
-    if (
-        layers not in (3, 5)
-        or hidden_size != 6144
-        or target_features != 5 * hidden_size
+    dspark_geometry = (
+        layers in (3, 5)
+        and hidden_size == 6144
+        and target_features == 5 * hidden_size
+        and heads == 64
+        and head_dim == 64
+        and rope_theta == 8_000_000.0
+    )
+    dflash2_geometry = (
+        layers == 6
+        and hidden_size == 6144
+        and target_features == 6 * hidden_size
+        and heads == 8
+        and head_dim == 128
+        and rope_theta == 1_000_000.0
+    )
+    if not (dspark_geometry or dflash2_geometry):
+        raise ValueError(
+            "target-context update geometry is neither GLM-5.2 dSpark nor "
+            "GLM-5.3 DFlash2"
+        )
+    if rows & (rows - 1) and not (
+        dflash2_geometry and active_requests == 1 and rows <= 8
     ):
         raise ValueError(
-            "GLM-5.2 dSpark update requires three or five draft layers, "
-            "hidden size 6144, and five target hidden-state taps"
+            "context update rows must be a power of two except for exact-small "
+            f"DFlash2 C1 decode buckets, got rows={rows} C={active_requests}"
         )
-    if heads != 64 or head_dim != 64:
-        raise ValueError("GLM-5.2 dSpark update requires 64 heads of width 64")
     if page_size not in (16, 32, 64, 128):
         raise ValueError(f"unsupported dSpark update page size {page_size}")
     if total_pages < 1 or max_pages_per_request < 1:
@@ -212,6 +229,10 @@ def _update_state(
         active_requests,
         layers,
         hidden_size,
+        target_features,
+        heads,
+        head_dim,
+        rope_theta,
         total_pages,
         page_size,
         max_pages_per_request,
@@ -273,6 +294,7 @@ def _update_state(
         target_features=target_features,
         heads=heads,
         head_dim=head_dim,
+        rope_theta=rope_theta,
         total_pages=total_pages,
         page_size=page_size,
         max_pages_per_request=max_pages_per_request,
@@ -310,11 +332,13 @@ def _rms_norm(source: Any, weight: Any) -> Any:
     return source * torch.rsqrt(variance + 1.0e-5).to(source.dtype) * weight
 
 
-def _apply_rope(source: Any, positions: Any, head_dim: int) -> Any:
+def _apply_rope(
+    source: Any, positions: Any, head_dim: int, rope_theta: float
+) -> Any:
     import torch
 
     exponent = torch.arange(0, head_dim, 2, device=source.device, dtype=torch.float32)
-    inverse_frequency = 1.0 / (8_000_000.0 ** (exponent / head_dim))
+    inverse_frequency = 1.0 / (rope_theta ** (exponent / head_dim))
     angles = positions.float().unsqueeze(-1) * inverse_frequency
     cosine = angles.cos().to(source.dtype).view(-1, 1, head_dim // 2)
     sine = angles.sin().to(source.dtype).view(-1, 1, head_dim // 2)
@@ -339,7 +363,10 @@ def _run_reference(state: _DsparkUpdateState) -> None:
             keys = keys.view(state.rows, state.heads, state.head_dim)
             values = values.view(state.rows, state.heads, state.head_dim)
             keys = _apply_rope(
-                _rms_norm(keys, weights.k_norm), state.row_positions, state.head_dim
+                _rms_norm(keys, weights.k_norm),
+                state.row_positions,
+                state.head_dim,
+                state.rope_theta,
             )
             state.reference_key_output[layer].copy_(keys)
             state.reference_value_output[layer].copy_(values)
@@ -388,7 +415,7 @@ def _run_update(state: _DsparkUpdateState) -> None:
                 PAGE_SIZE=state.page_size,
                 MAX_PAGES=state.max_pages_per_request,
                 KV_WIDTH=2 * attention_width,
-                THETA=8_000_000.0,
+                THETA=state.rope_theta,
                 EPSILON=1.0e-5,
                 BLOCK=state.head_dim,
                 num_warps=4,
@@ -411,7 +438,9 @@ def _dspark_rms_norm(
     variance = tl.sum(values * values, axis=0) / WIDTH
     inverse_rms = tl.rsqrt(variance + EPSILON)
     scales = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(output + row * WIDTH + offsets, values * inverse_rms * scales, mask=mask)
+    normalized = (values * inverse_rms).to(tl.bfloat16)
+    scaled = (normalized.to(tl.float32) * scales).to(tl.bfloat16)
+    tl.store(output + row * WIDTH + offsets, scaled, mask=mask)
 
 
 @triton.jit
@@ -448,7 +477,8 @@ def _dspark_kv_rope_scatter(
     ).to(tl.float32)
     variance = tl.sum(key_values * key_values, axis=0) / HEAD_DIM
     scales = tl.load(k_norm + offsets, mask=mask, other=0.0).to(tl.float32)
-    key_values = key_values * tl.rsqrt(variance + EPSILON) * scales
+    key_values = (key_values * tl.rsqrt(variance + EPSILON)).to(tl.bfloat16)
+    key_values = (key_values.to(tl.float32) * scales).to(tl.bfloat16)
 
     half = HEAD_DIM // 2
     pair = offsets % half
@@ -461,17 +491,26 @@ def _dspark_kv_rope_scatter(
     paired_scales = tl.load(k_norm + paired_offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    paired_values = paired_values * tl.rsqrt(variance + EPSILON) * paired_scales
+    paired_values = (paired_values * tl.rsqrt(variance + EPSILON)).to(tl.bfloat16)
+    paired_values = (
+        paired_values.to(tl.float32) * paired_scales
+    ).to(tl.bfloat16)
     position = tl.load(row_positions + row)
     frequency = tl.exp((-math.log(THETA) * (2.0 * pair)) / HEAD_DIM)
     angle = position.to(tl.float32) * frequency
-    cosine = tl.cos(angle)
-    sine = tl.sin(angle)
+    cosine = tl.cos(angle).to(tl.bfloat16)
+    sine = tl.sin(angle).to(tl.bfloat16)
+    cosine_term = (
+        key_values.to(tl.float32) * cosine.to(tl.float32)
+    ).to(tl.bfloat16)
+    sine_term = (
+        paired_values.to(tl.float32) * sine.to(tl.float32)
+    ).to(tl.bfloat16)
     rotated = tl.where(
         offsets < half,
-        key_values * cosine - paired_values * sine,
-        key_values * cosine + paired_values * sine,
-    )
+        (cosine_term.to(tl.float32) - sine_term.to(tl.float32)).to(tl.bfloat16),
+        (cosine_term.to(tl.float32) + sine_term.to(tl.float32)).to(tl.bfloat16),
+    ).to(tl.bfloat16)
     output_base = (row * HEADS + head) * HEAD_DIM
     tl.store(key_output + output_base + offsets, rotated, mask=mask)
 

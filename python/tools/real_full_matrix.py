@@ -12,12 +12,14 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+from typing import TYPE_CHECKING
 import urllib.request
 
-from tokenizers import Tokenizer
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
 
 
-MODEL_ID = "lukealonso/GLM-5.2-NVFP4-full"
+MODEL_ID = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
 GLM_USER_PREFIX = "[gMASK]<sop><|user|>"
 GLM_ASSISTANT_SUFFIX = "<|assistant|><think></think>"
 DEFAULT_MAX_CONTEXT_TOKENS = 128 * 1024
@@ -27,21 +29,36 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def default_tokenizer_path() -> Path:
+def default_tokenizer_path(model_id: str = MODEL_ID) -> Path:
+    if not model_id or "/" not in model_id:
+        raise ValueError(f"model ID is not a Hugging Face repository ID: {model_id!r}")
     cache_root = Path(
         os.environ.get(
             "HF_HOME",
             Path.home() / ".cache" / "huggingface",
         )
     )
+    cache_name = "models--" + model_id.replace("/", "--")
+    model_cache = cache_root / "hub" / cache_name
+    main_ref = model_cache / "refs" / "main"
+    if main_ref.exists():
+        revision = main_ref.read_text(encoding="utf-8").strip()
+        if not revision:
+            raise ValueError(f"empty Hugging Face main ref: {main_ref}")
+        tokenizer = model_cache / "snapshots" / revision / "tokenizer.json"
+        if not tokenizer.is_file():
+            raise FileNotFoundError(
+                f"{model_id} main ref {revision!r} has no tokenizer.json at {tokenizer}"
+            )
+        return tokenizer
+
     candidates = sorted(
-        (cache_root / "hub" / "models--lukealonso--GLM-5.2-NVFP4" / "snapshots").glob(
-            "*/tokenizer.json"
-        )
+        (model_cache / "snapshots").glob("*/tokenizer.json")
     )
     if not candidates:
         raise FileNotFoundError(
-            "no local GLM-5.2-NVFP4 tokenizer.json; pass --tokenizer"
+            f"no local {model_id} tokenizer.json below {cache_root / 'hub' / cache_name}; "
+            "pass --tokenizer"
         )
     return candidates[-1]
 
@@ -368,7 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer",
         type=Path,
-        help="tokenizer.json; defaults to the local lukealonso snapshot",
+        help="tokenizer.json; defaults to the local Hugging Face snapshot for --model",
     )
     parser.add_argument(
         "--endpoint",
@@ -407,8 +424,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    from tokenizers import Tokenizer
+
     root = repo_root()
-    tokenizer_path = (args.tokenizer or default_tokenizer_path()).resolve()
+    tokenizer_path = (args.tokenizer or default_tokenizer_path(args.model)).resolve()
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     corpus, corpus_sha256 = load_corpus(args.source)
     corpus_ids = tokenizer.encode(corpus, add_special_tokens=False).ids

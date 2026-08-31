@@ -93,10 +93,26 @@ struct RealFullMtpAcceptanceMetrics {
     draft_lengths: Vec<usize>,
     accepted_draft_lengths: Vec<usize>,
     verify_cycle_ms: Vec<f64>,
+    target_cycle_physical_m: Vec<usize>,
+    target_cycle_ms: Vec<f64>,
 }
 
 impl RealFullMtpAcceptanceMetrics {
-    fn record(&mut self, full: &crate::RealFullInfo, emitted_tokens: usize, cycle_ms: f64) {
+    fn record(
+        &mut self,
+        full: &crate::RealFullInfo,
+        emitted_tokens: usize,
+        cycle_ms: f64,
+        post_ttft: bool,
+    ) {
+        // The first target cycle includes prompt ingestion and is reported as
+        // TTFT, not decode_ms. Keep it out of the physical-M decode curve so
+        // every sample measures only a post-prefill target-model cycle.
+        if post_ttft {
+            self.target_cycle_physical_m
+                .push(full.request_mtp_verify_rows.saturating_add(1));
+            self.target_cycle_ms.push(cycle_ms);
+        }
         if full.request_mtp_verify_rows == 0 {
             return;
         }
@@ -123,6 +139,8 @@ impl RealFullMtpAcceptanceMetrics {
         metrics.mtp_draft_lengths = self.draft_lengths.clone();
         metrics.mtp_accepted_draft_lengths = self.accepted_draft_lengths.clone();
         metrics.mtp_verify_cycle_ms = self.verify_cycle_ms.clone();
+        metrics.target_cycle_physical_m = self.target_cycle_physical_m.clone();
+        metrics.target_cycle_ms = self.target_cycle_ms.clone();
     }
 }
 
@@ -540,7 +558,12 @@ fn real_glm_full_decode_stream_response(
             let full = cycle.info;
             cache_load_ms = cache_load_ms.max(full.request_kv_snapshot_restore_ms);
             let cycle_tokens = cycle.generated_tokens;
-            mtp_acceptance_metrics.record(&full, cycle_tokens.len().max(1), step_ms);
+            mtp_acceptance_metrics.record(
+                &full,
+                cycle_tokens.len().max(1),
+                step_ms,
+                first_step_ms.is_some(),
+            );
             if first_step_ms.is_none() {
                 first_step_ms = Some(step_ms);
             }
@@ -1150,7 +1173,12 @@ async fn execute_real_full_decode_loop(
         let full = cycle.info;
         cache_load_ms = cache_load_ms.max(full.request_kv_snapshot_restore_ms);
         let cycle_tokens = cycle.generated_tokens;
-        mtp_acceptance_metrics.record(&full, cycle_tokens.len().max(1), step_ms);
+        mtp_acceptance_metrics.record(
+            &full,
+            cycle_tokens.len().max(1),
+            step_ms,
+            first_step_ms.is_some(),
+        );
         if first_step_ms.is_none() {
             first_step_ms = Some(step_ms);
         }
@@ -2117,6 +2145,8 @@ fn real_full_diagnostic_metrics_from_request(
         mtp_draft_lengths: Vec::new(),
         mtp_accepted_draft_lengths: Vec::new(),
         mtp_verify_cycle_ms: Vec::new(),
+        target_cycle_physical_m: Vec::new(),
+        target_cycle_ms: Vec::new(),
         request_coordinator_graph_slots: full.request_coordinator_graph_slots,
         request_coordinator_graph_captured_graphs: full.request_coordinator_graph_captured_graphs,
         request_coordinator_graph_captures: full.request_coordinator_graph_captures,

@@ -5,7 +5,7 @@ use glmrt_core::{
     GLM52_MOE_INTERMEDIATE_SIZE, GLM52_MTP_LAYER_ID,
 };
 use glmrt_ffi::GlmrtDeviceBuffer;
-use glmrt_loader::is_glm52_exl3_recipe;
+use glmrt_loader::is_glm_exl3_recipe;
 use glmrt_transport::{
     protocol_v2_verbs_host_execution_lanes, ExpertProtocolV2DeviceResponseRef,
     ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView,
@@ -49,7 +49,7 @@ use crate::commands::real_full::sparse_mlp::route::{
     preload_routed_exl3_projection_cuda_cache, preload_routed_quant_projection_cuda_cache,
     preload_routed_quant_projection_host_cache,
     preload_routed_quant_projection_scalar_cache_parallel,
-    preload_startup_quantized_bf16_projection_cuda_cache, reduce_mapped_route_shards_cached,
+    preload_startup_quantized_mtp_projection_cuda_cache, reduce_mapped_route_shards_cached,
     reduce_mapped_route_shards_cached_host_output, try_begin_packed_w4a16_topk8_prefill_cached,
     PackedW4a16Topk8Route, RouteNvfp4IngressStream, RouteNvfp4IngressStreamChunk,
     RouteProjectionCachePreloadRequest, RouteStreamingOutputDtype, RouteTensorCache,
@@ -884,7 +884,7 @@ impl RealNvfp4ProtocolV2Executor {
             for spec in &specs {
                 if !exl3_base_projection_spec(&self.catalog, spec)
                     && !retained_bf16_projection_spec(&self.catalog, spec)?
-                    && !startup_quantized_bf16_projection_spec(&self.catalog, spec)?
+                    && !startup_quantized_mtp_projection_spec(&self.catalog, spec)?
                 {
                     scalar_requests.push(RouteProjectionCachePreloadRequest {
                         layer_id: spec.layer_id,
@@ -912,8 +912,7 @@ impl RealNvfp4ProtocolV2Executor {
         for spec in &specs {
             let exl3_base = exl3_base_projection_spec(&self.catalog, spec);
             let retained_bf16 = retained_bf16_projection_spec(&self.catalog, spec)?;
-            let startup_quantized_bf16 =
-                startup_quantized_bf16_projection_spec(&self.catalog, spec)?;
+            let startup_quantized_mtp = startup_quantized_mtp_projection_spec(&self.catalog, spec)?;
             layers.insert(spec.layer_id);
             experts.insert((spec.layer_id, spec.expert_id));
             projection_rows_cache.prepare_layer(spec.layer_id);
@@ -936,7 +935,7 @@ impl RealNvfp4ProtocolV2Executor {
             }
             if !exl3_base
                 && !retained_bf16
-                && !startup_quantized_bf16
+                && !startup_quantized_mtp
                 && preload_host_projection_rows
             {
                 let preload = preload_routed_quant_projection_host_cache(
@@ -985,7 +984,7 @@ impl RealNvfp4ProtocolV2Executor {
                     row_count: gate_rows,
                 },
             )?;
-            let startup_quantized_bf16 = startup_quantized_bf16_projection_spec(
+            let startup_quantized_mtp = startup_quantized_mtp_projection_spec(
                 &self.catalog,
                 &RouteProjectionPreloadSpec {
                     layer_id,
@@ -1003,7 +1002,7 @@ impl RealNvfp4ProtocolV2Executor {
                     row_count: gate_rows,
                 },
             );
-            if !exl3_base && !retained_bf16 && !startup_quantized_bf16 {
+            if !exl3_base && !retained_bf16 && !startup_quantized_mtp {
                 preload_bf16_route_projection_group_cache(
                     &self.catalog,
                     layer_id,
@@ -1032,7 +1031,7 @@ impl RealNvfp4ProtocolV2Executor {
                     exl3_specs.push(spec);
                 } else if retained_bf16_projection_spec(&self.catalog, spec)? {
                     retained_specs.push(spec);
-                } else if startup_quantized_bf16_projection_spec(&self.catalog, spec)? {
+                } else if startup_quantized_mtp_projection_spec(&self.catalog, spec)? {
                     startup_quantized_specs.push(spec);
                 } else {
                     quant_specs.push(spec);
@@ -1082,7 +1081,7 @@ impl RealNvfp4ProtocolV2Executor {
                 cuda_preload.weight_scale_bytes += retained_preload.weight_scale_bytes;
             }
             if !startup_quantized_requests.is_empty() {
-                let startup_preload = preload_startup_quantized_bf16_projection_cuda_cache(
+                let startup_preload = preload_startup_quantized_mtp_projection_cuda_cache(
                     &self.catalog,
                     &startup_quantized_requests,
                     &mut route_cache,
@@ -2917,13 +2916,13 @@ fn projection_rows(
     expert_id: usize,
     projection: &str,
 ) -> Result<usize> {
-    if is_glm52_exl3_recipe(&catalog.facts.quantization_recipe)
+    if is_glm_exl3_recipe(&catalog.facts.quantization_recipe)
         && layer_id < catalog.facts.num_hidden_layers
     {
         return match projection {
             "gate_proj" | "up_proj" => Ok(GLM52_MOE_INTERMEDIATE_SIZE),
             "down_proj" => Ok(catalog.facts.hidden_size),
-            other => bail!("unsupported GLM-5.2 EXL3 projection {other}"),
+            other => bail!("unsupported GLM-5 EXL3 projection {other}"),
         };
     }
     let tensor_name =
@@ -2986,7 +2985,7 @@ fn retained_bf16_projection_spec(
     Ok(true)
 }
 
-fn startup_quantized_bf16_projection_spec(
+fn startup_quantized_mtp_projection_spec(
     catalog: &TensorCatalog,
     spec: &RouteProjectionPreloadSpec,
 ) -> Result<bool> {
@@ -2997,11 +2996,37 @@ fn startup_quantized_bf16_projection_spec(
         "model.layers.{}.mlp.experts.{}.{}.weight",
         spec.layer_id, spec.expert_id, spec.projection
     );
-    Ok(catalog_tensor(catalog, &tensor_name)?.dtype == DType::Bf16)
+    let tensor = catalog_tensor(catalog, &tensor_name)?;
+    match tensor.dtype {
+        DType::Bf16 => Ok(true),
+        DType::F8E4M3 => {
+            anyhow::ensure!(
+                tensor.shape.len() == 2,
+                "block-FP8 MTP projection {tensor_name} must be rank 2, got {:?}",
+                tensor.shape
+            );
+            let scale_name = format!(
+                "model.layers.{}.mlp.experts.{}.{}.weight_scale_inv",
+                spec.layer_id, spec.expert_id, spec.projection
+            );
+            let scale = catalog_tensor(catalog, &scale_name)?;
+            let expected_scale_shape =
+                vec![tensor.shape[0].div_ceil(128), tensor.shape[1].div_ceil(128)];
+            anyhow::ensure!(
+                scale.dtype == DType::F32 && scale.shape == expected_scale_shape,
+                "block-FP8 MTP inverse scale {scale_name} must be F32 {:?}, got {:?} {:?}",
+                expected_scale_shape,
+                scale.dtype,
+                scale.shape,
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn exl3_base_projection_spec(catalog: &TensorCatalog, spec: &RouteProjectionPreloadSpec) -> bool {
-    is_glm52_exl3_recipe(&catalog.facts.quantization_recipe)
+    is_glm_exl3_recipe(&catalog.facts.quantization_recipe)
         && spec.layer_id < catalog.facts.num_hidden_layers
 }
 
@@ -3013,9 +3038,9 @@ fn retained_bf16_layer(catalog: &TensorCatalog, layer_id: usize) -> Result<bool>
     let gate = catalog_tensor(catalog, &gate_name)?;
     match gate.dtype {
         DType::Bf16 => Ok(true),
-        DType::U8 | DType::F4 => Ok(false),
+        DType::U8 | DType::F4 | DType::F8E4M3 => Ok(false),
         ref dtype => bail!(
-            "layer {layer_id} MTP expert serving only supports BF16 or packed NVFP4 sources, got {dtype:?} for {gate_name}"
+            "layer {layer_id} MTP expert serving only supports BF16, block-FP8, or packed NVFP4 sources, got {dtype:?} for {gate_name}"
         ),
     }
 }
@@ -3052,7 +3077,7 @@ fn resident_preload_plan_for_specs(
             spec.layer_id, spec.expert_id, spec.projection
         );
         let shard_count = intermediate_shard.map_or(1_u64, |shard| shard.count as u64);
-        if is_glm52_exl3_recipe(&catalog.facts.quantization_recipe)
+        if is_glm_exl3_recipe(&catalog.facts.quantization_recipe)
             && spec.layer_id < catalog.facts.num_hidden_layers
         {
             let trellis = require_tensor(&format!("{base_name}.trellis"))?;
@@ -3064,7 +3089,7 @@ fn resident_preload_plan_for_specs(
                     && suh.dtype == DType::F16
                     && svh.dtype == DType::F16
                     && mcg.dtype == DType::I32,
-                "GLM-5.2 EXL3 projection {base_name} has an invalid native tensor dtype"
+                "GLM-5 EXL3 projection {base_name} has an invalid native tensor dtype"
             );
             plan.weight_bytes += trellis.byte_length / shard_count;
             match spec.projection {
@@ -3078,7 +3103,7 @@ fn resident_preload_plan_for_specs(
                     // output rotation is replicated.
                     plan.weight_scale_bytes += suh.byte_length / shard_count + svh.byte_length;
                 }
-                other => bail!("unsupported GLM-5.2 EXL3 projection {other}"),
+                other => bail!("unsupported GLM-5 EXL3 projection {other}"),
             }
             // MCG is a validated recipe marker. The runtime keeps one codebook
             // LUT, not 768 duplicate scalar tensors per layer.
@@ -3101,6 +3126,19 @@ fn resident_preload_plan_for_specs(
                 plan.weight_scale_bytes += weight.byte_length / 32 / shard_count;
                 plan.scalar_metadata_bytes += 2 * std::mem::size_of::<f32>() as u64;
             }
+            continue;
+        }
+        if weight.dtype == DType::F8E4M3 && spec.layer_id == GLM52_MTP_LAYER_ID {
+            anyhow::ensure!(
+                startup_quantized_mtp_projection_spec(catalog, spec)?,
+                "block-FP8 MTP projection {base_name} does not satisfy the startup NVFP4 conversion contract"
+            );
+            // The source stores one E4M3 byte per value. The one-resident-copy
+            // serving representation stores two E2M1 values per byte plus one
+            // E4M3 scale per 16 values; weight_scale_inv is startup-only.
+            plan.weight_bytes += weight.byte_length / 2 / shard_count;
+            plan.weight_scale_bytes += weight.byte_length / 16 / shard_count;
+            plan.scalar_metadata_bytes += 2 * std::mem::size_of::<f32>() as u64;
             continue;
         }
         plan.weight_bytes += weight.byte_length / shard_count;
@@ -3262,8 +3300,8 @@ mod tests {
         completion_slices_for_all_rows, parse_real_nvfp4_protocol_v2_packed_direct_max_rows,
         real_nvfp4_cuda_reference_kernels_enabled, regular_response_device_target,
         resident_preload_plan_for_specs, routed_projection_preload_specs,
-        validate_completion_slices, RealNvfp4ProtocolV2Executor, StreamedIngressState,
-        REAL_NVFP4_PROTOCOL_V2_EXECUTOR,
+        startup_quantized_mtp_projection_spec, validate_completion_slices,
+        RealNvfp4ProtocolV2Executor, StreamedIngressState, REAL_NVFP4_PROTOCOL_V2_EXECUTOR,
     };
     use crate::cli::ExpertDaemonArgs;
     use crate::commands::expertd::run_expertd;
@@ -3277,9 +3315,12 @@ mod tests {
         DType, ExpertBatch, ExpertBatchRoute, ExpertHostBatch, ExpertHostBatchSet, GraphBucket,
         LayerId, ModelFacts, PlacementVersion, PositionId, RequestId, RowSourceKind, TensorCatalog,
         TensorInfo, TensorRole, EXPERT_HOSTS, GLM52_HIDDEN_SIZE, GLM52_MOE_INTERMEDIATE_SIZE,
+        GLM52_MTP_LAYER_ID,
     };
     use glmrt_ffi::GlmrtDeviceBuffer;
-    use glmrt_loader::{validate_glm52_exl3_expert_catalog, GLM52_EXL3_RECIPE_K3_V1};
+    use glmrt_loader::{
+        build_catalog_for_snapshot, validate_glm52_exl3_expert_catalog, GLM52_EXL3_RECIPE_K3_V1,
+    };
     use glmrt_transport::{
         expert_protocol_v2_compact_id, serve_protocol_v2_tcp_listener_with_executor,
         tcp_protocol_v2_host_batch_set_bf16_dispatch, tcp_protocol_v2_roundtrip,
@@ -3813,6 +3854,107 @@ mod tests {
         assert_eq!(plan.weight_bytes, 48);
         assert_eq!(plan.weight_scale_bytes, 96);
         assert_eq!(plan.scalar_metadata_bytes, 12);
+    }
+
+    #[test]
+    fn glm53_block_fp8_mtp_plans_one_packed_nvfp4_resident_copy() {
+        let mut tensors = Vec::new();
+        for (projection, shape) in [
+            (
+                "gate_proj",
+                vec![GLM52_MOE_INTERMEDIATE_SIZE, GLM52_HIDDEN_SIZE],
+            ),
+            (
+                "up_proj",
+                vec![GLM52_MOE_INTERMEDIATE_SIZE, GLM52_HIDDEN_SIZE],
+            ),
+            (
+                "down_proj",
+                vec![GLM52_HIDDEN_SIZE, GLM52_MOE_INTERMEDIATE_SIZE],
+            ),
+        ] {
+            let values = shape.iter().product::<usize>();
+            tensors.push(TensorInfo {
+                name: format!(
+                    "model.layers.{GLM52_MTP_LAYER_ID}.mlp.experts.0.{projection}.weight"
+                ),
+                file: "mtp.safetensors".to_owned(),
+                dtype: DType::F8E4M3,
+                shape: shape.clone(),
+                byte_offset: 0,
+                byte_length: values as u64,
+                role: TensorRole::RoutedExpert,
+                layer_id: Some(GLM52_MTP_LAYER_ID as u32),
+                expert_id: Some(0),
+                is_quantization_metadata: false,
+            });
+            let scale_shape = vec![shape[0].div_ceil(128), shape[1].div_ceil(128)];
+            tensors.push(TensorInfo {
+                name: format!(
+                    "model.layers.{GLM52_MTP_LAYER_ID}.mlp.experts.0.{projection}.weight_scale_inv"
+                ),
+                file: "mtp.safetensors".to_owned(),
+                dtype: DType::F32,
+                shape: scale_shape.clone(),
+                byte_offset: 0,
+                byte_length: (scale_shape.iter().product::<usize>() * 4) as u64,
+                role: TensorRole::RoutedExpert,
+                layer_id: Some(GLM52_MTP_LAYER_ID as u32),
+                expert_id: Some(0),
+                is_quantization_metadata: true,
+            });
+        }
+        tensors.sort_by(|left, right| left.name.cmp(&right.name));
+        let catalog = TensorCatalog {
+            model_id: "zai-org/GLM-5.3".to_owned(),
+            snapshot_path: "/tmp/glm53".to_owned(),
+            facts: ModelFacts {
+                hidden_size: GLM52_HIDDEN_SIZE,
+                num_hidden_layers: GLM52_MTP_LAYER_ID,
+                ..ModelFacts::default()
+            },
+            tensors,
+        };
+        let shard = ExpertIntermediateShard::new(4, 0).unwrap();
+        let specs = routed_projection_preload_specs(&catalog, Some(shard)).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert!(specs
+            .iter()
+            .all(|spec| startup_quantized_mtp_projection_spec(&catalog, spec).unwrap()));
+
+        let plan = resident_preload_plan_for_specs(&catalog, &specs, Some(shard)).unwrap();
+        let source_values = GLM52_MOE_INTERMEDIATE_SIZE * GLM52_HIDDEN_SIZE;
+        assert_eq!(plan.weight_bytes, (3 * source_values / 2 / 4) as u64);
+        assert_eq!(plan.weight_scale_bytes, (3 * source_values / 16 / 4) as u64);
+        assert_eq!(plan.scalar_metadata_bytes, 3 * 2 * 4);
+        assert_eq!(plan.missing_metadata_tensors, 0);
+        assert_eq!(plan.complete_expert_projection_sets, 1);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned zai-org/GLM-5.3 source snapshot"]
+    fn validates_installed_glm53_block_fp8_mtp_catalog() {
+        let snapshot = std::env::var_os("GLMRT_TEST_GLM53_SOURCE_SNAPSHOT")
+            .map(PathBuf::from)
+            .expect("set GLMRT_TEST_GLM53_SOURCE_SNAPSHOT to the pinned snapshot");
+        let catalog = build_catalog_for_snapshot("zai-org/GLM-5.3", &snapshot).unwrap();
+        let shard = ExpertIntermediateShard::new(4, 0).unwrap();
+        let mtp_specs = routed_projection_preload_specs(&catalog, Some(shard))
+            .unwrap()
+            .into_iter()
+            .filter(|spec| spec.layer_id == GLM52_MTP_LAYER_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(mtp_specs.len(), 256 * 3);
+        assert!(mtp_specs
+            .iter()
+            .all(|spec| startup_quantized_mtp_projection_spec(&catalog, spec).unwrap()));
+        let plan = resident_preload_plan_for_specs(&catalog, &mtp_specs, Some(shard)).unwrap();
+        assert_eq!(plan.layers, 1);
+        assert_eq!(plan.experts, 256);
+        assert_eq!(plan.complete_expert_projection_sets, 256);
+        assert_eq!(plan.missing_metadata_tensors, 0);
+        assert_eq!(plan.weight_bytes, 1_207_959_552);
+        assert_eq!(plan.weight_scale_bytes, 150_994_944);
     }
 
     #[test]

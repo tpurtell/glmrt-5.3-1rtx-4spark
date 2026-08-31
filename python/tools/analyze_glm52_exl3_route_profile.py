@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a content-bound GLM-5.2 TP4 route-replay profile from live logs."""
+"""Build a content-bound GLM-5 K3/K4 TP4 route-replay profile from live logs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-SCHEMA = "glmrt-glm52-exl3-route-profile-v1"
+LEGACY_SCHEMA = "glmrt-glm52-exl3-route-profile-v1"
+SCHEMA = "glmrt-glm5-exl3-route-profile-v1"
+GLM53_MODEL_ID = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
 MARKER = "protocol_v2_expert_queue_plan "
 SOURCE_KIND_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 REQUIRED_FIELDS = {
@@ -391,6 +393,13 @@ def main() -> None:
     parser.add_argument("--expected-layer-first", type=int, default=3)
     parser.add_argument("--expected-layer-last", type=int, default=77)
     parser.add_argument("--max-rows", type=int, default=2064)
+    parser.add_argument(
+        "--trellis-bits",
+        type=int,
+        choices=(3, 4),
+        default=3,
+        help="model's checkpoint-native EXL3 bitrate (default: K3)",
+    )
     args = parser.parse_args()
 
     if args.experts <= 0 or args.top_k <= 0 or args.expected_hosts <= 0:
@@ -428,8 +437,17 @@ def main() -> None:
             raise ProfileError(
                 f"route profile layer coverage mismatch: missing={missing} unexpected={unexpected}"
             )
+        deployment = _deployment_binding(args.deployment)
+        deployment_fields = deployment.get("selected_fields")
+        if args.trellis_bits == 4 and (
+            not isinstance(deployment_fields, dict)
+            or deployment_fields.get("model_id") != GLM53_MODEL_ID
+        ):
+            raise ProfileError(
+                f"K4 route profile requires deployment model_id={GLM53_MODEL_ID}"
+            )
         report: dict[str, object] = {
-            "schema": SCHEMA,
+            "schema": LEGACY_SCHEMA if args.trellis_bits == 3 else SCHEMA,
             "status": "accepted",
             "capture_id": args.capture_id,
             "geometry": {
@@ -439,8 +457,9 @@ def main() -> None:
                 "max_rows": args.max_rows,
                 "layer_first": args.expected_layer_first,
                 "layer_last": args.expected_layer_last,
+                "trellis_bits": args.trellis_bits,
             },
-            "deployment": _deployment_binding(args.deployment),
+            "deployment": deployment,
             "logs": identities,
             "summary": _summary(samples, len(records)),
             "samples": samples,

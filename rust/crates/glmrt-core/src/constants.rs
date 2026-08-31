@@ -1,7 +1,13 @@
 pub const DEFAULT_MODEL_ID: &str = "lukealonso/GLM-5.2-NVFP4";
 pub const NVIDIA_MODEL_ID: &str = "nvidia/GLM-5.2-NVFP4";
 pub const EXL3_MODEL_ID: &str = "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1";
-pub const SUPPORTED_MODEL_IDS: [&str; 3] = [DEFAULT_MODEL_ID, NVIDIA_MODEL_ID, EXL3_MODEL_ID];
+pub const GLM53_EXL3_MODEL_ID: &str = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1";
+pub const SUPPORTED_MODEL_IDS: [&str; 4] = [
+    DEFAULT_MODEL_ID,
+    NVIDIA_MODEL_ID,
+    EXL3_MODEL_ID,
+    GLM53_EXL3_MODEL_ID,
+];
 pub const COORDINATOR_HOST: &str = "coordinator";
 pub const EXPERT_HOSTS: [&str; 4] = ["spark-0", "spark-1", "spark-2", "spark-3"];
 pub const GLM52_HIDDEN_SIZE: usize = 6144;
@@ -48,3 +54,14 @@ pub const GLM52_COMPRESSED_KV_BF16_BYTES_PER_TOKEN: usize =
     GLM52_COMPRESSED_MAIN_MLA_BF16_BYTES_PER_TOKEN + GLM52_COMPRESSED_DSA_BF16_BYTES_PER_TOKEN;
 pub const GLM52_EXPANDED_DEBUG_KV_BF16_BYTES_PER_TOKEN: usize =
     GLM52_NUM_HIDDEN_LAYERS * 2 * GLM52_HIDDEN_SIZE * 2;
+
+#[cfg(test)]
+mod tests {
+    use super::{GLM53_EXL3_MODEL_ID, SUPPORTED_MODEL_IDS};
+
+    #[test]
+    fn production_model_allowlist_includes_glm53_exl3_k4() {
+        assert!(SUPPORTED_MODEL_IDS.contains(&GLM53_EXL3_MODEL_ID));
+        assert_eq!(GLM53_EXL3_MODEL_ID, "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1");
+    }
+}

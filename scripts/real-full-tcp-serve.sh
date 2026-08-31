@@ -636,7 +636,8 @@ warmup_protocol_v2_experts() {
   local wire_contract="bf16-in/bf16-out"
   local warmup_routes_per_row=1
   local -a wire_args=()
-  if [ "$model_id" = "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1" ]; then
+  case "$model_id" in
+  wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1|wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1)
     # The native EXL3 route is a fused top-k=8 NVFP4-ingress kernel. A
     # legacy single-route BF16 probe falls through to the W4A16 projection
     # loader and asks the EXL3 catalog for a nonexistent `.weight` tensor.
@@ -644,7 +645,8 @@ warmup_protocol_v2_experts() {
     wire_contract="nvfp4-in/fp8-out"
     warmup_routes_per_row=8
     wire_args=(--nvfp4-fp8-roundtrip)
-  fi
+    ;;
+  esac
 
   echo "== warming Spark experts with binary ProtocolV2 precompile frames transport=${coordinator_transport} wire=${wire_contract} ==" >&2
   IFS=',' read -r -a entries <<< "$expert_hosts"

@@ -3540,6 +3540,8 @@ async fn real_glm_full_backend_runs_executor_decode_loop_for_multi_token_request
     assert_eq!(diagnostics.mtp_full_match_cycles, 3);
     assert_eq!(diagnostics.mtp_accepted_draft_lengths, vec![1, 1, 1]);
     assert_eq!(diagnostics.mtp_verify_cycle_ms.len(), 3);
+    assert_eq!(diagnostics.target_cycle_physical_m, vec![2, 2]);
+    assert_eq!(diagnostics.target_cycle_ms.len(), 2);
 }
 
 #[tokio::test]
@@ -3595,6 +3597,8 @@ async fn real_glm_full_backend_consumes_verified_tokens_from_one_decode_cycle() 
     assert_eq!(diagnostics.mtp_full_match_cycles, 1);
     assert_eq!(diagnostics.mtp_accepted_draft_lengths, vec![2]);
     assert_eq!(diagnostics.mtp_verify_cycle_ms.len(), 1);
+    assert!(diagnostics.target_cycle_physical_m.is_empty());
+    assert!(diagnostics.target_cycle_ms.is_empty());
 }
 
 #[tokio::test]
@@ -3660,6 +3664,10 @@ async fn real_glm_full_backend_decode_loop_stops_at_glm_chat_marker() {
     base.scheduler_terminal_lm_head_blocker = None;
     base.blocker.clear();
     base.failed_requirements.clear();
+    // This executor emits one target token per call and does not model a
+    // speculative verifier batch. Keep its physical target width at M=1.
+    base.request_mtp_verify_rows = 0;
+    base.request_mtp_accepted_rows = 0;
     state.config.real_full_executor = Some(Arc::new(FinishingStepSamplingRealFullExecutor {
         inner: StepSamplingRealFullExecutor {
             requests: Arc::clone(&requests),
@@ -3687,6 +3695,9 @@ async fn real_glm_full_backend_decode_loop_stops_at_glm_chat_marker() {
     assert_eq!(captured.len(), 3);
     assert_eq!(captured[2].generated_token_ids, vec![42, 43]);
     assert_eq!(captured[2].decode_step_index, 2);
+    let diagnostics = output.metrics.real_full.as_ref().unwrap();
+    assert_eq!(diagnostics.target_cycle_physical_m, vec![1, 1]);
+    assert_eq!(diagnostics.target_cycle_ms.len(), 2);
     assert_eq!(
         finishes.lock().unwrap().as_slice(),
         &[captured[0].sequence_id.clone()]

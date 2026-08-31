@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build a one-layer glmrt TensorCatalog from EXL3 projection checkpoints.
+"""Build a one-layer GLMRT TensorCatalog from EXL3 projection checkpoints.
 
 The projection checkpoint store is the durable, resumable output written while
-GLM-5.2 is being quantized.  This utility turns one complete decoder layer into
+GLM-5 is being quantized.  This utility turns one complete decoder layer into
 the same catalog entries that the final safetensors artifact will expose.  It is
 intended for pre-publication loader/preload/dispatch qualification on a Spark;
 it does not rewrite or duplicate any tensor payloads.
@@ -21,6 +21,12 @@ from typing import Any
 
 MODEL_ID = "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1"
 RECIPE = "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1"
+GLM53_MODEL_ID = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
+GLM53_RECIPE = "glm53_exl3_trellis_4bpw_calibrated_natural_route_v1"
+MODEL_PROFILES = {
+    MODEL_ID: {"recipe": RECIPE, "trellis_bits": 3},
+    GLM53_MODEL_ID: {"recipe": GLM53_RECIPE, "trellis_bits": 4},
+}
 EXPERTS = 256
 HIDDEN = 6144
 INTERMEDIATE = 2048
@@ -139,7 +145,29 @@ def _projection_files(root: Path, layer_id: int) -> dict[tuple[int, str], Path]:
     return projections
 
 
-def build_catalog(root: Path, layer_id: int) -> dict[str, Any]:
+def _expected_tensor_shapes(
+    projection: str, trellis_bits: int
+) -> dict[str, list[int]]:
+    if projection not in PROJECTIONS or trellis_bits not in (3, 4):
+        raise ValueError(
+            f"unsupported EXL3 projection/bitrate {projection!r}/K{trellis_bits}"
+        )
+    input_width, output_width = (
+        (HIDDEN, INTERMEDIATE)
+        if projection in {"gate_proj", "up_proj"}
+        else (INTERMEDIATE, HIDDEN)
+    )
+    return {
+        "trellis": [input_width // 16, output_width // 16, trellis_bits * 16],
+        "suh": [input_width],
+        "svh": [output_width],
+        "mcg": [],
+    }
+
+
+def build_catalog(
+    root: Path, layer_id: int, model_id: str = MODEL_ID
+) -> dict[str, Any]:
     root = root.expanduser().resolve(strict=True)
     if not root.is_dir():
         raise ValueError(f"projection checkpoint path is not a directory: {root}")
@@ -148,6 +176,10 @@ def build_catalog(root: Path, layer_id: int) -> dict[str, Any]:
             "the standalone runtime catalog must use the first routed layer "
             f"{FIRST_ROUTED_LAYER}, got {layer_id}"
         )
+    try:
+        profile = MODEL_PROFILES[model_id]
+    except KeyError as error:
+        raise ValueError(f"unsupported EXL3 catalog model ID {model_id!r}") from error
 
     projection_files = _projection_files(root, layer_id)
     tensors: list[dict[str, Any]] = []
@@ -161,6 +193,9 @@ def build_catalog(root: Path, layer_id: int) -> dict[str, Any]:
         for projection in PROJECTIONS:
             tensor_path = projection_files[(expert_id, projection)]
             header = _safetensors_header(tensor_path)
+            expected_shapes = _expected_tensor_shapes(
+                projection, profile["trellis_bits"]
+            )
             if set(header) != set(TENSOR_DTYPES):
                 raise ValueError(
                     f"{tensor_path} has tensors {sorted(header)}, expected "
@@ -174,6 +209,12 @@ def build_catalog(root: Path, layer_id: int) -> dict[str, Any]:
                     raise ValueError(
                         f"{tensor_path}:{suffix} has dtype {metadata['dtype']}, "
                         f"expected {expected_header_dtypes[suffix]}"
+                    )
+                if metadata["shape"] != expected_shapes[suffix]:
+                    raise ValueError(
+                        f"{tensor_path}:{suffix} has shape {metadata['shape']}, "
+                        f"expected {expected_shapes[suffix]} for "
+                        f"{model_id} K{profile['trellis_bits']}"
                     )
                 tensors.append(
                     {
@@ -191,17 +232,17 @@ def build_catalog(root: Path, layer_id: int) -> dict[str, Any]:
                 )
     tensors.sort(key=lambda tensor: tensor["name"])
     return {
-        "model_id": MODEL_ID,
+        "model_id": model_id,
         "snapshot_path": os.fspath(root),
         "facts": {
-            "model_id": MODEL_ID,
+            "model_id": model_id,
             "hidden_size": HIDDEN,
             # Limit this diagnostic catalog to the selected complete layer.
             "num_hidden_layers": layer_id + 1,
             "first_k_dense_replace": FIRST_ROUTED_LAYER,
             "routed_experts": EXPERTS,
             "top_k": TOP_K,
-            "quantization_recipe": RECIPE,
+            "quantization_recipe": profile["recipe"],
         },
         "tensors": tensors,
     }
@@ -211,10 +252,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--projection-checkpoint-dir", type=Path, required=True)
     parser.add_argument("--layer-id", type=int, default=FIRST_ROUTED_LAYER)
+    parser.add_argument("--model-id", choices=tuple(MODEL_PROFILES), default=MODEL_ID)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    catalog = build_catalog(args.projection_checkpoint_dir, args.layer_id)
+    catalog = build_catalog(
+        args.projection_checkpoint_dir, args.layer_id, model_id=args.model_id
+    )
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
@@ -228,6 +272,8 @@ def main() -> None:
             {
                 "output": os.fspath(output),
                 "layer_id": args.layer_id,
+                "model_id": args.model_id,
+                "trellis_bits": MODEL_PROFILES[args.model_id]["trellis_bits"],
                 "experts": EXPERTS,
                 "tensors": len(catalog["tensors"]),
                 "snapshot_path": catalog["snapshot_path"],

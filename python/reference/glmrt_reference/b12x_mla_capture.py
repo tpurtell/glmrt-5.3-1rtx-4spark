@@ -289,8 +289,8 @@ def _run_b12x_glm_dsa_indexer_prefill(
     ctx: dict[str, Any], *, prepare_only: bool, **kwargs: Any
 ) -> None:
     import torch
-    from b12x.attention.nsa_indexer.paged import index_topk_fp8
-    from b12x.attention.nsa_indexer.scratch import (
+    from b12x.attention.dsa_indexer.paged import index_topk_fp8
+    from b12x.attention.dsa_indexer.scratch import (
         B12XIndexerPagedScratchCaps,
         plan_indexer_paged_scratch,
     )
@@ -444,10 +444,10 @@ def _run_b12x_glm_dsa_indexer_prefill(
         if prepare_only and plan_key in _B12X_GLM_DSA_INDEXER_PREPARED:
             return
         if query_rows == 1:
-            from b12x.attention.nsa_indexer.fused_indexer import (
+            from b12x.attention.dsa_indexer.fused_indexer import (
                 run_fused_paged_indexer,
             )
-            from b12x.attention.nsa_indexer.kernel import (
+            from b12x.attention.dsa_indexer.kernel import (
                 _split_index_k_cache_runtime_views,
             )
 

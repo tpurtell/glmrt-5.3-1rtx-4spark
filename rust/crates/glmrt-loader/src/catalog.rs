@@ -1,5 +1,5 @@
 use crate::exl3_format::{
-    exl3_recipe_from_quantization_config, is_glm52_exl3_recipe, validate_glm52_exl3_expert_catalog,
+    exl3_recipe_from_quantization_config, is_glm_exl3_recipe, validate_glm52_exl3_expert_catalog,
 };
 use crate::snapshot::resolve_snapshot;
 use anyhow::{Context, Result};
@@ -18,6 +18,8 @@ use std::sync::Mutex;
 
 const EXTERNAL_QUANTIZATION_CONFIG_FILES: [&str; 2] =
     ["quantize_config.json", "quantization_config.json"];
+const COMPACT_EXL3_DECLARATION_FIELDS: [&str; 4] =
+    ["quant_method", "format", "checkpoint_format", "bits"];
 
 #[derive(Debug, Deserialize)]
 struct SafetensorsIndex {
@@ -147,9 +149,9 @@ pub fn build_catalog_for_snapshot(model_id: &str, snapshot_path: &Path) -> Resul
         facts,
         tensors,
     };
-    if is_glm52_exl3_recipe(&catalog.facts.quantization_recipe) {
+    if is_glm_exl3_recipe(&catalog.facts.quantization_recipe) {
         validate_glm52_exl3_expert_catalog(&catalog)
-            .context("validating calibrated GLM-5.2 EXL3 routed experts")?;
+            .context("validating calibrated GLM-5 EXL3 routed experts")?;
     }
     Ok(catalog)
 }
@@ -181,7 +183,7 @@ pub fn read_model_facts(model_id: &str, snapshot_path: &Path) -> Result<ModelFac
             .moe_intermediate_size
             .unwrap_or(GLM52_MOE_INTERMEDIATE_SIZE)
             == GLM52_MOE_INTERMEDIATE_SIZE,
-        "unsupported GLM-5.2 MoE intermediate size for {model_id}"
+        "unsupported GLM-5 MoE intermediate size for {model_id}"
     );
     let quantization_config =
         resolve_model_quantization_config(snapshot_path, config.quantization_config.as_ref())?;
@@ -255,12 +257,19 @@ fn resolve_model_quantization_config<'a>(
         let full_object = full.as_object().with_context(|| {
             format!("external EXL3 config {} must be an object", path.display())
         })?;
+        let legacy_compact_matches = full_object.len() == embedded_object.len() + 1
+            && embedded_object
+                .iter()
+                .all(|(key, value)| full_object.get(key) == Some(value));
+        let minimal_compact_matches = embedded_object.len()
+            == COMPACT_EXL3_DECLARATION_FIELDS.len()
+            && COMPACT_EXL3_DECLARATION_FIELDS.iter().all(|field| {
+                embedded_object.get(*field).is_some()
+                    && embedded_object.get(*field) == full_object.get(*field)
+            });
         anyhow::ensure!(
             full_object.get("tensor_storage").is_some()
-                && full_object.len() == embedded_object.len() + 1
-                && embedded_object
-                    .iter()
-                    .all(|(key, value)| full_object.get(key) == Some(value)),
+                && (legacy_compact_matches || minimal_compact_matches),
             "config.json quantization_config differs from compact {}",
             path.display()
         );
@@ -275,7 +284,7 @@ fn resolve_model_quantization_config<'a>(
     }
     let (_, full) = resolved.with_context(|| {
         format!(
-            "compact GLM-5.2 EXL3 config requires {} or {} in {}",
+            "compact GLM-5 EXL3 config requires {} or {} in {}",
             EXTERNAL_QUANTIZATION_CONFIG_FILES[0],
             EXTERNAL_QUANTIZATION_CONFIG_FILES[1],
             snapshot_path.display()
@@ -465,7 +474,8 @@ pub fn classification_summary_markdown(catalog: &TensorCatalog) -> String {
 
 #[cfg(test)]
 mod quantization_config_tests {
-    use super::resolve_model_quantization_config;
+    use super::{read_model_facts, resolve_model_quantization_config};
+    use crate::exl3_format::GLM53_EXL3_RECIPE_K4_V1;
 
     #[test]
     fn compact_exl3_config_resolves_only_an_exact_external_storage_extension() {
@@ -510,5 +520,63 @@ mod quantization_config_tests {
         let error =
             resolve_model_quantization_config(temporary.path(), Some(&embedded)).unwrap_err();
         assert!(error.to_string().contains("differs from compact"));
+    }
+
+    #[test]
+    fn model_facts_require_the_complete_external_k4_ledger() {
+        let temporary = tempfile::tempdir().unwrap();
+        let embedded = serde_json::json!({
+            "quant_method": "exl3",
+            "format": "exl3",
+            "checkpoint_format": "exl3",
+            "bits": 4.0
+        });
+        let mut full = serde_json::json!({
+            "method": "exl3",
+            "quant_method": "exl3",
+            "format": "exl3",
+            "checkpoint_format": "exl3",
+            "bits": 4.0,
+            "codebook": "mcg",
+            "out_scales": "auto",
+            "group_size": -1,
+            "desc_act": false,
+            "module_include": [
+                "^model\\.layers\\.(?:[3-9]|[1-6][0-9]|7[0-7])\\.mlp\\.experts\\.\\d+\\.(?:gate_proj|up_proj|down_proj)$"
+            ],
+            "meta": {
+                "ds4rt_error_ledger": {
+                    "family_join": {"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                    "run": {"kind": "production"}
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        std::fs::write(
+            temporary.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "moe_intermediate_size": 2048,
+                "quantization_config": embedded
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        full.insert(
+            "tensor_storage".to_owned(),
+            serde_json::json!({"model.layers.3.mlp.experts.0.gate_proj": {}}),
+        );
+        let external = temporary.path().join("quantize_config.json");
+        std::fs::write(&external, serde_json::to_vec(&full).unwrap()).unwrap();
+
+        let facts = read_model_facts("test/glm53-exl3-k4", temporary.path()).unwrap();
+        assert_eq!(facts.quantization_recipe, GLM53_EXL3_RECIPE_K4_V1);
+
+        std::fs::remove_file(external).unwrap();
+        let error = read_model_facts("test/glm53-exl3-k4", temporary.path()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("compact GLM-5 EXL3 config requires quantize_config.json"));
     }
 }

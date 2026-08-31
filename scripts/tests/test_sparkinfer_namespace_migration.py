@@ -34,7 +34,7 @@ CUTLASS_PACKAGES = (
     "nvidia-cutlass-dsl-libs-cu12",
     "nvidia-cutlass-dsl-libs-cu13",
 )
-QUALIFIED_CUTLASS_VERSION = "4.6.1"
+QUALIFIED_CUTLASS_VERSION = "4.6.2"
 SPARKINFER_IMAGE_DOCKERFILES = (
     ROOT / "docker" / "Dockerfile.dev",
     ROOT / "docker" / "Dockerfile.release",
@@ -299,7 +299,7 @@ def test_standalone_bootstrap_imports_verified_submodule() -> None:
         (ROOT / "third_party" / "sparkinfer").resolve()
     )
     assert re.fullmatch(r"[0-9a-f]{40}", revision)
-    assert Version(version) == Version("1.1.0")
+    assert Version(version) == Version("1.3.0")
 
 
 def test_live_launchers_override_stale_cmake_sparkinfer_cache_entries() -> None:
@@ -414,11 +414,9 @@ def test_packed_expert_warmups_use_model_appropriate_wire() -> None:
         assert 'if [ "$warmup_layer_id" != "78" ]; then' not in warmup
         assert 'local wire_contract="bf16-in/bf16-out"' in warmup
         assert "local warmup_routes_per_row=1" in warmup
-        assert (
-            'if [ "$model_id" = '
-            '"wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1" ]; then'
-            in warmup
-        )
+        assert 'case "$model_id" in' in warmup
+        assert "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1" in warmup
+        assert "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1" in warmup
         assert 'wire_contract="nvfp4-in/fp8-out"' in warmup
         assert "warmup_routes_per_row=8" in warmup
         assert "wire_args=(--nvfp4-fp8-roundtrip)" in warmup

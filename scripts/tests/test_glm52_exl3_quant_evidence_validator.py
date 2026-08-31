@@ -75,27 +75,46 @@ def _metrics(*, apply_out_scales: bool = False) -> dict:
     }
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _fixture(tmp_path: Path, *, bits: int = 3) -> tuple[Path, Path, Path]:
     checkpoint_root = tmp_path / "projections"
     run_state = tmp_path / "run-state"
     run_state.mkdir()
     family = {
-        "bits": 3,
+        "bits": bits,
         "codebook": "mcg",
         "quantizer_numerics": {"sigma_reg": 0.025},
     }
-    plan = _bound(
-        {
-            "schema": "glmrt-glm52-gptqmodel-plan-v2",
-            "projection_checkpoint": {
-                "contract": "ds4rt.exl3-projection-checkpoint-v1",
-                "root": str(checkpoint_root),
-            },
-            "run_state_dir": str(run_state),
-            "ledger_provenance": {"family_join": family},
+    plan_body = {
+        "schema": (
+            "glmrt-glm5-gptqmodel-plan-v3"
+            if bits == 4
+            else "glmrt-glm52-gptqmodel-plan-v2"
+        ),
+        "projection_checkpoint": {
+            "contract": "ds4rt.exl3-projection-checkpoint-v1",
+            "root": str(checkpoint_root),
         },
-        "plan_sha256",
-    )
+        "run_state_dir": str(run_state),
+        "ledger_provenance": {"family_join": family},
+    }
+    if bits == 4:
+        plan_body.update(
+            {
+                "recipe": "glm53_exl3_trellis_4bpw_calibrated_natural_route_v1",
+                "source": {
+                    "release": "glm-5.3",
+                    "format": "fp8-e4m3-block128x128-dynamic",
+                    "geometry": {
+                        "first_target_layer": 3,
+                        "last_target_layer": 77,
+                        "n_routed_experts": 256,
+                        "mtp_layer_index": 78,
+                    },
+                },
+                "exl3": {"bits": 4, "codebook": "mcg"},
+            }
+        )
+    plan = _bound(plan_body, "plan_sha256")
     plan_path = run_state / "glmrt-gptqmodel-plan.json"
     plan_path.write_bytes(TOOL.canonical_json(plan) + b"\n")
 
@@ -120,7 +139,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
                 "sha256": "a" * 64,
             },
             "quantizer_contract": {
-                "bits": 3,
+                "bits": bits,
                 "codebook": "mcg",
                 "apply_out_scales": None,
             },
@@ -132,10 +151,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     metrics = _metrics(apply_out_scales=False)
     tensor_specs = {
         "trellis": {
-            "shape": [1, 1, 48],
+            "shape": [1, 1, 16 * bits],
             "dtype": "torch.int16",
-            "numel": 48,
-            "bytes": 96,
+            "numel": 16 * bits,
+            "bytes": 32 * bits,
             "sha256": "b" * 64,
         },
         "suh": {
@@ -169,10 +188,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         "processor_layer_index": 3,
         "expert": 0,
         "projection": "w1",
-        "bits": 3,
+        "bits": bits,
         "codebook": "mcg",
         "sample_count": 1024,
-        "encoded_bytes": 164,
+        "encoded_bytes": 32 * bits + 68,
         "route_evidence": route,
         "quantizer_metrics": metrics,
         "provenance": {"family_join": family},
@@ -206,6 +225,43 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return plan_path, checkpoint_root, journal
 
 
+def _add_unjournaled_checkpoint(checkpoint_root: Path) -> None:
+    source_manifest_path = next(checkpoint_root.rglob("*.json"))
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    source_tensor = source_manifest_path.with_suffix(".safetensors")
+    manifest = {
+        key: value
+        for key, value in source_manifest.items()
+        if key != "manifest_sha256"
+    }
+    request = dict(manifest["request"])
+    request.pop("request_sha256")
+    request["module"] = "model.layers.3.mlp.experts.1.gate_proj"
+    request["route_evidence"] = dict(request["route_evidence"], expert=1)
+    request = _bound(request, "request_sha256")
+    ledger = dict(manifest["result"]["ledger_record"])
+    ledger["module"] = request["module"]
+    ledger["expert"] = 1
+    ledger["route_evidence"] = request["route_evidence"]
+    result = dict(manifest["result"], ledger_record=ledger)
+    digest = request["request_sha256"]
+    directory = checkpoint_root / digest[:2] / digest[2:4]
+    directory.mkdir(parents=True)
+    tensor_path = directory / f"{digest}.safetensors"
+    tensor_path.write_bytes(source_tensor.read_bytes())
+    manifest.update(
+        {
+            "request": request,
+            "request_sha256": digest,
+            "tensor_file": tensor_path.name,
+            "tensor_sha256": TOOL.sha256_file(tensor_path),
+            "result": result,
+        }
+    )
+    manifest = _bound(manifest, "manifest_sha256")
+    (directory / f"{digest}.json").write_bytes(TOOL.canonical_json(manifest) + b"\n")
+
+
 def test_partial_validation_authenticates_autoscale_false_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -226,6 +282,66 @@ def test_partial_validation_authenticates_autoscale_false_checkpoint(
     assert report["metrics"]["global"][
         "aggregate_hessian_weighted_relative_error"
     ] == pytest.approx(0.1)
+    assert report["metrics"]["by_route_evidence"]["natural-route"][
+        "projection_count"
+    ] == 1
+
+
+def test_glm53_k4_evidence_uses_64_lane_trellis_and_new_schema(
+    tmp_path: Path,
+) -> None:
+    plan, checkpoints, journal = _fixture(tmp_path, bits=4)
+
+    report = TOOL.validate_evidence(
+        plan_path=plan,
+        checkpoint_root=checkpoints,
+        journal_path=journal,
+        require_complete=False,
+        verify_tensor_hashes=True,
+    )
+
+    assert report["schema"] == TOOL.GLM53_SCHEMA
+    assert report["scope"] == "glm-5.3-base-routed-experts-layers-3-through-77"
+    assert report["coverage"]["expected_projection_count"] == 57_600
+    assert report["integrity"]["logical_encoded_tensor_bytes"] == 196
+
+
+def test_live_snapshot_authenticates_only_the_durable_journal_frontier(
+    tmp_path: Path,
+) -> None:
+    plan, checkpoints, journal = _fixture(tmp_path, bits=4)
+    _add_unjournaled_checkpoint(checkpoints)
+
+    report = TOOL.validate_evidence(
+        plan_path=plan,
+        checkpoint_root=checkpoints,
+        journal_path=journal,
+        require_complete=False,
+        verify_tensor_hashes=True,
+        live_journal_snapshot=True,
+    )
+
+    assert report["status"] == "partial-live-snapshot-accepted"
+    assert report["coverage"]["projection_count"] == 1
+    assert report["integrity"]["journal_record_count"] == 1
+    assert report["integrity"]["checkpoint_pairs_seen"] == 2
+    assert report["integrity"]["post_snapshot_checkpoint_count"] == 1
+
+
+def test_live_snapshot_cannot_be_used_as_complete_release_evidence(
+    tmp_path: Path,
+) -> None:
+    plan, checkpoints, journal = _fixture(tmp_path, bits=4)
+
+    with pytest.raises(TOOL.EvidenceValidationError, match="cannot prove complete"):
+        TOOL.validate_evidence(
+            plan_path=plan,
+            checkpoint_root=checkpoints,
+            journal_path=journal,
+            require_complete=True,
+            verify_tensor_hashes=True,
+            live_journal_snapshot=True,
+        )
 
 
 def test_validation_rejects_quantizer_arithmetic_drift(tmp_path: Path) -> None:

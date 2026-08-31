@@ -1,11 +1,10 @@
-# GLM-5.2 calibrated EXL3 K3 quantization
+# GLM-5.3 calibrated EXL3 K4 quantization
 
 This directory contains the reproducible, restartable quantization path for the
-GLMRT GLM-5.2 EXL3 model. It quantizes only the routed experts in decoder
-layers 3 through 77 to native EXL3 K3/MCG tensors. All other tensors remain in
+GLMRT GLM-5.3 EXL3 K4 model. It quantizes only the routed experts in decoder
+layers 3 through 77 to native EXL3/MCG tensors. All other tensors remain in
 their source format. The generated artifact is intended for GLMRT's TP4 Spark
-EXL3 loader; it is not an NVFP4 checkpoint and does not keep a second resident
-expert representation.
+EXL3 loader and does not keep a second resident expert representation.
 
 The production topology is exactly two compute-capability 12.0 coordinator
 GPUs. The image, Python packages, Rust toolchain, GPTQModel fork, input model,
@@ -13,591 +12,431 @@ corpus, hardware identities, and numerical recipe are all content-bound in the
 preflight report and execution plan. A resume fails closed if any immutable
 input changes.
 
-## Prepare the pinned source
+## GLM-5.3 K4 production recipe
 
-`build.sh` initializes and verifies the GPTQModel submodule automatically. To
-prepare it without running the full build:
+The commands below are the complete GLM-5.3 production runbook:
 
-```bash
-git submodule sync -- third_party/gptqmodel
-git submodule update --init --checkout -- third_party/gptqmodel
-python3 scripts/verify-gptqmodel-source.py \
-  --source third_party/gptqmodel \
-  --lock third_party/gptqmodel.lock.json
-```
+- source: the exact `zai-org/GLM-5.3` snapshot;
+- bitrate: pass `--bits 4` explicitly;
+- source format: block-128x128 FP8 E4M3, which the plan validates together
+  with every routed projection's scale tensor;
+- native Spark validation: always pass `--trellis-bits 4`;
+- Spark tile tuning: pass `--trellis-bits 4` to
+  `bench_b12x_spark_exl3_tiles.py`; it maps each observed live M to the K4
+  production capacity rather than timing an unrelated exact-M specialization.
+  Use `--rows all-aot` for every compiled capacity or `--rows required-native`
+  for the complete 44-row K4 live qualification surface;
+- checkpoint-only Spark qualification: pass
+  `--model-id wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1` to
+  `build_exl3_projection_catalog.py`; the builder validates K4 trellis shapes
+  and emits the K4 recipe;
+- output identity: publish only as
+  `wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1`;
+- artifact validation: this plan binds both tokenizer files directly, so omit
+  the obsolete `--tokenizer-attestation` argument;
+- model-card template: `quantization/GLM53_EXL3_MODEL_CARD.md`;
+- serving qualification: run
+  `python/tools/validate_glm53_exl3_serving_qualification.py`, which compares
+  matched native-MTP and DFlash2 runs and selects the measured agentic default;
+- model-card renderer: `python/tools/render_glm53_exl3_model_card.py`.
 
-Do not substitute upstream GPTQModel or a PyPI wheel. The GLMRT fork contains
-the GLM-5.2 model definition, EXL3 Hessian/projection checkpointing, bounded
-layer state, and crash-consistent resume support used by this recipe.
-
-## Build the calibration corpus
-
-The corpus builder creates source-disjoint calibration, screening, and
-held-out JSONL files. It records the exact committed training-data inputs,
-builder revision, tokenizer hash, selection seed, per-record provenance, and
-split hashes in `manifest.json`. Both the GLMRT checkout and training-data
-checkout must be clean for the paths consumed by the builder.
-
-The pinned quantization image provides the required Python packages. Mount the
-two Git checkouts at their real absolute paths so provenance remains valid:
-
-```bash
-repo_root="$(git rev-parse --show-toplevel)"
-training_root="$(git -C ../training-data rev-parse --show-toplevel)"
-source_snapshot=/path/to/GLM-5.2/snapshot
-corpus_root=/path/to/glm-5.2-exl3-k3-corpus
-quant_image=glmrt-quant-coordinator:exl3-k3
-
-docker run --rm \
-  -v "$repo_root:$repo_root:ro" \
-  -v "$training_root:$training_root:ro" \
-  -v "$source_snapshot:$source_snapshot:ro" \
-  -v "$(dirname "$corpus_root"):$(dirname "$corpus_root")" \
-  "$quant_image" \
-  python "$repo_root/python/tools/build_glm52_calibration_corpus.py" \
-    --training-data "$training_root" \
-    --tokenizer "$source_snapshot/tokenizer.json" \
-    --output "$corpus_root"
-```
-
-The defaults select about 1.08 million calibration prompt tokens and 65,536
-held-out prompt tokens across general, code/agentic, math, reasoning
-termination, and structured-output axes. To create a different calibration,
-change the explicit token budgets or seed; that produces a different manifest
-and therefore a different quantization plan.
-
-## Build and qualify the image
-
-Build arguments bind the fully hashed dependency locks and exact GPTQModel
-revision into the image:
+The validated v1 corpus contains 1,441 examples and 1,082,141 prompt tokens.
+Keep a slow, read-only source snapshot on scratch if necessary, but put the
+rolling run frontier, projection checkpoints, active-layer staging, offload
+state, and final output on the fast local NVMe. A representative fresh command
+has this shape (omit `--resume` until resuming an already-bound plan):
 
 ```bash
-quant_req_sha="$(sha256sum quantization/requirements.amd64.lock | awk '{print $1}')"
-quant_build_req_sha="$(sha256sum quantization/build-requirements.lock | awk '{print $1}')"
-gptq_revision="$(git -C third_party/gptqmodel rev-parse HEAD)"
-quant_image=glmrt-quant-coordinator:exl3-k3
-
-docker build --platform linux/amd64 \
-  -f docker/Dockerfile.quantization \
-  --build-arg TARGETARCH=amd64 \
-  --build-arg GLMRT_QUANT_REQUIREMENTS_SHA256="$quant_req_sha" \
-  --build-arg GLMRT_QUANT_BUILD_REQUIREMENTS_SHA256="$quant_build_req_sha" \
-  --build-arg GLMRT_GPTQMODEL_COMMIT="$gptq_revision" \
-  -t "$quant_image" .
+python -X faulthandler quantization/quantize_glm52_gptqmodel.py \
+  --snapshot /path/to/zai-org--GLM-5.3/snapshots/REVISION \
+  --calibration-jsonl /fast-nvme/calibration/calibration.jsonl \
+  --calibration-manifest /fast-nvme/calibration/manifest.json \
+  --preflight-report /fast-nvme/quant-state/coordinator-preflight.json \
+  --output /fast-nvme/models/GLM-5.3-EXL3-K4-calibrated-v1 \
+  --run-state-dir /fast-nvme/quant-state/run-state \
+  --projection-checkpoint-dir /fast-nvme/quant-state/projection-checkpoints \
+  --offload-dir /fast-nvme/quant-state/offload \
+  --bits 4
 ```
 
-Run preflight with exactly the two GPUs that will perform the quantization. The
-report is a required plan input, not merely diagnostic output:
-
-```bash
-state_root=/path/to/glm-5.2-exl3-k3-run
-image_digest="$(docker image inspect --format '{{.Id}}' "$quant_image")"
-
-docker run --rm --gpus '"device=0,1"' --ipc=host \
-  -e GLMRT_QUANT_IMAGE_DIGEST="$image_digest" \
-  -v "$(dirname "$state_root"):$(dirname "$state_root")" \
-  "$quant_image" \
-  python /opt/glmrt/quantization/preflight.py \
-    --require-image-digest \
-    --output "$state_root/coordinator-preflight.json"
-```
-
-Preflight checks the target platform/CUDA architecture, both physical GPU
-identities and power limits, driver, package locks, free-threaded Python,
-Rust/uv versions, cuSPARSELt metadata, image digest, and exact GPTQModel source
-tree. Keep the report with the run state.
-
-## Plan, run, and resume
-
-Use fast scratch storage for projection checkpoints. Put rolling layer state,
-active-layer source staging, and offload state on durable NVMe. The source
-snapshot and all state paths must be visible inside the container at the same
-absolute paths.
-
-```bash
-output_root=/path/to/GLM-5.2-EXL3-K3-calibrated
-projection_root=/fast-scratch/glm-5.2-exl3-k3/projection-checkpoints
-run_state="$state_root/run-state"
-active_source="$run_state/active-layer-source"
-offload_root="$state_root/offload"
-
-quant_args=(
-  python -X faulthandler
-  /opt/glmrt/quantization/quantize_glm52_gptqmodel.py
-  --snapshot "$source_snapshot"
-  --calibration-jsonl "$corpus_root/calibration.jsonl"
-  --calibration-manifest "$corpus_root/manifest.json"
-  --preflight-report "$state_root/coordinator-preflight.json"
-  --output "$output_root"
-  --run-state-dir "$run_state"
-  --projection-checkpoint-dir "$projection_root"
-  --active-layer-source-dir "$active_source"
-  --offload-dir "$offload_root"
-)
-
-docker run --rm --gpus '"device=0,1"' --ipc=host \
-  -v "$source_snapshot:$source_snapshot:ro" \
-  -v "$(dirname "$corpus_root"):$(dirname "$corpus_root"):ro" \
-  -v "$(dirname "$state_root"):$(dirname "$state_root")" \
-  -v "$(dirname "$projection_root"):$(dirname "$projection_root")" \
-  -v "$(dirname "$output_root"):$(dirname "$output_root")" \
-  "$quant_image" "${quant_args[@]}" --plan-only
-```
-
-Remove `--plan-only` to start a fresh run. If the process is interrupted and
-the image and source are unchanged, run the identical command with `--resume`.
-Do not add `--resume` to a fresh run and do not edit the run-state files.
-`--stop-after-layer N` is available for a
-qualification run; it stops only after layer `N` has committed a complete
-rolling boundary and is intentionally excluded from the immutable numerical
-plan. Resume also handles interruption during final export: an export with its
-final commit marker is fully hash-verified, fsynced, and atomically published;
-an unmistakably partial stage is discarded and rebuilt from the durable packed
-projection checkpoints without repeating trellis search. A malformed committed
-stage fails closed.
-
-If checkpoint-only execution code must change after a failure, first commit
-and pin the corrected GPTQModel source, rebuild the quantization image, and
-produce a new two-GPU preflight report. Then reuse the parent command and add:
-
-```bash
---execution-upgrade --resume
-```
-
-This does not regenerate or edit the immutable parent plan. It writes a signed
-`glmrt-execution-upgrade.json` that binds the parent plan, old and new image,
-GPTQModel and toolchain identities, unchanged Python/Torch and GPU UUIDs, the
-exact error-journal frontier, and the retained rolling layer boundary. Repeated
-upgrades form an authenticated history. The active upgrade is copied into the
-finished artifact and referenced by its run manifest. A changed model,
-calibration stream, numerical recipe, storage root, batch size, runtime, or GPU
-identity fails closed. If interruption lands between archiving the active
-upgrade and atomically installing its successor, the next upgrade launch
-removes only an exact duplicate of the still-active record; differing or
-unlinked history continues to fail closed.
-
-The current router-candidate payload contract is
-`gptqmodel.exl3-router-candidate-capture-v3`. It requires an explicit model
-score adapter, reproduces the live router with its original top-k width, and
-then treats that selected set as authoritative while ranking the adjacent
-recovery candidates. This avoids relying on nested `torch.topk` results across
-different widths at a tied score boundary. Changing this contract selects a
-new capture-spool key; obsolete scratch for the same layer/subset is removed
-when the replacement spool opens, so malformed evidence cannot be reused and
-does not remain as a second 13 GB layer capture.
-
-For GLM-MoE-DSA under the pinned Transformers runtime, that adapter reproduces
-the router exactly: FP32 logits pass through sigmoid, the FP32 correction bias
-is added for selection, each group's score is the sum of its strongest two
-corrected experts, non-selected groups are masked, and top-k is taken from the
-remaining corrected scores. The recovered ranking must reproduce the live
-top-k set for every row before any near-route evidence is accepted.
-
-Projection checkpoint tensor/manifest pairs are atomically published as
-`0644`, even when the container runs as root, so the host-side independent
-validator can read them without changing ownership. Older in-progress images
-that published `0600` pairs may be repaired after the container stops with a
-single root-side `chmod a+r` over files in the checkpoint store; permissions
-are not part of checkpoint content identity.
-
-An already-complete projection store may seed a fresh run with
-`--projection-checkpoint-seed-dir /path/to/store`. The quantizer hashes every
-seed artifact, verifies complete signed coverage, and accepts only an exact
-numerical-family match (or a specifically reviewed, allowlisted
-checkpoint-only GPTQModel transition). Never copy individual projection files
-by hand.
-
-For an allowlisted transition, `family_join` remains the seed's numerical
-compatibility identity in both reused and newly written projection keys. It is
-not the identity of the process that produced a new checkpoint. The actual
-GPTQModel revision and source-tree hash, image digest, GPU identities, and
-preflight are recorded under `provenance.run.coordinator` and bound by the
-immutable plan hash. If an execution upgrade is active, new projection records
-also carry `provenance.run.execution_upgrade`, while the complete signed
-upgrade chain is retained beside the plan. This separation permits numerically
-identical projection reuse without losing executable provenance.
-
-The rolling boundary stores the activation continuation and router
-`prev_topk_indices` separately, while completed packed projections remain in
-the projection store. The first unseeded projection also builds GPTQModel's
-EXL3 CUDA extension into `run-state/jit/exllamav3`; the loader fingerprints its
-sources, compiler flags, Python/Torch/CUDA versions, and target architectures,
-so later containers reuse only a compatible binary. Publication is atomic: the
-final model directory is created only after all 78 decoder layers have
-completed and the deferred EXL3 modules have been materialized.
-
-Deferred packed modules do not create a second copy of the 272.73 GB projection
-payload. Their offload directories contain only small indices that reference
-the already authenticated projection-checkpoint tensor ranges and bind each
-range by SHA-256. The final streaming writer verifies those hashes while
-copying the ranges into the publication shards. Projection checkpoints must
-therefore remain in place until the artifact has been completely written and
-validated; cleanup tooling enforces that ordering.
-
-Every new v2 plan also carries a deterministic storage contract. Before model
-loading, the runner groups output, rolling state, offload, and projection
-requirements by the actual filesystem device and writes
-`storage-preflight.json`. For the pinned source it budgets approximately
-329.85 GB of tensor payload for the final artifact, 272.73 GB for durable K3
-projection payloads, 128 GiB for bounded rolling state, 12 GiB for offload,
-format overhead, and a 32 GiB post-completion free-space floor. Existing
-completed projections and rolling files reduce only their corresponding
-remaining requirement. Output and run state must share a filesystem because
-publication is one atomic rename.
-
-## Tests
-
-The host-side corpus, plan, seed, boundary, and resume contracts are covered by:
-
-```bash
-PYTHONPATH=quantization pytest -q quantization/tests
-```
-
-Run these tests in the pinned image when the host does not have the locked
-Python dependencies. Native Spark execution and numerical parity are qualified
-separately after the artifact is complete; a successful quantization alone is
-not permission to publish or replace the NVFP4 serving baseline.
-
-After building the Spark native library on an SM120/SM121 host, validate the
-production C ABI and every route-block regime against the pinned SparkInfer
-implementation:
-
-```bash
-PYTHONPATH=third_party/sparkinfer \
-python3 python/tools/validate_b12x_exl3_native.py \
-  --native-library /path/to/libglmrt_native.so \
-  --rows 1,3,129,257,513,1025,2049,2064
-```
-
-The validator uses the production GLM-5.2 TP4 geometry, passes inputs through
-GLMRT's NVFP4 wire codec, requires a nonzero finite oracle, and reports the
-compiled tile, register, spill, and numerical-difference evidence. It is a
-runtime integration gate, not a substitute for held-out model-quality
-qualification.
-
-Before final model publication, the same validator must assemble all four TP
-ranks directly from one complete calibrated layer in the resumable projection
-store. Each pass authenticates the selected layer's 768 manifests and packed
-payloads before loading them:
+Qualify every production Spark rank against the pinned SparkInfer reference
+with K4 selected explicitly:
 
 ```bash
 native_evidence_root=/path/to/native-evidence
+model_snapshot=/path/to/finalized-exl3-model
+trellis_bits=4
+expert_slot_fingerprint=$(jq -er '.fingerprints.expert_slot | select(test("^[0-9a-f]{64}$"))' \
+  "$qualification_root/mtp-deployment.json")
 mkdir -p "$native_evidence_root"
 for tp_rank in 0 1 2 3; do
   PYTHONPATH=third_party/sparkinfer \
   python3 python/tools/validate_b12x_exl3_native.py \
     --native-library /path/to/libglmrt_native.so \
-    --projection-checkpoint-dir /path/to/projection-checkpoints \
+    --expert-slot-fingerprint "$expert_slot_fingerprint" \
+    --trellis-bits "$trellis_bits" \
+    --model-snapshot "$model_snapshot" \
     --layer-id 3 --tp-rank "$tp_rank" \
-    --rows 1,3,9,10,129,257,513,1025,2049,2064 \
+    --rows 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,64,128,129,256,257,512,513,1024,1025,2048,2049,2064 \
     --output "$native_evidence_root/native-tp${tp_rank}.json"
 done
 ```
 
-This reads all 768 `trellis/suh/svh/mcg` projection checkpoints for that layer,
-validates their exact namespace, shapes, manifest digests, and packed-payload
-hashes, performs the production TP4 intermediate-axis slicing, and compares
-the native ABI with the pinned SparkInfer implementation. The M=2,049 and
-M=2,064 cases qualify the non-power-of-two bucket that retains a full prefill
-wave's target/draft suffix. The selected quantizer global scale is already
-folded inversely into `suh`; the runtime unit-scale buffer must remain 1.0.
+The final publication gate requires the correct GLM-5.3 `config.json`, a full
+standalone `quantize_config.json` containing all 57,600 `tensor_storage`
+records and all 230,400 stored-tensor descriptions, and exact agreement
+between its compact declaration and `config.json.quantization_config`. For
+GLM-5.3 that embedded declaration contains exactly `quant_method`, `format`,
+`checkpoint_format`, and `bits`; calibration provenance, the error ledger,
+module selection, storage details, and every other quantization field remain
+only in `quantize_config.json`. The publication gate also rejects a main
+`config.json` larger than 128 KiB. The Hub verifier repeats that agreement
+check against the exact publication bytes, proves those bytes are the resolved
+public revision through Hub Git/LFS object identities, requires the Hub API to
+parse the compact EXL3 declaration, and checks the rendered model/tree/config
+pages for visible errors. Matching local intent alone is not sufficient.
 
-## Accept and stage the completed artifact
+Publication retains `meta.ds4rt_error_ledger` byte-for-structure and every
+other calibration or quantization field in the standalone file. It removes
+only redundant top-level GPTQModel execution controls (for example the active
+offload and CUDA-placement controls), which the pinned serializer normally
+omits before the artifact is written. Content-bound paths and execution facts
+inside the immutable calibration ledger are not stripped.
 
-The quantizer publishes locally with one same-filesystem atomic rename. Before
-uploading or serving that directory, authenticate and summarize all projection
-quality evidence. Final qualification must hash the packed payloads; the two
-diagnostic flags shown below are only useful while a quantization is running:
+Treat the quantizer's first completed directory as a raw export. After the
+quantizer has exited successfully, use this complete GLM-5.3 acceptance block:
 
 ```bash
-quant_evidence_report="$state_root/glm52-exl3-quant-evidence.json"
+raw_output_root=/fast-nvme/models/GLM-5.3-EXL3-K4-calibrated-v1
+output_root=/fast-nvme/models/GLM-5.3-EXL3-K4-v1
+state_root=/fast-nvme/quant-state
+quant_image=glmrt-quant-coordinator:exl3-k4
+model_id=wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1
+source_snapshot=/path/to/zai-org--GLM-5.3/snapshots/REVISION
+run_state="$state_root/run-state"
+projection_root="$state_root/projection-checkpoints"
+quant_evidence_report="$state_root/glm53-exl3-k4-quant-evidence.json"
+artifact_report="$state_root/glm53-exl3-k4-artifact-validation.json"
 
+# Acceptance mode intentionally omits --allow-incomplete,
+# --skip-tensor-hashes, and --live-journal-snapshot.
 python3 python/tools/validate_glm52_exl3_quant_evidence.py \
   --plan "$run_state/glmrt-gptqmodel-plan.json" \
   --projection-checkpoint-dir "$projection_root" \
   --error-journal "$run_state/.glmrt-exl3-error-journal.jsonl" \
   --output "$quant_evidence_report"
 
-# In-progress inspection only; never use this report for release acceptance:
-#   --allow-incomplete --skip-tensor-hashes
-```
-
-The default mode requires all 57,600 base routed-expert projections, exact
-journal membership, content-bound plans/manifests/requests, correct K3 tensor
-geometry, all finite and arithmetically consistent Hessian/reconstruction
-metrics, and SHA-256 verification of every packed checkpoint. The signed report
-also validates any complete execution-upgrade chain and accounts for
-projection records produced by the parent plan and each upgraded executor. It
-contains global, per-projection, and per-layer error distributions. It is
-quantizer evidence, not an end-to-end model-quality result; held-out serving
-qualification remains mandatory.
-
-Then run the independent artifact validator:
-
-The original v1 production run started before tokenizer files were included in
-the immutable plan. Its one-time recovery evidence must use the retained
-original container metadata and that exact pinned image:
-
-```bash
-docker inspect glmrt-exl3-k3-quant-safe-v6-full-1 \
-  > "$state_root/original-container-inspect.json"
-
-source_model_root="$(dirname "$(dirname "$source_snapshot")")"
-repo_root="$(git rev-parse --show-toplevel)"
+# The quantization image runs as root. After it has exited successfully,
+# normalize only the atomically published raw artifact so the host can create
+# protected hard links without duplicating its payload. Do not run this while
+# the quantizer is active and do not broaden the mounted or chowned path.
+raw_parent=$(dirname "$raw_output_root")
+raw_name=$(basename "$raw_output_root")
+host_uid=$(id -u)
+host_gid=$(id -g)
 docker run --rm --network none --ipc=none \
-  -v "$repo_root:$repo_root:ro" \
-  -v "$source_model_root:$source_model_root:ro" \
-  -v "$(dirname "$corpus_root"):$(dirname "$corpus_root"):ro" \
-  -v "$(dirname "$state_root"):$(dirname "$state_root")" \
+  --entrypoint /usr/bin/chown \
+  -v "$raw_parent:/glmrt-models" \
   "$quant_image" \
-  python "$repo_root/python/tools/attest_glm52_quant_tokenizer.py" \
-    --plan "$run_state/glmrt-gptqmodel-plan.json" \
-    --snapshot "$source_snapshot" \
-    --calibration-jsonl "$corpus_root/calibration.jsonl" \
-    --container-inspect "$state_root/original-container-inspect.json" \
-    --output "$state_root/tokenizer-attestation.json"
-```
+  -R "$host_uid:$host_gid" "/glmrt-models/$raw_name"
 
-The attestation hashes the canonical tokenizer blobs and the ordered prepared
-token/attention-mask stream, binds the original image/container/plan/corpus,
-and proves both blobs predated container launch. This recovery step is not used
-by new plans.
+python3 python/tools/finalize_glm5_exl3_artifact.py \
+  --artifact "$raw_output_root" \
+  --output "$output_root" \
+  --report "$state_root/glm53-exl3-k4-finalization.json"
 
-```bash
-artifact_report="$state_root/glm52-exl3-artifact-validation.json"
-tokenizer_attestation="$state_root/tokenizer-attestation.json"
-
+# GLM-5.3 plans bind both tokenizer files directly. Deliberately do not pass
+# a separate tokenizer-attestation option here.
 python3 python/tools/validate_glm52_exl3_artifact.py \
   --artifact "$output_root" \
   --source-snapshot "$source_snapshot" \
   --projection-checkpoint-dir "$projection_root" \
-  --tokenizer-attestation "$tokenizer_attestation" \
   --verify-artifact-file-hashes \
   --output "$artifact_report"
 ```
 
-This proves the exact replacement of 57,600 base routed-expert projections by
-230,400 K3 `trellis/suh/svh/mcg` tensors, rejects retained native copies of
-those weights, checks the external and embedded EXL3 declarations, validates
-all safetensors headers and bound run manifests, and byte-compares every
-retained native tensor with the pinned source. It also byte-compares every
-packed artifact tensor with its plan-bound calibrated projection checkpoint
-and emits the same checkpoint-inventory identity as the independent quant
-evidence validator. An upgraded run must expose the same active execution
-upgrade in both reports. It streams data and does not materialize a model.
-`--skip-retained-native-bytes` is diagnostic only and its report is not
-accepted by the cache stager.
+This is not a second weight copy: every unchanged payload is a hard link. The
+tool removes Transformers serialization drift (including the historical
+GLM-5 `head_dim` rewrite), preserves every source config field value-for-value,
+restores the exact tokenizer and generation metadata, substitutes only the
+compact EXL3 declaration, retains the complete standalone
+`quantize_config.json.tensor_storage`, and rebinds both artifact manifests.
+It deliberately accepts both the metadata-rich compact declaration emitted by
+the currently running quantization image and the older GPTQModel raw
+serialization that duplicated the complete `tensor_storage` object into
+`config.json`, but only when the embedded object agrees exactly with the
+standalone file. The finalized GLM-5.3 artifact always reduces that declaration
+to the four discovery fields above. It also proves that the standalone
+`meta.ds4rt_error_ledger` is exactly the immutable plan provenance plus any
+content-bound execution upgrade.
+Only `output_root` is eligible for the downstream commands below.
 
-The `--tokenizer-attestation` argument is required for the in-progress v1
-production run because its immutable plan predates direct tokenizer-file
-binding. Capture the signed report from the retained original container inspect
-record with `attest_glm52_quant_tokenizer.py`; new plans bind both tokenizer
-files directly and must omit this legacy argument.
-
-Stage the accepted internal artifact under its production model ID without
-duplicating the tensor payload on the coordinator. This stage is for runtime
-qualification; it still contains private recovery/provenance files and is not
-the Hub upload tree:
+Stage the accepted artifact under its production model ID, then synchronize
+that exact content revision to every Spark:
 
 ```bash
 python3 python/tools/stage_glm52_exl3_hf_snapshot.py \
   --artifact "$output_root" \
   --validation-report "$artifact_report" \
   --quant-evidence-report "$quant_evidence_report" \
-  --model-id wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1 \
+  --model-id "$model_id" \
   --update-ref
-```
 
-The default hardlink mode requires the artifact and Hugging Face cache to be
-on the same filesystem. It creates the standard blob/snapshot/symlink layout
-with a content-derived local revision, so the candidate can be exercised by
-the ordinary release and WIP paths before Hub publication. Use
-`--link-mode copy` only when the extra artifact-sized storage is intentional.
-
-Distribute the selected snapshot to all Sparks concurrently over RDMA and
-verify every received blob before launch:
-
-```bash
 python3 python/tools/sync_glm52_exl3_hf_snapshot.py \
+  --model-id "$model_id" \
   --hosts ostrich,dodo,emu,kiwi \
-  --output "$state_root/glm52-exl3-spark-sync.json"
+  --output "$state_root/glm53-exl3-k4-spark-sync.json"
 ```
 
-### Retune the AOT buckets on the completed model
+For GLM-5.3, preserve this order; the block above provides the exact artifact
+acceptance commands and later sections provide the serving commands:
 
-The source-time Spark sweep is provisional. Once the accepted EXL3 artifact is
-staged on all four Sparks, perform one final model-backed tuning pass before
-the paired serving qualification or publication. Use the final GLMRT and
-SparkInfer build and the actual balanced-profile scheduler; do not infer this
-profile from uniformly random routes or from a sweep that varies only global
-`M`.
+1. Wait for the quantizer to atomically publish `raw_output_root`.
+2. Validate the complete 57,600-record journal and projection store with full
+   tensor hashing; an `--allow-incomplete` report is never release evidence.
+3. Run the hard-linked finalizer above, then validate `output_root` against the
+   pinned source snapshot without a separate tokenizer attestation.
+4. Stage the validated artifact under
+   `wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1` and synchronize that exact content
+   revision to all four Sparks.
+5. Build one final WIP slot, validate all four K4 TP ranks, tune the real K4
+   tiles, and rerun the DFlash2 top-k/selector/body gates until the serving
+   warp profile exactly matches every winner.
+6. Run all seven fresh-process DFlash2 width trials, then fresh native-MTP and
+   selected-width DFlash2 final arms, followed by the matching DFlash2
+   preflight and serving qualifier.
+7. Render the model card and create the standard-only publication tree. Upload
+   only that tree to the exact repository above, verify its website/API and
+   remote object inventory, then materialize the resolved Hub commit into the
+   local HF cache without downloading a second copy of the model. Revalidate
+   both configuration files, all 57,600 storage records, all 230,400 stored
+   tensor descriptions, the inventory, manifests, and hashes from that layout.
 
-Capture the per-layer, per-rank live row count and complete expert route-count
-vector for representative decode, speculative verify, concurrency, and
-prefill requests. Retain request type and frequency so replay can minimize the
-frequency-weighted full-system cost rather than choosing every isolated
-microbenchmark minimum. The capture must include the transition bucket around
-the 2,048-row prefill boundary and the target/draft suffix through 2,064 rows.
+### GLM-5.3 final serving evidence
 
-Use a unique capture identity because WIP process logs are append-only. The
-main statistics trace is sufficient; the much larger per-row route trace is
-not required. Start the final EXL3 deployment with the trace variables, run
-the frozen tuning workload, then bind the captured records to that deployment:
+Collect native-MTP and DFlash2 evidence from the same final WIP slot, balanced
+profile, model revision, tokenizer, prompt seeds, and 400 W coordinator power
+limit. Preserve each deployment and startup report exactly as described in the
+general paired runbook below. In addition to the seven-type blend, Orchid,
+full cache-aware 0/32K/64K/128K/256K by +1K/+2K/+4K/+8K/+16K/+32K prefill
+grid, and tool evaluation, each arm must collect a prompt-bound C1/C2/C4 code
+curve and the complete long-context needle grid:
+
+Install the exact draft checkpoint in the same Hugging Face cache mounted into
+the coordinator WIP/release container. The draft runtime aliases the accepted
+target embedding and LM head, so it needs only this pinned 4.9-GB config/weight
+snapshot and does not create another copy of those target tensors:
 
 ```bash
-route_capture_id=glm52-exl3-final-balanced-v1
-route_capture_gate=/wip/run/glm52-exl3-final-balanced-v1.enabled
-export GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS=1
-export GLMRT_PROTOCOL_V2_EXPERT_QUEUE_CAPTURE_ID="$route_capture_id"
-export GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES_GATE_FILE="$route_capture_gate"
-./run.sh --wip --wip-slot exl3-paired \
-  --profile qualification-exl3.config --restart
-
-# Open the gate only after startup/warmup, run the frozen tuning corpus, then
-# close it before any unrelated requests can contaminate the frequency mix.
-docker exec glrmt-coordinator-wip touch "$route_capture_gate"
-# Run the decode/speculation/concurrency/prefill tuning corpus here.
-docker exec glrmt-coordinator-wip \
-  mv "$route_capture_gate" "$route_capture_gate.closed"
-
-route_log="$state_root/glm52-exl3-route-capture.log"
-docker exec glrmt-coordinator-wip \
-  cat /wip/run/coordinator-8000.log >"$route_log"
-
-python3 python/tools/analyze_glm52_exl3_route_profile.py \
-  --log balanced="$route_log" \
-  --deployment .glmrt-wip/run/deployment.json \
-  --capture-id "$route_capture_id" \
-  --output "$state_root/glm52-exl3-route-profile.json"
-
-unset GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS
-unset GLMRT_PROTOCOL_V2_EXPERT_QUEUE_CAPTURE_ID
-unset GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES_GATE_FILE
+hf download incoai/GLM-5.3-DFlash2 \
+  --revision 425aa615ce320caac34400208b30808c8f14f76c
 ```
 
-The analyzer accepts only the versioned trace contract, requires complete
-layers 3–77 and all four replicated TP ranks, verifies each route-count vector
-sums to `M * 8`, and rejects rank disagreement. Its report hashes the complete
-input log and deployment evidence. Each sample records both M and the observed
-expert-reuse distribution, including active experts, maximum reuse R, and the
-padded work implied by every legal route-block width. Pass a selected fixture
-directly to
-`validate_b12x_exl3_native.py --route-profile ... --route-profile-sample N`;
-the native validator authenticates the report and realizes the same expert
-reuse degrees while alternating production and candidate capacities in one
-process.
+If that exact repository cache already exists under an alternate `HF_HOME`,
+copy its complete `models--incoai--GLM-5.3-DFlash2` cache directory (blobs,
+snapshot symlinks, trees, and refs) into the coordinator container's mounted
+HF cache instead of downloading the 4.9-GB payload again. Verify that the
+snapshot name is the literal revision above and that `model.safetensors`
+resolves to blob
+`3105f14043bef642baa49a7d533fdf0b8b2895737ec84b6305601da662656161`.
+The accepted five-file snapshot totals 4,919,153,766 bytes;
+`config.json` has SHA-256
+`f59e1da17d41d24a1aba588aecee1607788adb34a03805f2c883add8ca954e9b`.
+The runtime additionally validates all 96 BF16 tensor names, shapes, offsets,
+and their 4,918,848,512-byte payload before preload. It also rejects a regular
+file or any snapshot symlink that does not resolve to the exact LFS blob above,
+so this identity check adds no second 4.9-GB startup read.
 
-The benchmark-only native entry point also accepts `--compare-grid-x N`, with
-an optional `--compare-capacity-rows M`, so each observed fixture can sweep
-the persistent grid independently of its exported tile/capacity. Candidate
-grids are bounded by that compiled bucket's safe cooperative-grid maximum;
-serving never reads these controls. Capacity comparisons that cross a
-SparkInfer route-block ABI boundary are rejected rather than timing stale
-packed-route metadata.
+The resolver fails closed if that exact revision is absent. If `HF_HOME` is
+changed, create or recreate the WIP containers with that value so the mounted
+cache and resolved profile refer to the same files; do not inject a one-off
+snapshot path into a publication run.
 
-Replay those observed route fixtures in one process against the production
-capacity and each legal candidate capacity/tile/grid. In particular, recheck
-the provisional exact-M=9 EXL3 specialization against its M=16 parent, every
-large bucket used by the captures, and M=2,048 versus M=2,064. Alternate the
-candidate order, report multiple medians, and include packing plus fused FC1,
-activation, and FC2 time. A candidate wins only when its weighted improvement
-survives repeated same-process measurement and it does not create a material
-tail regression for a common route shape.
+Before collecting the final DFlash2 arm, sweep `DFLASH2_FIXED_DRAFTS=1` through
+`7` with the matched seven-type blend and tool evaluation. Use
+`SPECULATION=plain` as the non-speculative diagnostic control. Choose by tool
+points first, code decode throughput second, and seven-type weighted decode
+throughput third; prefer the narrower width only on an exact tie. Then rerun
+the complete final arm at that width. Select the final agentic default between
+native MTP and DFlash2 by tool points, code decode throughput, the C1/C2/C4
+code-throughput geometric mean, and seven-type weighted decode throughput, in
+that order.
 
-Bake only those measured winners into
-`python/tools/_b12x_exl3_k3_profile.py`, the exported AOT regimes, and the
-matching Rust/native capacity selector. The checkpoint-native trellis layout
-remains the sole resident weight format; bucket tuning must not introduce dual
-weight residency. Build the selected profile once, then rerun all-four-rank
-calibrated native parity at every capacity boundary, including 2,049 and
-2,064, before collecting the paired end-to-end results below. Preserve the
-route corpus, raw timing reports, model revision, WIP deployment identity,
-SparkInfer revision, power limits, and selected profile with the qualification
-evidence so the final choices can be reproduced.
+After quantization releases the coordinator GPU, first select the 154,880-way
+top-k backend across every C1/C2/C4, K1-K7 row case. The signed report requires
+exact candidates and values for both the initial and changed graph inputs and
+only advances a non-Torch backend when its equal-case aggregate median wins by
+at least 1%. Each timing graph contains repeated top-k nodes so a one-node graph
+replay launch cannot hide the kernel difference. Set `DFLASH2_TOPK_BACKEND` in
+the launch configuration to the report's `selected_backend` before any width
+trial; the complete service trials remain the acceptance gate.
 
-After staging, the remaining acceptance order is: Rust catalog validation,
-all-four-rank preload and basic generation, the completed-model AOT retuning
-above, held-out quality, matched native versus EXL3 decode/prefill
-measurements, and the existing tool-call suite.
-The general release benchmarks do not need to be regenerated. The following
-is one fresh, paired qualification of this EXL3 artifact against NVFP4: both
-arms must use the same GLMRT/SparkInfer build, balanced profile, 400 W power
-limit, tokenizer, prompt seeds, and frozen prefill corpus. Use a new output
-directory and run each command once against the NVFP4 deployment and once
-against the EXL3 deployment:
-
-Build one WIP slot only once, then launch both model arms from that same slot
-with explicit complete configuration files. The files should be identical
-except for `MODEL=luke` versus `MODEL=exl3`; do not rebuild or clone a second
-slot between arms:
+Then performance-gate the fused candidate selector against the retained split
+transition/argmax reference on the pinned checkpoint's real codebooks. This
+microbenchmark covers C1/C2/C4, K1-K7, and both Torch `int64` and FlashInfer
+`int32` candidate indices; it interleaves the timing order and refuses any
+token mismatch. Preserve its content-bound report. Performance-gate the body
+convolution/residual/RMS fusion the same way against its exact three-kernel
+reference and sweep four versus eight warps. After timing layer 0, the body
+gate also requires exact residual and normalized output for both epilogues in
+all six real draft layers over the full C1/C2/C4, K1-K7 surface. Both fusions
+must win the production cases before the final binary is accepted; the
+microbench gate requires at least a 1% median speedup, after which full-cycle
+service measurements remain authoritative. The reports also reject unless every
+measured winning warp count matches the helper used by the serving graph. If a
+winner changes, update that runtime helper and rerun the sweep so the report is
+bound to the code that will ship. Otherwise tune the fusion or restore the
+split path before running the service-width sweep.
 
 ```bash
-./wip.sh --slot exl3-paired
-./run.sh --wip --wip-slot exl3-paired \
-  --profile qualification-nvfp4.config --restart
-# collect the NVFP4 arm, then:
-./run.sh --wip --wip-slot exl3-paired \
-  --profile qualification-exl3.config --restart
+python3 python/tools/tune_dflash2_topk.py \
+  --snapshot /path/to/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c \
+  --concurrency 1,2,4 --widths 1,2,3,4,5,6,7 \
+  --output "$qualification_root/dflash2-topk-tuning.json"
+
+python3 python/tools/tune_dflash2_selector.py \
+  --snapshot /path/to/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c \
+  --concurrency 1,2,4 --widths 1,2,3,4,5,6,7 \
+  --candidate-dtypes both --fused-warps 4,8 \
+  --output "$qualification_root/dflash2-selector-tuning.json"
+
+python3 python/tools/tune_dflash2_body_fusion.py \
+  --snapshot /path/to/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c \
+  --concurrency 1,2,4 --widths 1,2,3,4,5,6,7 \
+  --fused-warps 4,8 \
+  --output "$qualification_root/dflash2-body-fusion-tuning.json"
 ```
 
-This makes the required coordinator/Spark slot fingerprints and SparkInfer
-revision identical while preserving the distinct model revision and
-model-sensitive expert-runtime fingerprint for each arm.
+The BF16 DFlash2 body remains the required baseline. As a separate follow-on,
+measure the single-residency W8A16 candidate on every live C1/C2/C4, K1-K7
+row shape. This first tunes layer 0 and then validates the selected tile on all
+six real draft layers. A projection class advances only if every row/layer
+case wins by at least 1% and passes its numerical sanity gate. Advancing means
+it is eligible for implementation and full held-out acceptance testing, not
+that the tool may modify the serving format. Never retain both its BF16 and W8
+weight after an implementation is selected.
 
 ```bash
-qualification_root="$state_root/serving-qualification"
-mkdir -p "$qualification_root"
+python3 python/tools/tune_dflash2_w8a16_body.py \
+  --native-library /path/to/libglmrt_native.so \
+  --snapshot /path/to/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c \
+  --layers 0,1,2,3,4,5 --rows dflash \
+  --output "$qualification_root/dflash2-w8a16-body-tuning.json"
+```
 
-# Substitute nvfp4/exl3 and the corresponding model ID for each deployment.
-arm=nvfp4
-model=lukealonso/GLM-5.2-NVFP4
-nonce_seed=2026082301
-prefill_run_id=glm52-exl3-k3-paired-v1
+If no projection class advances, stop there. If one does, add only its measured
+small-row AOT shapes and one-format loader/capture contract, then compare full
+DFlash2 acceptance, tool score, verify-cycle cost, and decode throughput with
+the BF16 arm before promotion.
+
+`run.sh` and `scripts/run-wip.sh` bind the selected width and configured top-k
+backend into the resolved profile, deployment fingerprint, signed deployment
+evidence, qualification report, and rendered model card; do not inject engine
+environment variables manually for publication measurements.
+
+Preserve each preliminary trial as
+`dflash2-width-$width-{deployment,blended,tool-eval}.{json,jsonl,json}`. The
+qualifier revalidates every raw file, requires all seven trials to use the same
+binary/model/power and exact prompt fixtures, calculates the winner, and
+rejects the final DFlash2 arm unless it uses that width:
+
+The configured width is the full proposal width, not an assertion that every
+target verification remains `M=K+1`. The output-budget tail is deliberately
+truncated and may measure any `M` from 1 through `K+1`. Qualification requires
+the full `K+1` case to occur, rejects any larger row count, and retains every
+smaller tail measurement in the published physical-M curve.
+
+Start a fresh service process for every width trial, then start it again at the
+selected width before collecting the complete final DFlash2 arm. Likewise,
+start a fresh process before the native-MTP final arm. Do not collect final
+evidence from the process used by a preliminary trial: DFlash2 maintains an
+aligned target/draft radix cache while native MTP deliberately recomputes the
+prompt, so process reuse can make otherwise matched prompt timing incomparable.
+Copy each deployment record only after that arm's fresh process has completed
+startup. Deployment evidence binds the launcher's nanosecond start identity;
+qualification rejects a reused launch identity anywhere among the seven width
+trials, the selected-width final arm, or the native-MTP final arm.
+
+```bash
+width_trial_args=()
+for width in 1 2 3 4 5 6 7; do
+  width_trial_args+=(
+    --dflash2-width-trial "$width"
+    "$qualification_root/dflash2-width-$width-deployment.json"
+    "$qualification_root/dflash2-width-$width-blended.jsonl"
+    "$qualification_root/dflash2-width-$width-tool-eval.json"
+  )
+done
+```
+
+```bash
+model=wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1
+tokenizer=/path/to/the/staged/GLM-5.3-EXL3-K4-v1/tokenizer.json
+nonce_seed=2026082901
+needle_session=glm53-k4-needle-v1
+prefill_run_id=glm53-k4-prefill-v1
 frozen_corpus=/path/to/unchanged/prefill-corpus
-tokenizer=/path/to/the/same/tokenizer.json
 
-# Immediately after ./run.sh --wip reports ready for this arm, preserve its
-# content-bound binary/model/runtime identity before launching the other arm.
+# Set arm=mtp for the native-MTP deployment and arm=dflash2 for DFlash2.
 cp .glmrt-wip/run/deployment.json \
   "$qualification_root/$arm-deployment.json"
+
+python3 python/tools/bench_real_full_mtp_acceptance.py \
+  --model "$model" --tokenizer "$tokenizer" \
+  --suite weighted --repeats 5 --nonce-seed "$nonce_seed" \
+  --output "$qualification_root/$arm-blended.jsonl"
+
+python3 python/tools/bench_real_full_repeat_decode.py \
+  --model "$model" --tokenizer "$tokenizer" \
+  --word orchid --count 100 --max-tokens 1500 \
+  --warmups 1 --repeats 5 --nonce-seed "$nonce_seed" \
+  --output "$qualification_root/$arm-orchid.jsonl"
+
+for concurrency in 1 2 4; do
+  python3 python/tools/bench_real_full_concurrency.py code \
+    --model "$model" --tokenizer "$tokenizer" \
+    --concurrency "$concurrency" --warmups 2 --repeats 5 \
+    --cache-state token-zero-nonce --nonce-seed "$nonce_seed" \
+    --output "$qualification_root/$arm-concurrency-c$concurrency.jsonl"
+done
+
+python3 python/tools/bench_release_prefill_matrix.py \
+  --model "$model" --tokenizer "$tokenizer" \
+  --corpus-root "$frozen_corpus" --profile balanced \
+  --run-id "$prefill_run_id" --repeats 2 \
+  --output "$qualification_root/$arm-prefill.jsonl"
+
+python3 python/tools/bench_real_full_needle.py \
+  --model "$model" --tokenizer "$tokenizer" \
+  --session-id "$needle_session" \
+  --max-context-tokens 400000 --maximum-request-seconds 600 \
+  --output "$qualification_root/$arm-needle.jsonl"
+
+tool-eval-bench \
+  --base-url http://127.0.0.1:8000/v1/ --parallel 1 \
+  --temperature 0 \
+  --model "$model" --json-file "$qualification_root/$arm-tool-eval.json"
+
+# Preserve the exact Spark residency used by this speculation arm. Native MTP
+# includes the retained layer 78, converted once from source block-FP8 into its
+# startup W4A16 TP4 slab; DFlash2 must omit that otherwise-unused layer.
 expert_runtime_fingerprint="$(
   jq -r .fingerprints.expert_runtime \
     "$qualification_root/$arm-deployment.json"
 )"
-
-python3 python/tools/bench_real_full_mtp_acceptance.py \
-  --model "$model" --suite weighted --repeats 5 \
-  --nonce-seed "$nonce_seed" \
-  > "$qualification_root/$arm-blended.jsonl"
-
-python3 python/tools/bench_real_full_repeat_decode.py \
-  --model "$model" --word orchid --count 100 --max-tokens 1500 \
-  --warmups 1 --repeats 5 --nonce-seed "$nonce_seed" \
-  --tokenizer "$tokenizer" \
-  --output "$qualification_root/$arm-orchid.jsonl"
-
-python3 python/tools/bench_release_prefill_matrix.py \
-  --model "$model" --profile balanced --run-id "$prefill_run_id" \
-  --tokenizer "$tokenizer" --corpus-root "$frozen_corpus" \
-  > "$qualification_root/$arm-prefill.jsonl"
-
-tool-eval-bench \
-  --base-url http://127.0.0.1:8000/v1/ --parallel 1 \
-  --model "$model" --json-file "$qualification_root/$arm-tool-eval.json"
-
-# Preserve each append-only Spark log before switching arms. The analyzer
-# selects the final `starting expert-*` segment and accepts a later orderly
-# container stop, but copying while the WIP containers are live is simplest.
 for host in ostrich dodo emu kiwi; do
   ssh "$host" docker exec glrmt-spark-expert-wip \
     cat /wip/run/expert-9100.log \
     > "$qualification_root/$arm-$host-expert.log"
 done
-
-weight_format=nvfp4  # use exl3 for the candidate arm
+startup_mtp_arg=()
+if [[ "$arm" == mtp ]]; then
+  startup_mtp_arg+=(--include-mtp)
+fi
 python3 python/tools/analyze_glm52_expert_startup.py \
-  --model "$model" --weight-format "$weight_format" --cache-state cold \
+  --model "$model" --weight-format exl3 --cache-state warm \
   --expert-runtime-fingerprint "$expert_runtime_fingerprint" \
+  "${startup_mtp_arg[@]}" \
   --log ostrich="$qualification_root/$arm-ostrich-expert.log" \
   --log dodo="$qualification_root/$arm-dodo-expert.log" \
   --log emu="$qualification_root/$arm-emu-expert.log" \
@@ -605,96 +444,377 @@ python3 python/tools/analyze_glm52_expert_startup.py \
   --output "$qualification_root/$arm-startup.json"
 ```
 
-`tool-eval-bench --version` must report
-`2.3.2.dev3+g5df1e9e0c`, the build used for the accepted NVFP4 benchmark. The
-benchmark files bind exact prompts independently of the selected model. The
-startup analyzer also requires every Spark log to carry the exact expert
-runtime fingerprint preserved in that arm's WIP deployment evidence. The
-validator rejects different prompt sequences, tokenizer bytes, corpus bytes,
-tool scenarios, sampling settings, runtime correctness failures, runtime
-fingerprint mismatches, or runtime graph captures before comparing performance.
-Every EXL3 candidate response must also pass the prompt-specific,
-non-executing semantic contract (Python AST and requested assertions,
-arithmetic result, word/bullet constraints, bare JSON edit shape, and
-multilingual fork/page coverage as applicable). Baseline misses are retained
-in the signed report instead of invalidating an otherwise usable paired
-reference; they never excuse a candidate miss:
+The selected-default commands in this subsection are intentionally adjacent to
+the per-arm startup collection, but they run only **after** the signed serving
+qualifier below has selected `selected_default`; this subsection is not an
+instruction to guess the winner early. For the final selected-default startup
+graphic, keep “cold” and “warm” launch
+state separate from the compiled-kernel cache label above. A cold launch starts
+and reloads all four Spark expert slabs. A warm launch uses `--restart` with
+the identical slot/configuration and must retain all four fingerprint-matched
+resident experts. Capture the complete launcher stream with `set -o pipefail`
+and snapshot `/wip/run/coordinator-${ADDR##*:}.log` plus `deployment.json`
+immediately after each launch; the persistent process log is append-only and
+must not be referenced in place after the next restart.
+
+Analyze each immutable snapshot against the same accepted Spark startup report:
 
 ```bash
-serving_qualification_report="$state_root/glm52-exl3-serving-qualification.json"
+python3 python/tools/analyze_glm53_full_startup.py \
+  --cache-state cold --speculation "$selected_default" \
+  --deployment "$qualification_root/default-cold-deployment.json" \
+  --launcher-log "$qualification_root/default-cold-launcher.log" \
+  --coordinator-log "$qualification_root/default-cold-coordinator.log" \
+  --expert-startup "$qualification_root/$selected_default-startup.json" \
+  --output "$qualification_root/default-cold-full-startup.json"
 
-python3 python/tools/validate_glm52_exl3_serving_qualification.py \
+python3 python/tools/analyze_glm53_full_startup.py \
+  --cache-state warm --speculation "$selected_default" \
+  --deployment "$qualification_root/default-warm-deployment.json" \
+  --launcher-log "$qualification_root/default-warm-launcher.log" \
+  --coordinator-log "$qualification_root/default-warm-coordinator.log" \
+  --expert-startup "$qualification_root/$selected_default-startup.json" \
+  --output "$qualification_root/default-warm-full-startup.json"
+```
+
+The analyzer reconciles every launcher/shell/daemon phase clock, aligns the
+parallel Spark readiness and coordinator critical paths, verifies reload versus
+retention from the launcher lifecycle, and binds the exact runtime fingerprint.
+The renderer reopens and rehashes all underlying logs/reports before producing
+the new GLM-5.3-only graphic and its signed provenance report:
+
+```bash
+python3 python/tools/render_glm53_startup_timeline.py \
+  --serving "$qualification_root/glm53-exl3-k4-serving.json" \
+  --cold "$qualification_root/default-cold-full-startup.json" \
+  --warm "$qualification_root/default-warm-full-startup.json" \
+  --output "$qualification_root/glm53-startup-timeline.svg" \
+  --report "$qualification_root/glm53-startup-timeline.json"
+```
+
+Render the selected-default production micro-timeline directly from its
+accepted balanced seven-type run. The first code replay supplies the complete
+chronological post-TTFT sequence; the renderer reconciles physical M,
+acceptance, committed tokens, cycle time, and `decode_ms`, then shows the full
+response ribbon, a time-scaled first-cycle zoom, and the independently
+recomputed physical-M curve. This avoids the synchronization overhead and
+separate diagnostic deployment used by prior development graphics:
+
+```bash
+python3 python/tools/render_glm53_balanced_micro_timeline.py \
+  --serving "$qualification_root/glm53-exl3-k4-serving.json" \
+  --deployment "$qualification_root/default-deployment.json" \
+  --blended "$qualification_root/balanced-$selected_default-blended.jsonl" \
+  --output "$qualification_root/glm53-balanced-micro-timeline.svg" \
+  --report "$qualification_root/glm53-balanced-micro-timeline.json"
+```
+
+Use the same explicit nonce seed and needle session for both modes. The
+qualifier recomputes every concurrency aggregate from its lanes and requires
+identical request digests across modes. The needle gate covers 8K, 32K, 128K,
+256K, and 384K at 10%, 50%, and 90% depth; all 15 requests per mode must recall
+the exact key, complete within ten minutes, execute complete attention and
+numeric progression, and report zero runtime graph captures.
+
+The final OSS benchmark refresh is a superset of the serving gate and is
+collected from this same accepted binary/artifact rather than rerun in the
+release checkout. Publish GLM-5.3 EXL3 K4 only. Preserve enough signed evidence
+to replace every measured section of the current OSS README:
+
+- balanced native-MTP and selected-width DFlash2: seven-type decode, Orchid,
+  C1/C2/C4 code concurrency, the complete cache-aware prefill matrix, startup,
+  physical-M verify-cycle timings, and the long-context needle grid;
+- the selected agentic default: the 0/32K/64K/128K/256K context decode matrix
+  for code, creative writing, and math, three serial 69-scenario tool-eval runs
+  with distinct recorded seeds, and isolated Pi coding-agent runs with
+  reasoning off and high;
+- native-MTP and DFlash2 under balanced, long, and accuracy profiles: the same
+  five-replay seven-type decode workload plus an exact cached-2K/+8K prefill
+  cell, retaining verify throughput and draft acceptance; and
+- a new selected-default balanced-path micro-timeline and cold/warm startup
+  timelines. Do not reuse diagrams or startup numbers from another model.
+
+The recipes below define those release arms but are executed only after the
+serving qualifier later in this section has accepted both balanced modes and
+selected the default. Their `--serving` input must be that finished report;
+they cannot be run top-to-bottom before it exists.
+
+For the six profile/mode arms, use one fixed nonce seed and run ID. Record the
+fresh deployment report for every arm; the balanced deployment and blended
+files are the already-accepted serving arms, while their 2K/+8K prefill cell is
+an additional release measurement. For each deployment run:
+
+```bash
+python3 python/tools/bench_real_full_mtp_acceptance.py \
+  --model "$model" --profile "$profile" --suite weighted --repeats 5 \
+  --nonce-seed 53 --tokenizer "$tokenizer" --run-id glm53-k4-profile-v1 \
+  --output "$qualification_root/$profile-$arm-blended.jsonl"
+
+python3 python/tools/bench_release_prefill_matrix.py \
+  --model "$model" --profile "$profile" --base 2048 --suffix 8192 \
+  --repeats 2 --tokenizer "$tokenizer" \
+  --corpus-root /path/to/frozen/release-corpus \
+  --run-id glm53-k4-profile-prefill-v1 \
+  --output "$qualification_root/$profile-$arm-prefill.jsonl"
+```
+
+After all six arms, bind them to the accepted serving runtime and recompute the
+decode, acceptance, verifier-throughput, prefill, mode-ratio, and
+profile-retention tables. Repeat `--arm` once for every balanced/long/accuracy
+and `mtp`/`dflash2` combination:
+
+```bash
+python3 python/tools/validate_glm53_profile_release_evidence.py \
+  --serving "$qualification_root/glm53-exl3-k4-serving.json" \
+  --arm balanced mtp \
+    "$qualification_root/balanced-mtp-deployment.json" \
+    "$qualification_root/balanced-mtp-blended.jsonl" \
+    "$qualification_root/balanced-mtp-prefill.jsonl" \
+  --arm balanced dflash2 \
+    "$qualification_root/balanced-dflash2-deployment.json" \
+    "$qualification_root/balanced-dflash2-blended.jsonl" \
+    "$qualification_root/balanced-dflash2-prefill.jsonl" \
+  --arm long mtp \
+    "$qualification_root/long-mtp-deployment.json" \
+    "$qualification_root/long-mtp-blended.jsonl" \
+    "$qualification_root/long-mtp-prefill.jsonl" \
+  --arm long dflash2 \
+    "$qualification_root/long-dflash2-deployment.json" \
+    "$qualification_root/long-dflash2-blended.jsonl" \
+    "$qualification_root/long-dflash2-prefill.jsonl" \
+  --arm accuracy mtp \
+    "$qualification_root/accuracy-mtp-deployment.json" \
+    "$qualification_root/accuracy-mtp-blended.jsonl" \
+    "$qualification_root/accuracy-mtp-prefill.jsonl" \
+  --arm accuracy dflash2 \
+    "$qualification_root/accuracy-dflash2-deployment.json" \
+    "$qualification_root/accuracy-dflash2-blended.jsonl" \
+    "$qualification_root/accuracy-dflash2-prefill.jsonl" \
+  --output "$qualification_root/glm53-exl3-k4-profile-release.json"
+```
+
+After the agentic default is selected, collect its three publication tool
+runs with explicit, distinct seeds rather than relying on the tool's implicit
+default. Keep the service process and every other sampling/control field fixed:
+
+```bash
+for seed in 2026082901 2026082902 2026082903; do
+  tool-eval-bench \
+    --base-url http://127.0.0.1:8000/v1/ --parallel 1 \
+    --temperature 0 --seed "$seed" --model "$model" \
+    --json-file "$qualification_root/default-tool-eval-seed-$seed.json"
+done
+```
+
+Collect the two isolated Pi coding-agent arms into new, nonexisting evidence
+directories. The wrapper pins the exact prompt, local `glmrt` provider,
+temperature zero, built-in tool surface, and Pi event mode; it then validates
+the complete transcript, token accounting, wall time, single HTML artifact,
+and every module script with Node. These reports replace manually counted Pi
+rows:
+
+```bash
+for thinking in off high; do
+  scripts/bench-pi-coding-agent.sh \
+    --root "$qualification_root/default-pi-$thinking" \
+    --model wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 \
+    --thinking "$thinking"
+done
+```
+
+Bind those five publication runs to the balanced deployment of the measured
+default and the accepted serving qualification. Pass the tool files in the
+same seed order shown above. This gate rejects a different model revision,
+slot/runtime fingerprint, speculation width/backend, pre-deployment run,
+nonserial tool run, changed 69-scenario fixture, or reused Pi session:
+
+```bash
+python3 python/tools/validate_glm53_agentic_release_evidence.py \
+  --serving "$qualification_root/glm53-exl3-k4-serving.json" \
+  --deployment "$qualification_root/default-deployment.json" \
+  --tool-eval "$qualification_root/default-tool-eval-seed-2026082901.json" \
+  --tool-eval "$qualification_root/default-tool-eval-seed-2026082902.json" \
+  --tool-eval "$qualification_root/default-tool-eval-seed-2026082903.json" \
+  --pi-off "$qualification_root/default-pi-off/evidence.json" \
+  --pi-high "$qualification_root/default-pi-high/evidence.json" \
+  --output "$qualification_root/glm53-exl3-k4-agentic-release.json"
+```
+
+Collect the selected-default context decode grid from that same balanced
+deployment. The harness constructs one exact retained prefix per nonzero
+context and branches all timed workloads from it, rather than rebuilding the
+long prefix for every sample. It refuses to overwrite evidence and rejects an
+incomplete Cartesian product, insufficient prefix reuse, inconsistent
+cache/prefill row accounting, incomplete attention, failed numeric progression,
+or runtime graph capture:
+
+```bash
+python3 python/tools/bench_release_decode_matrix.py \
+  --model wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 \
+  --tokenizer "$tokenizer" \
+  --corpus-root /path/to/frozen/release-corpus \
+  --profile balanced \
+  --run-id 20260830T000000Z \
+  --output "$qualification_root/default-context-decode.jsonl"
+```
+
+For each nonzero cached-context prefill sample, `cached_prompt_tokens` must be
+at least the requested base and
+`prompt_tokens - cached_prompt_tokens - 1 == prefill_rows == suffix_tokens`.
+The benchmark primes each base once, then branches every timed suffix from the
+retained radix-cache prefix; rebuilding the long prefix for every cell is not
+valid release evidence.
+
+Generate the GPU DFlash2 preflight from the same final WIP binary and staged
+K4 target. The draft cache is sliding-window bounded; 2,176 tokens is the
+runtime's page-rounded envelope for the 2,048-token window, one 64-token page,
+and every selected K1–K7 query block. Keep the checkpoint revision literal so a moving
+Hub ref cannot enter publication evidence:
+
+```bash
+glmrt_bin=/path/to/the/final/wip/glmrt
+dflash_snapshot=/path/to/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c
+target_catalog="$qualification_root/glm53-k4-target-catalog.json"
+dflash2_width=SELECTED_WIDTH_FROM_K1_THROUGH_K7_SWEEP
+dflash2_topk_backend=SELECTED_BACKEND_FROM_DFLASH2_TOPK_TUNING
+
+"$glmrt_bin" inspect-model \
+  --model-id wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 \
+  --out "$target_catalog" \
+  --summary "$qualification_root/glm53-k4-target-catalog.md"
+
+GLMRT_REAL_FULL_DFLASH2_TOPK_BACKEND="$dflash2_topk_backend" \
+"$glmrt_bin" dflash-preflight \
+  --snapshot "$dflash_snapshot" \
+  --target-catalog "$target_catalog" \
+  --kv-capacity-tokens 2176 \
+  --max-concurrency 4 \
+  --kv-storage bf16 \
+  --kv-page-size 64 \
+  --context-tokens 1024 \
+  --accepted-rows-per-request 4 \
+  --proposal-tokens-per-request "$dflash2_width" \
+  --preload --capture-static \
+  --static-warmup 2 --static-iterations 10 --static-repeats 3 \
+  >"$qualification_root/dflash2-preflight.json"
+```
+
+This preflight must be generated with the measured winning width. That width
+changes the actual DFlash2 body/head graph geometry to `K+1` query rows and K
+candidate rows; it is not a post-hoc truncation of a K7 graph. The accepted C1
+graph registry must contain exact update rows 2 through 8,
+followed by the larger power-of-two prefill buckets through 1,024. This keeps
+every possible one-request DFlash2 decode commit (1 through 8 target rows) to
+one update-graph replay; C2 and C4 continue to use safely padded power-of-two
+registries. The `--accepted-rows-per-request 4` value above exercises the
+independent memory/capacity plans. Static GPU capture always mirrors serving:
+one-row base executors plus the complete packed registry. Every C1/C2/C4 graph
+is captured against the production four-slot shared KV allocation: 34 pages
+per request and 136 physical 64-token pages in total. A smaller
+per-concurrency cache changes layer strides and is not accepted as
+production-equivalent evidence. The preflight also
+numerically checks the base update and every advertised packed bucket against
+its reference, checks eager/replay identity, proves that runtime position
+updates affect the keys, and proves exact output after restoring the positions.
+The head proof also binds deterministic sorted top-k and the upstream-matched
+BF16-edge/FP32-final candidate-score accumulation contract.
+The qualifier rejects C1 reports that omit rows 3, 5, 6, or 7 or do not carry
+that per-bucket proof.
+
+After generating the four native TP-rank reports and the GPU DFlash2 preflight,
+produce the signed serving report with the complete GLM-5.3 invocation:
+
+```bash
+serving_qualification_report="$state_root/glm53-exl3-k4-serving-qualification.json"
+
+python3 python/tools/validate_glm53_exl3_serving_qualification.py \
   --artifact "$output_root" \
   --artifact-validation "$artifact_report" \
   --quant-evidence "$quant_evidence_report" \
-  --baseline-blended "$qualification_root/nvfp4-blended.jsonl" \
-  --candidate-blended "$qualification_root/exl3-blended.jsonl" \
-  --baseline-repeat "$qualification_root/nvfp4-orchid.jsonl" \
-  --candidate-repeat "$qualification_root/exl3-orchid.jsonl" \
-  --baseline-prefill "$qualification_root/nvfp4-prefill.jsonl" \
-  --candidate-prefill "$qualification_root/exl3-prefill.jsonl" \
-  --baseline-tool-eval "$qualification_root/nvfp4-tool-eval.json" \
-  --candidate-tool-eval "$qualification_root/exl3-tool-eval.json" \
-  --baseline-startup "$qualification_root/nvfp4-startup.json" \
-  --candidate-startup "$qualification_root/exl3-startup.json" \
-  --baseline-deployment "$qualification_root/nvfp4-deployment.json" \
-  --candidate-deployment "$qualification_root/exl3-deployment.json" \
-  --candidate-native-validation "$native_evidence_root/native-tp0.json" \
-  --candidate-native-validation "$native_evidence_root/native-tp1.json" \
-  --candidate-native-validation "$native_evidence_root/native-tp2.json" \
-  --candidate-native-validation "$native_evidence_root/native-tp3.json" \
+  --native-blended "$qualification_root/mtp-blended.jsonl" \
+  --dflash2-blended "$qualification_root/dflash2-blended.jsonl" \
+  --native-repeat "$qualification_root/mtp-orchid.jsonl" \
+  --dflash2-repeat "$qualification_root/dflash2-orchid.jsonl" \
+  --native-prefill "$qualification_root/mtp-prefill.jsonl" \
+  --dflash2-prefill "$qualification_root/dflash2-prefill.jsonl" \
+  --native-tool-eval "$qualification_root/mtp-tool-eval.json" \
+  --dflash2-tool-eval "$qualification_root/dflash2-tool-eval.json" \
+  --native-startup "$qualification_root/mtp-startup.json" \
+  --dflash2-startup "$qualification_root/dflash2-startup.json" \
+  --native-deployment "$qualification_root/mtp-deployment.json" \
+  --dflash2-deployment "$qualification_root/dflash2-deployment.json" \
+  --native-concurrency "$qualification_root/mtp-concurrency-c1.jsonl" \
+  --native-concurrency "$qualification_root/mtp-concurrency-c2.jsonl" \
+  --native-concurrency "$qualification_root/mtp-concurrency-c4.jsonl" \
+  --dflash2-concurrency "$qualification_root/dflash2-concurrency-c1.jsonl" \
+  --dflash2-concurrency "$qualification_root/dflash2-concurrency-c2.jsonl" \
+  --dflash2-concurrency "$qualification_root/dflash2-concurrency-c4.jsonl" \
+  --native-needle "$qualification_root/mtp-needle.jsonl" \
+  --dflash2-needle "$qualification_root/dflash2-needle.jsonl" \
+  --native-validation "$native_evidence_root/native-tp0.json" \
+  --native-validation "$native_evidence_root/native-tp1.json" \
+  --native-validation "$native_evidence_root/native-tp2.json" \
+  --native-validation "$native_evidence_root/native-tp3.json" \
+  --dflash2-preflight "$qualification_root/dflash2-preflight.json" \
+  --dflash2-topk-tuning "$qualification_root/dflash2-topk-tuning.json" \
+  --dflash2-selector-tuning "$qualification_root/dflash2-selector-tuning.json" \
+  --dflash2-body-fusion-tuning "$qualification_root/dflash2-body-fusion-tuning.json" \
+  "${width_trial_args[@]}" \
+  --expected-default auto \
   --output "$serving_qualification_report"
 ```
 
-Keep the four native reports available through model-card rendering and public
-snapshot preparation. The serving qualifier records their exact byte hashes,
-TP-rank coverage, calibrated-layer inventory, tested native-library identity,
-and mandatory row regimes. Both downstream publication tools re-read those
-reports and reject a missing, modified, duplicated-rank, or summary-only native
-gate; setting `native_kernel_parity` by hand is not sufficient.
+Once the profile, agentic, retained-context, startup-timeline, and production
+micro-timeline reports are complete, bind the entire OSS benchmark refresh to
+one selected production runtime. This final gate recursively reopens and
+rehashes every referenced input and rendered SVG; copied summary numbers or a
+report from a different binary, model revision, deployment, speculation
+setting, power limit, or pre-deployment run are rejected:
 
-The default release thresholds require no blended or orchid decode regression,
-at least 95% of NVFP4 speculative acceptance, at least 95% of NVFP4 prefill in
-every measured cell, and at least 98% of NVFP4 tool-evaluation points. Any
-EXL3 expert resident preload and full expert service handoff must also be no
-slower than matched NVFP4 startup. Any deliberate tradeoff must be made
-explicit by changing the corresponding threshold argument; the selected
-threshold and the losing cells remain in the content-bound report.
+```bash
+python3 python/tools/validate_glm53_oss_release_evidence.py \
+  --serving "$serving_qualification_report" \
+  --agentic "$qualification_root/glm53-exl3-k4-agentic-release.json" \
+  --profiles "$qualification_root/glm53-exl3-k4-profile-release.json" \
+  --context-decode "$qualification_root/default-context-decode.jsonl" \
+  --startup-timeline "$qualification_root/glm53-startup-timeline.json" \
+  --micro-timeline "$qualification_root/glm53-balanced-micro-timeline.json" \
+  --output "$qualification_root/glm53-exl3-k4-oss-release.json"
 
-The calibrated-v1 publication used an explicit decode-optimized policy after
-also preserving the default-policy rejection report. Its floors are 94% of
-NVFP4 speculative acceptance and 79% of NVFP4 throughput in every prefill
-cell. The measured acceptance ratio was 94.84%; geometric-mean prefill was
-98.09%, but the worst 1K-suffix cells at 32K and 131K context were about
-79.6%. This tradeoff accompanied 1.062x weighted decode, 1.111x Orchid repeat,
-91 versus 87 tool score, 35/35 candidate semantic contracts, and 0.709x expert
-startup. These relaxed floors are model/publication-specific; the validator's
-95% defaults remain unchanged.
+python3 python/tools/render_glm53_oss_benchmark_charts.py \
+  --evidence "$qualification_root/glm53-exl3-k4-oss-release.json" \
+  --prefill-output benchmarks/glm53-exl3-k4-prefill.svg \
+  --decode-output benchmarks/glm53-exl3-k4-decode.svg \
+  --report "$qualification_root/glm53-exl3-k4-benchmark-charts.json"
 
-The deployment records additionally require both arms to use the same exact
-coordinator and Spark WIP artifacts, SparkInfer revision, profile, dSpark mode,
-and coordinator power limit. They bind each arm to its exact staged model
-revision and model-sensitive expert-runtime fingerprint, avoiding the weaker
-and incorrect practice of labeling a dirty WIP build with only `git rev-parse
-HEAD`.
+python3 python/tools/render_glm53_oss_benchmark_markdown.py \
+  --evidence "$qualification_root/glm53-exl3-k4-oss-release.json" \
+  --charts "$qualification_root/glm53-exl3-k4-benchmark-charts.json" \
+  --output benchmarks/glm53-exl3-k4-release.md
+```
 
-The orchid workload is a low-entropy performance probe, not a counting-quality
-test. GLM-5.2 can overshoot the requested count even in the NVFP4 baseline, so
-qualification records exactness but accepts a word-occurrence count from 80%
-through 125% of the request. Prompt identity, tokenization, zero runtime graph
-capture, and matched-arm decode timing remain mandatory. Semantic instruction
-following is gated separately by the weighted contracts and tool evaluation.
+The renderer emits the high-level mode comparison, all seven decode types and
+acceptance rates, both 5x6 prefill matrices, selected-default 5x3 retained-
+context decode matrix, C1/C2/C4 scaling, three seeded tool runs, both Pi arms,
+both long-context needle grids, all six profile/mode arms, and the cold/warm
+and production-timeline links. The selected-default prefill and retained-
+context decode SVGs are generated from those same cells, and their signed
+chart report is rebound and rehashed before the Markdown links them. Neither
+renderer carries forward benchmark rows from another target model. The
+resulting repository-local Markdown is the numeric source for the OSS README
+refresh; do not transcribe tables from console output.
 
-After those gates pass, render the model card mechanically from the exact
-accepted reports, then prepare a standard-only publication tree:
+Render `quantization/GLM53_EXL3_MODEL_CARD.md` only from that accepted report,
+then build the standard-only publication tree. Do not point the upload command
+at the quantizer output directory:
 
 ```bash
 public_root="$output_root-publication"
-publication_report="$state_root/glm52-exl3-publication.json"
-rendered_model_card="$state_root/GLM52-EXL3-README.md"
+publication_report="$state_root/glm53-exl3-k4-publication.json"
+rendered_model_card="$state_root/GLM53-EXL3-K4-README.md"
 
-python3 python/tools/render_glm52_exl3_model_card.py \
-  --template quantization/GLM52_EXL3_MODEL_CARD.md \
+python3 python/tools/render_glm53_exl3_model_card.py \
+  --template quantization/GLM53_EXL3_MODEL_CARD.md \
   --artifact-validation "$artifact_report" \
   --quant-evidence "$quant_evidence_report" \
   --serving-qualification "$serving_qualification_report" \
@@ -711,96 +831,52 @@ python3 python/tools/prepare_glm52_exl3_hf_publication.py \
   --report "$publication_report"
 ```
 
-The renderer refuses unsigned, incomplete, rejected, or cross-bound evidence.
-The publication builder additionally requires the rendered card to cite the
-exact serving-report hash, so qualification numbers cannot be copied from a
-different artifact or run.
+The generated section includes both speculation modes, the exact seven-type
+table, C1/C2/C4 decode, the independently recomputed post-TTFT C1 target-cycle
+curve by physical M, including directly measured scalar M1 cycles and every
+DFlash2 K1-K7 trial. Each request's measured cycle sum must equal the same
+`decode_ms` used for TPS. The section also includes prefill, the long-context
+needle grid, structural hashes, and the measured agentic default.
 
-The public tree hardlinks only the weight shards, copies standard tokenizer
-and license files, emits compact public configuration, and excludes local
-plans, recovery journals, quantization logs, and hardware paths. Re-stage and
-re-sync that exact tree for a final generation smoke test:
+Re-stage the standard-only publication tree and synchronize it once more for
+the final generation smoke test:
 
 ```bash
+: "${model_id:?set model_id to the exact accepted artifact repository ID}"
 python3 python/tools/stage_glm52_exl3_hf_snapshot.py \
   --artifact "$public_root" \
   --publication-report "$publication_report" \
+  --model-id "$model_id" \
   --update-ref
 
 python3 python/tools/sync_glm52_exl3_hf_snapshot.py \
+  --model-id "$model_id" \
   --hosts ostrich,dodo,emu,kiwi
 ```
 
-Upload only `$public_root`, then resolve and verify the exact public Hub
-revision. The verifier force-downloads and hashes every file up to 64 MiB
-(including the compact configuration and model card), checks the remote LFS
-SHA-256 for larger shards, and rejects any missing or unexpected file:
+Upload the accepted standard-only tree to exactly this repository, then run
+the Hub verifier against the resolved public revision:
 
 ```bash
-hf upload wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1 \
+hf upload wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 \
   "$public_root" . --no-private \
-  --commit-message "Publish calibrated GLM-5.2 EXL3 K3"
+  --commit-message "Publish calibrated GLM-5.3 EXL3 K4 v1"
 
-hub_verification_report="$state_root/glm52-exl3-hub-verification.json"
 python3 python/tools/verify_glm52_exl3_hub_publication.py \
   --publication-report "$publication_report" \
   --revision main \
-  --output "$hub_verification_report"
-
-hub_revision="$(jq -r .resolved_revision "$hub_verification_report")"
+  --hf-home "${HF_HOME:-$HOME/.cache/huggingface}" \
+  --output "$state_root/glm53-exl3-k4-hub-verification.json"
 ```
 
-Retain `hub_revision` with the final reports. The earlier standard-tree staging
-and all-four-Spark smoke test prove the same publication bytes load in GLMRT;
-the remote verifier proves that exact byte inventory is what the public Hub
-revision exposes without downloading another full copy of every shard.
-
-Keep the projection checkpoint store until the published model has passed the
-complete serving and quality ladder. Once the complete artifact and quant
-evidence are accepted, the rolling layer boundary, capture frontier, active
-source, post-quant replay, JIT, and offload state are regenerable and may be
-removed, but retain the immutable plan, artifact/run manifests, compact error
-evidence, validation reports, and final model. Projection-checkpoint deletion
-remains an explicit user decision.
-
-Use the content-bound cleanup planner instead of deleting run directories by
-hand. It is dry-run by default. After the complete artifact and quant-evidence
-reports are accepted, review and then release only regenerable transient state:
-
-```bash
-transient_cleanup_report="$state_root/glm52-exl3-transient-cleanup.json"
-python3 python/tools/cleanup_glm52_exl3_quant_state.py \
-  --artifact-validation "$artifact_report" \
-  --quant-evidence "$quant_evidence_report" \
-  --output "$transient_cleanup_report"
-
-# After reviewing the exact targets in the planned report:
-python3 python/tools/cleanup_glm52_exl3_quant_state.py \
-  --artifact-validation "$artifact_report" \
-  --quant-evidence "$quant_evidence_report" \
-  --execute \
-  --output "$transient_cleanup_report"
-```
-
-Only after the remote Hub verifier accepts the exact public revision may the
-current run's projection store be released:
-
-```bash
-checkpoint_cleanup_report="$state_root/glm52-exl3-checkpoint-cleanup.json"
-python3 python/tools/cleanup_glm52_exl3_quant_state.py \
-  --artifact-validation "$artifact_report" \
-  --quant-evidence "$quant_evidence_report" \
-  --publication-report "$publication_report" \
-  --hub-verification "$hub_verification_report" \
-  --release-projection-checkpoints \
-  --output "$checkpoint_cleanup_report"
-
-# Review first, then repeat with --execute.
-```
-
-The utility derives every target from the signed plan, refuses broad or
-overlapping roots, never follows symlinks, and does not remove the immutable
-plan/reports/final model. A separately supplied projection seed is deliberately
-excluded because another run may still reference it. If root-owned state cannot
-be removed as the host user, rerun only the reviewed `--execute` command with
-`sudo`.
+Do not upload the rolling quantizer output directly. Only the publication tree
+created after the full artifact, serving, compact-config, and standalone
+`tensor_storage` gates is eligible for this command.
+The verifier does not clean-download the model. It checks the actual rendered
+Hub model, revision-tree, and `config.json` pages, requires the Hub model API to
+expose the compact EXL3 declaration, verifies every remote Git blob or LFS OID,
+and hardlinks the accepted publication bytes into
+`snapshots/<resolved-Hub-commit>` with standard remote blob names and
+`refs/main`. As a final gate, it resolves that exact commit through
+`huggingface_hub.snapshot_download(..., local_files_only=True)`; no model data
+is downloaded. The final load/smoke test must use that exact materialized path.

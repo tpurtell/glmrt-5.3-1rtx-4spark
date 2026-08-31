@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1420" viewBox="0 0 1920 1420" role="img" aria-labelledby="title desc">
-<title id="title">GLMRT balanced path architecture</title>
-<desc id="desc">Measured GLMRT balanced inference path.</desc>
+<title id="title">GLMRT GLM-5.3 balanced path architecture</title>
+<desc id="desc">GLM-5.3 EXL3 K4 inference across one coordinator and four DGX Spark expert workers.</desc>
 <defs>
 <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="5" stdDeviation="8" flood-opacity=".28"/></filter>
 <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#46d7e8"/></marker>
@@ -10,23 +10,23 @@
 <style>.title{font:700 34px Inter,Segoe UI,sans-serif;fill:#e9f3ff}.subtitle{font:400 16px Inter,Segoe UI,sans-serif;fill:#91a8bf}.section{font:700 20px Inter,Segoe UI,sans-serif;fill:#e9f3ff}.box-title{font:700 16px Inter,Segoe UI,sans-serif;fill:#e9f3ff}.body{font:400 14px Inter,Segoe UI,sans-serif;fill:#b9cde0}.small{font:400 12px Inter,Segoe UI,sans-serif;fill:#91a8bf}.mono{font:500 12px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#b9cde0}.metric{font:700 18px Inter,Segoe UI,sans-serif;fill:#e9f3ff}.metric-label{font:500 11px Inter,Segoe UI,sans-serif;fill:#91a8bf;letter-spacing:.8px}</style>
 </defs>
 <rect width="1920" height="1420" fill="#07111f"/>
-<text x="64" y="58" class="title" text-anchor="start">GLMRT BALANCED PATH</text>
-<text x="64" y="86" class="subtitle" text-anchor="start">Information flow, ownership, residency, kernels, and fresh NVFP4 headline timing</text>
+<text x="64" y="58" class="title" text-anchor="start">GLMRT GLM-5.3 · BALANCED PATH</text>
+<text x="64" y="86" class="subtitle" text-anchor="start">EXL3 K4 target · adaptive DFlash2 · one RTX PRO 6000 coordinator · four DGX Spark expert workers</text>
 <rect x="64" y="112" width="245" height="66" rx="13" fill="#0b192a" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
-<text x="81" y="139" class="metric" text-anchor="start" fill="#56d69c">26.63 TPS</text>
+<text x="81" y="139" class="metric" text-anchor="start" fill="#56d69c">25.96 TPS</text>
 <text x="81" y="161" class="metric-label" text-anchor="start">WEIGHTED ADAPTIVE DECODE</text>
 <rect x="327" y="112" width="245" height="66" rx="13" fill="#0b192a" fill-opacity="1.0" stroke="#a978ff" stroke-width="1.2"/>
-<text x="344" y="139" class="metric" text-anchor="start" fill="#a978ff">75.2%</text>
+<text x="344" y="139" class="metric" text-anchor="start" fill="#a978ff">49.8%</text>
 <text x="344" y="161" class="metric-label" text-anchor="start">DRAFT ACCEPTANCE</text>
 <rect x="590" y="112" width="245" height="66" rx="13" fill="#0b192a" fill-opacity="1.0" stroke="#46d7e8" stroke-width="1.2"/>
-<text x="607" y="139" class="metric" text-anchor="start" fill="#46d7e8">1736 TPS</text>
+<text x="607" y="139" class="metric" text-anchor="start" fill="#46d7e8">1516 TPS</text>
 <text x="607" y="161" class="metric-label" text-anchor="start">FRESH 8K EXTERNAL</text>
 <rect x="853" y="112" width="245" height="66" rx="13" fill="#0b192a" fill-opacity="1.0" stroke="#ffc35a" stroke-width="1.2"/>
 <text x="870" y="139" class="metric" text-anchor="start" fill="#ffc35a">M = 1…8</text>
 <text x="870" y="161" class="metric-label" text-anchor="start">TARGET ROWS / CYCLE</text>
 <rect x="1116" y="112" width="300" height="66" rx="13" fill="#0b192a" fill-opacity="1.0" stroke="#5d8cff" stroke-width="1.2"/>
-<text x="1133" y="139" class="metric" text-anchor="start" fill="#5d8cff">609,536</text>
-<text x="1133" y="161" class="metric-label" text-anchor="start">SHARED TARGET-KV SLOTS</text>
+<text x="1133" y="139" class="metric" text-anchor="start" fill="#5d8cff">400K</text>
+<text x="1133" y="161" class="metric-label" text-anchor="start">REQUEST CONTEXT CAP</text>
 <rect x="64" y="225" width="265" height="175" rx="14" fill="#10243a" fill-opacity="1.0" stroke="#46d7e8" stroke-width="1.2" filter="url(#shadow)"/>
 <rect x="64" y="225" width="6" height="175" rx="3" fill="#46d7e8" fill-opacity="1.0" stroke="#46d7e8" stroke-width="1.2"/>
 <text x="86" y="254" class="box-title" text-anchor="start">OpenAI-compatible client</text>
@@ -48,9 +48,9 @@
 <rect x="870" y="310" width="495" height="112" rx="14" fill="#10243a" fill-opacity="1.0" stroke="#5d8cff" stroke-width="1.2"/>
 <rect x="870" y="310" width="6" height="112" rx="3" fill="#5d8cff" fill-opacity="1.0" stroke="#5d8cff" stroke-width="1.2"/>
 <text x="892" y="339" class="box-title" text-anchor="start">Shared cache ownership</text>
-<text x="892" y="364" class="body" text-anchor="start">target radix: 609,536 × 56,544 B = 32.1 GiB</text>
+<text x="892" y="364" class="body" text-anchor="start">profile-sized packed target radix KV pool</text>
 <text x="892" y="382" class="body" text-anchor="start">logical request cap 400,000; 64-token pages</text>
-<text x="892" y="400" class="body" text-anchor="start">dSpark tails use a separate bounded host LRU</text>
+<text x="892" y="400" class="body" text-anchor="start">DFlash2 keeps bounded per-request draft state</text>
 <path d="M329,312 L400,350" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <path d="M835,366 L870,366" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <rect x="400" y="457" width="965" height="83" rx="14" fill="#10243a" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
@@ -60,7 +60,7 @@
 <path d="M618,422 L618,457" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <rect x="400" y="580" width="965" height="400" rx="18" fill="#0a1728" fill-opacity="1.0" stroke="#203a55" stroke-width="1.2"/>
 <text x="425" y="616" class="section" text-anchor="start">3 · TARGET TRANSFORMER · 78 SERIAL LAYERS</text>
-<text x="1338" y="615" class="mono" text-anchor="end" fill="#ffc35a">34.6 GiB weights · W8A16 Q-A / Q-B / O</text>
+<text x="1338" y="615" class="mono" text-anchor="end" fill="#ffc35a">resident attention · dense/shared MLP · router · LM head</text>
 <rect x="430" y="645" width="905" height="82" rx="14" fill="#102538" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
 <rect x="430" y="645" width="6" height="82" rx="3" fill="#56d69c" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
 <text x="452" y="674" class="box-title" text-anchor="start">Layers 0–2 · dense ×3</text>
@@ -86,24 +86,24 @@
 <text x="993" y="910" class="body" text-anchor="start">BF16 owner delta → residual</text>
 <path d="M716,879 L741,879" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <path d="M946,879 L971,879" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
-<text x="450" y="966" class="mono" text-anchor="start" fill="#56d69c">Clean target-cycle medians: M1≈47.4 ms · M2 72.1 · M3 90.8 · M4 101.7 · M8 147.8</text>
+<text x="450" y="966" class="mono" text-anchor="start" fill="#56d69c">Target-cycle medians: M1 50.0 ms · M2 72.3 · M3 90.2 · M5 107.5 · M8 142.2</text>
 <path d="M882,540 L882,580" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <rect x="400" y="1025" width="452" height="205" rx="14" fill="#10243a" fill-opacity="1.0" stroke="#a978ff" stroke-width="1.2"/>
 <rect x="400" y="1025" width="6" height="205" rx="3" fill="#a978ff" fill-opacity="1.0" stroke="#a978ff" stroke-width="1.2"/>
-<text x="422" y="1054" class="box-title" text-anchor="start">4A · RedHat dSpark controller</text>
-<text x="422" y="1079" class="body" text-anchor="start">target residual taps: 2 / 20 / 39 / 58 / 75</text>
-<text x="422" y="1097" class="body" text-anchor="start">3 BF16 draft layers; native 2K sliding window</text>
-<text x="422" y="1115" class="body" text-anchor="start">2383 MiB weights + 408 MiB GPU KV</text>
-<text x="422" y="1133" class="body" text-anchor="start">request-local confidence residuals + joint cost model</text>
-<text x="422" y="1151" class="body" text-anchor="start">propose D=0…7 → target physical M=D+1</text>
+<text x="422" y="1054" class="box-title" text-anchor="start">4A · DFlash2 controller</text>
+<text x="422" y="1079" class="body" text-anchor="start">target residual taps: 5 / 19 / 33 / 47 / 61 / 75</text>
+<text x="422" y="1097" class="body" text-anchor="start">6 BF16 draft layers; native 2K sliding window</text>
+<text x="422" y="1115" class="body" text-anchor="start">4.9 GB weights + bounded per-request GPU KV</text>
+<text x="422" y="1133" class="body" text-anchor="start">route-calibrated adaptive K1–K7 verifier</text>
+<text x="422" y="1151" class="body" text-anchor="start">propose K=1…7 → target physical M=K+1</text>
 <rect x="885" y="1025" width="480" height="205" rx="14" fill="#10243a" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
 <rect x="885" y="1025" width="6" height="205" rx="3" fill="#56d69c" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
 <text x="907" y="1054" class="box-title" text-anchor="start">4B · Terminal score + commit</text>
 <text x="907" y="1079" class="body" text-anchor="start">one batched final norm + full BF16 LM head</text>
 <text x="907" y="1097" class="body" text-anchor="start">greedy or sampled target rows</text>
 <text x="907" y="1115" class="body" text-anchor="start">accept matching draft prefix; emit 1…M tokens</text>
-<text x="907" y="1133" class="body" text-anchor="start">publish target radix pages + reusable dSpark tail</text>
-<text x="907" y="1151" class="body" text-anchor="start">measured 2.520 emitted/spec cycle</text>
+<text x="907" y="1133" class="body" text-anchor="start">publish target radix pages + advance draft state</text>
+<text x="907" y="1151" class="body" text-anchor="start">measured 5.15 emitted tokens / target cycle</text>
 <path d="M565,980 C565,1000 625,1000 625,1025" fill="none" stroke="#a978ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <path d="M852,1124 L885,1124" fill="none" stroke="#46d7e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
 <path d="M1125,1025 C1125,995 1010,996 1010,980" fill="none" stroke="#56d69c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
@@ -118,28 +118,28 @@
 <rect x="1472" y="375" width="6" height="150" rx="3" fill="#46d7e8" fill-opacity="1.0" stroke="#46d7e8" stroke-width="1.2"/>
 <text x="1494" y="404" class="box-title" text-anchor="start">spark-0 · ostrich</text>
 <text x="1494" y="429" class="body" text-anchor="start">64 experts/layer by modulo ownership</text>
-<text x="1494" y="447" class="body" text-anchor="start">device-resident NVFP4 or EXL3 K3 weights</text>
+<text x="1494" y="447" class="body" text-anchor="start">device-resident EXL3 K4 weights</text>
 <text x="1494" y="465" class="body" text-anchor="start">SparkInfer/CuTe grouped kernels</text>
 <text x="1494" y="483" class="body" text-anchor="start">expert-local FP32 accumulation</text>
 <rect x="1472" y="565" width="356" height="150" rx="14" fill="#171d35" fill-opacity="1.0" stroke="#5d8cff" stroke-width="1.2"/>
 <rect x="1472" y="565" width="6" height="150" rx="3" fill="#5d8cff" fill-opacity="1.0" stroke="#5d8cff" stroke-width="1.2"/>
 <text x="1494" y="594" class="box-title" text-anchor="start">spark-1 · dodo</text>
 <text x="1494" y="619" class="body" text-anchor="start">64 experts/layer by modulo ownership</text>
-<text x="1494" y="637" class="body" text-anchor="start">device-resident NVFP4 or EXL3 K3 weights</text>
+<text x="1494" y="637" class="body" text-anchor="start">device-resident EXL3 K4 weights</text>
 <text x="1494" y="655" class="body" text-anchor="start">SparkInfer/CuTe grouped kernels</text>
 <text x="1494" y="673" class="body" text-anchor="start">expert-local FP32 accumulation</text>
 <rect x="1472" y="755" width="356" height="150" rx="14" fill="#171d35" fill-opacity="1.0" stroke="#a978ff" stroke-width="1.2"/>
 <rect x="1472" y="755" width="6" height="150" rx="3" fill="#a978ff" fill-opacity="1.0" stroke="#a978ff" stroke-width="1.2"/>
 <text x="1494" y="784" class="box-title" text-anchor="start">spark-2 · emu</text>
 <text x="1494" y="809" class="body" text-anchor="start">64 experts/layer by modulo ownership</text>
-<text x="1494" y="827" class="body" text-anchor="start">device-resident NVFP4 or EXL3 K3 weights</text>
+<text x="1494" y="827" class="body" text-anchor="start">device-resident EXL3 K4 weights</text>
 <text x="1494" y="845" class="body" text-anchor="start">SparkInfer/CuTe grouped kernels</text>
 <text x="1494" y="863" class="body" text-anchor="start">expert-local FP32 accumulation</text>
 <rect x="1472" y="945" width="356" height="150" rx="14" fill="#171d35" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
 <rect x="1472" y="945" width="6" height="150" rx="3" fill="#56d69c" fill-opacity="1.0" stroke="#56d69c" stroke-width="1.2"/>
 <text x="1494" y="974" class="box-title" text-anchor="start">spark-3 · kiwi</text>
 <text x="1494" y="999" class="body" text-anchor="start">64 experts/layer by modulo ownership</text>
-<text x="1494" y="1017" class="body" text-anchor="start">device-resident NVFP4 or EXL3 K3 weights</text>
+<text x="1494" y="1017" class="body" text-anchor="start">device-resident EXL3 K4 weights</text>
 <text x="1494" y="1035" class="body" text-anchor="start">SparkInfer/CuTe grouped kernels</text>
 <text x="1494" y="1053" class="body" text-anchor="start">expert-local FP32 accumulation</text>
 <path d="M1301,879 C1390,879 1370,545 1472,545" fill="none" stroke="#a978ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="1.0" marker-end="url(#arrow)"/>
@@ -150,6 +150,6 @@
 <text x="1492" y="1177" class="box-title" text-anchor="start">Reduction policy</text>
 <text x="1492" y="1200" class="small" text-anchor="start">small rows: direct BF16 response</text>
 <text x="1492" y="1218" class="small" text-anchor="start">≥16 rows: FP8 Spark-RDMA → BF16 owner</text>
-<text x="64" y="1364" class="subtitle" text-anchor="start">Measured on the maintained source tree. Headline timing is uninstrumented; synchronized stage timing is shown in the companion timeline.</text>
-<text x="1856" y="1364" class="mono" text-anchor="end">v6 public release</text>
+<text x="64" y="1364" class="subtitle" text-anchor="start">Measured balanced-profile values; the production micro-timeline contains the source-bound target-cycle evidence.</text>
+<text x="1856" y="1364" class="mono" text-anchor="end">v7 public release</text>
 </svg>

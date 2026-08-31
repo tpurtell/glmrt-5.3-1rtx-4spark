@@ -15,6 +15,20 @@ use glmrt_loader::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "dflash2_cost_profile.rs"]
+mod dflash2_cost_profile;
+use dflash2_cost_profile::{
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_MODEL,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_REVISION, GLM53_EXL3_K4_DFLASH2_COST_PROFILE_ID,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_CONCURRENCY,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_DRAFTS, GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MS,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_POWER_LIMIT_WATTS,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SOURCE_SHA256,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SPARKINFER_REVISION,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_MODEL,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_REVISION,
+    GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TOPOLOGY,
+};
 #[path = "dspark_cost_profile.rs"]
 mod dspark_cost_profile;
 use dspark_cost_profile::{
@@ -1976,6 +1990,7 @@ pub(super) struct DsparkRuntimeCostModel {
     row: BTreeMap<DsparkRuntimeGlobalCostKey, DsparkRuntimeCostCell>,
     concurrency: BTreeMap<usize, DsparkRuntimeCostCell>,
     profiled_ms: BTreeMap<DsparkRuntimeGlobalCostKey, f64>,
+    learn_profiled_residuals: bool,
     route_conditioned: BTreeMap<DsparkRuntimeGlobalCostKey, DsparkRuntimeRouteCostCell>,
 }
 
@@ -1994,8 +2009,13 @@ impl DsparkRuntimeCostModel {
             row: BTreeMap::new(),
             concurrency: BTreeMap::new(),
             profiled_ms: BTreeMap::new(),
+            learn_profiled_residuals: false,
             route_conditioned: BTreeMap::new(),
         })
+    }
+
+    fn enable_profiled_residual_learning(&mut self) {
+        self.learn_profiled_residuals = true;
     }
 
     pub(super) fn install_profile(
@@ -2205,10 +2225,12 @@ impl DsparkRuntimeCostModel {
             max_context_bucket,
             target_rows,
         )?;
-        if self.profiled_ms.contains_key(&DsparkRuntimeGlobalCostKey {
-            request_count,
-            target_rows,
-        }) {
+        if !self.learn_profiled_residuals
+            && self.profiled_ms.contains_key(&DsparkRuntimeGlobalCostKey {
+                request_count,
+                target_rows,
+            })
+        {
             return Ok(DsparkRuntimeCostObservation {
                 request_count,
                 context_work_bucket,
@@ -2219,6 +2241,11 @@ impl DsparkRuntimeCostModel {
                 exact_samples: 0,
             });
         }
+        // DFlash2 may explicitly treat its topology/model/power-qualified
+        // profile as a cold-start prior. Learn bounded residual ratios around
+        // it so fallback cells and complete-cycle costs converge without
+        // discarding that calibrated surface. Qualified dSpark profiles keep
+        // the historical immutable behavior above.
         // Preserve real regime changes while preventing one host stall from
         // permanently poisoning a rarely visited row/context cell.
         let prior = self.base_prior_ms(request_count, target_rows, context_work_bucket)?;
@@ -2324,6 +2351,47 @@ pub(super) fn install_qualified_dspark_cost_profile(
         sparkinfer_revision: GLM52_REDHAT_DSPARK_COST_PROFILE_SPARKINFER_REVISION,
         topology: GLM52_REDHAT_DSPARK_COST_PROFILE_TOPOLOGY,
         power_limit_watts: GLM52_REDHAT_DSPARK_COST_PROFILE_POWER_LIMIT_WATTS,
+    }))
+}
+
+pub(super) fn install_qualified_dflash2_cost_profile(
+    model: &mut DsparkRuntimeCostModel,
+    target_model: &str,
+    target_snapshot: &Path,
+    checkpoint_model: &str,
+    checkpoint_revision: &str,
+    sparkinfer_revision: Option<&str>,
+    coordinator_power_limit_watts: Option<usize>,
+    max_execution_lanes: usize,
+    max_verify_drafts: usize,
+) -> Result<Option<DsparkCostProfileActivation>> {
+    let target_revision = target_snapshot.file_name().and_then(|name| name.to_str());
+    if target_model != GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_MODEL
+        || target_revision != Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_REVISION)
+        || checkpoint_model != GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_MODEL
+        || checkpoint_revision != GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_REVISION
+        || sparkinfer_revision != Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SPARKINFER_REVISION)
+        || coordinator_power_limit_watts
+            != Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_POWER_LIMIT_WATTS)
+        || max_execution_lanes > GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_CONCURRENCY
+        || max_verify_drafts != GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_DRAFTS
+    {
+        return Ok(None);
+    }
+    for (request_index, rows) in GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MS
+        .iter()
+        .take(max_execution_lanes)
+        .enumerate()
+    {
+        model.install_profile(request_index + 1, rows)?;
+    }
+    model.enable_profiled_residual_learning();
+    Ok(Some(DsparkCostProfileActivation {
+        profile_id: GLM53_EXL3_K4_DFLASH2_COST_PROFILE_ID,
+        source_sha256: GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SOURCE_SHA256,
+        sparkinfer_revision: GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SPARKINFER_REVISION,
+        topology: GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TOPOLOGY,
+        power_limit_watts: GLM53_EXL3_K4_DFLASH2_COST_PROFILE_POWER_LIMIT_WATTS,
     }))
 }
 
@@ -3373,7 +3441,7 @@ impl DsparkSpsProfile {
         Ok(Self { steps_per_second })
     }
 
-    fn get(&self, batch_rows: usize) -> Result<f64> {
+    pub(super) fn get(&self, batch_rows: usize) -> Result<f64> {
         self.steps_per_second
             .get(batch_rows)
             .copied()
@@ -4399,7 +4467,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_profile_is_immutable_to_runtime_observations() {
+    fn embedded_runtime_profile_is_immutable_by_default() {
         let mut model = DsparkRuntimeCostModel::new(2, 1).unwrap();
         model
             .install_profile(2, &[(2, 20.0), (3, 30.0), (4, 40.0)])
@@ -4407,10 +4475,25 @@ mod tests {
         assert!(model.install_profile(2, &[(2, 20.0)]).is_err());
         let before = 1_000.0 / model.profile(2, &[0, 0]).unwrap().get(2).unwrap();
         assert!((before - 20.0).abs() < 1.0e-12);
-        let observation = model.observe(2, &[0, 0], 2, 1_000.0, Some(2_000)).unwrap();
+        let observation = model.observe(2, &[0, 0], 2, 1_000.0, None).unwrap();
         let after = 1_000.0 / model.profile(2, &[0, 0]).unwrap().get(2).unwrap();
         assert_eq!(observation.exact_samples, 0);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn embedded_runtime_profile_can_learn_bounded_residuals_when_enabled() {
+        let mut model = DsparkRuntimeCostModel::new(2, 1).unwrap();
+        model
+            .install_profile(2, &[(2, 20.0), (3, 30.0), (4, 40.0)])
+            .unwrap();
+        model.enable_profiled_residual_learning();
+        let before = 1_000.0 / model.profile(2, &[0, 0]).unwrap().get(2).unwrap();
+        let observation = model.observe(2, &[0, 0], 2, 1_000.0, None).unwrap();
+        let after = 1_000.0 / model.profile(2, &[0, 0]).unwrap().get(2).unwrap();
+        assert_eq!(observation.exact_samples, 1);
+        assert!(after > before);
+        assert!(after <= before * 4.0);
     }
 
     #[test]
@@ -4452,6 +4535,52 @@ mod tests {
         )
         .unwrap();
         assert!(activation.is_none());
+    }
+
+    #[test]
+    fn glm53_exl3_k4_dflash2_profile_requires_the_exact_serving_identity() {
+        let target_snapshot =
+            Path::new("/tmp").join(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_REVISION);
+        let mut model = DsparkRuntimeCostModel::new(
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_CONCURRENCY,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_DRAFTS,
+        )
+        .unwrap();
+        let activation = install_qualified_dflash2_cost_profile(
+            &mut model,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_MODEL,
+            &target_snapshot,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_MODEL,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_REVISION,
+            Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SPARKINFER_REVISION),
+            Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_POWER_LIMIT_WATTS),
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_CONCURRENCY,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_DRAFTS,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(activation.profile_id, GLM53_EXL3_K4_DFLASH2_COST_PROFILE_ID);
+        let installed_ms = 1_000.0 / model.profile(1, &[0]).unwrap().get(1).unwrap();
+        assert!((installed_ms - GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MS[0][0].1).abs() < 1.0e-9);
+
+        let mut wrong_checkpoint = DsparkRuntimeCostModel::new(
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_CONCURRENCY,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_DRAFTS,
+        )
+        .unwrap();
+        assert!(install_qualified_dflash2_cost_profile(
+            &mut wrong_checkpoint,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_TARGET_MODEL,
+            &target_snapshot,
+            "another/draft-checkpoint",
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_DSPARK_REVISION,
+            Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_SPARKINFER_REVISION),
+            Some(GLM53_EXL3_K4_DFLASH2_COST_PROFILE_POWER_LIMIT_WATTS),
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_CONCURRENCY,
+            GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MAX_DRAFTS,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

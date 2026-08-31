@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use glmrt_core::{
     plan_completion_first_routes, CompletionRoutePlanEntry, DType, TensorCatalog, TensorInfo,
     GLM52_HIDDEN_SIZE, GLM52_MOE_INTERMEDIATE_SIZE,
@@ -11,8 +11,8 @@ use glmrt_ffi::{
     GLMRT_ROUTE_SHARD_WIRE_FP8_E4M3_ROW_SCALED, GLMRT_ROUTE_SHARD_WIRE_NVFP4_E2M1_FP8_E4M3,
 };
 use glmrt_loader::{
-    dtype_byte_width, glm52_exl3_expert, is_glm52_exl3_recipe, load_tensor_bytes, load_tensor_rows,
-    Glm52Exl3Projection, LoadedTensor, LoadedTensorRows, GLM52_EXL3_BITS,
+    dtype_byte_width, exl3_bits_for_recipe, glm52_exl3_expert, is_glm_exl3_recipe,
+    load_tensor_bytes, load_tensor_rows, Glm52Exl3Projection, LoadedTensor, LoadedTensorRows,
 };
 use glmrt_transport::{protocol_v2_verbs_host_execution_lanes, ExpertProtocolV2StreamPlan};
 use io_uring::{opcode, types, IoUring};
@@ -48,7 +48,10 @@ use super::super::intermediate_sharding::{
     ExpertIntermediateShard, SparkExpertReduction,
 };
 use super::super::rdma_reduction::SparkExpertRdmaReduction;
-use super::math::{bf16_bytes_to_f32, dot_packed_nvfp4, first_f32_scalar, silu, tensor_row_bytes};
+use super::math::{
+    bf16_bytes_to_f32, dot_packed_nvfp4, f8e4m3_byte_to_f32, first_f32_scalar, silu,
+    tensor_row_bytes,
+};
 use super::router::ScoredRoute;
 
 const REAL_FULL_CUDA_REFERENCE_KERNELS_ENV: &str = "GLMRT_REAL_FULL_CUDA_REFERENCE_KERNELS";
@@ -95,7 +98,7 @@ const B12X_POWER_OF_TWO_CAPACITY_ROWS: usize = 2048;
 // wave with one packed AOT launch; larger waves must be split upstream rather
 // than silently entering the expert-grouped fallback.
 const B12X_W4A16_PREFILL_TOPK8_CAPACITY_ROWS: usize = 2064;
-pub(in crate::commands::real_full) const B12X_EXL3_K3_TOPK8_CAPACITY_ROWS: usize = 2064;
+pub(in crate::commands::real_full) const B12X_EXL3_TOPK8_CAPACITY_ROWS: usize = 2064;
 const B12X_W4A16_PREFILL_TOPK8_ROUTES: usize = 8;
 const B12X_W4A16_EXPERTS: usize = 256;
 const B12X_W4A16_MAX_PACKED_ROUTE_SLOTS: usize = 32_640;
@@ -103,6 +106,7 @@ const B12X_W4A16_MAX_ROUTE_BLOCKS: usize = 760;
 const B12X_W4A16_SCRATCH_ELEMENTS: usize = 3_145_728;
 const B12X_W4A16_LOCK_ELEMENTS: usize = 1_026;
 const EXL3_K3_TRELLIS_TILE: usize = 16;
+#[cfg(test)]
 const EXL3_K3_TRELLIS_WORDS_PER_TILE: usize = 48;
 const EXL3_MCG_MARKER: u32 = 0xCBAC_1FED;
 const STREAMING_FIRST_RESPONSE_ROWS: usize = 32;
@@ -2123,11 +2127,12 @@ impl RouteCudaWorkspace {
         &mut self,
         library: Arc<NativeLibrary>,
         rows: usize,
+        trellis_bits: usize,
         hidden_dim: usize,
         intermediate_dim: usize,
         output_dim: usize,
     ) -> Result<B12xSparkExl3AotRouteWorkspaceBuffers> {
-        let capacity_rows = b12x_exl3_k3_capacity_rows(rows)?;
+        let capacity_rows = b12x_exl3_capacity_rows(rows, trellis_bits)?;
         let common = self.ensure_b12x_aot_route_buffers_for_capacity(
             Arc::clone(&library),
             rows,
@@ -2532,6 +2537,91 @@ struct LoadedRouteCudaBf16ExpertShard {
     down: LoadedTensorRows,
 }
 
+const GLM53_BLOCK_FP8_WEIGHT_BLOCK: usize = 128;
+
+fn f32_to_bf16_rne_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let least_significant_retained_bit = (bits >> 16) & 1;
+    let rounded = bits.wrapping_add(0x7fff + least_significant_retained_bit);
+    (rounded >> 16) as u16
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dequantize_block_fp8_e4m3_to_bf16(
+    weight: &[u8],
+    row_count: usize,
+    row_width: usize,
+    source_row_start: usize,
+    source_column_start: usize,
+    scale_inv: &[f32],
+    scale_rows: usize,
+    scale_columns: usize,
+    block_size: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        row_count > 0 && row_width > 0 && block_size > 0,
+        "{label} block-FP8 geometry must be nonzero"
+    );
+    anyhow::ensure!(
+        weight.len() == row_count * row_width,
+        "{label} block-FP8 payload has {} bytes, expected {}x{}",
+        weight.len(),
+        row_count,
+        row_width,
+    );
+    anyhow::ensure!(
+        scale_inv.len() == scale_rows * scale_columns,
+        "{label} block-FP8 inverse-scale payload has {} values, expected {}x{}",
+        scale_inv.len(),
+        scale_rows,
+        scale_columns,
+    );
+    anyhow::ensure!(
+        source_row_start + row_count <= scale_rows * block_size
+            && source_column_start + row_width <= scale_columns * block_size,
+        "{label} sharded window rows={}..{} columns={}..{} exceeds inverse-scale coverage {}x{}",
+        source_row_start,
+        source_row_start + row_count,
+        source_column_start,
+        source_column_start + row_width,
+        scale_rows * block_size,
+        scale_columns * block_size,
+    );
+    anyhow::ensure!(
+        scale_inv
+            .iter()
+            .all(|scale| scale.is_finite() && *scale > 0.0),
+        "{label} block-FP8 inverse scales must be finite and positive"
+    );
+
+    let mut bf16 = vec![0_u8; weight.len() * std::mem::size_of::<u16>()];
+    for local_row in 0..row_count {
+        let source_row = source_row_start + local_row;
+        let scale_row = source_row / block_size;
+        let input_row = &weight[local_row * row_width..(local_row + 1) * row_width];
+        let output_row = &mut bf16[local_row * row_width * 2..(local_row + 1) * row_width * 2];
+        for local_column in 0..row_width {
+            let fp8 = input_row[local_column];
+            anyhow::ensure!(
+                fp8 & 0x7f != 0x7f,
+                "{label} contains an E4M3FN NaN at local row {local_row} column {local_column}"
+            );
+            let source_column = source_column_start + local_column;
+            let scale = scale_inv[scale_row * scale_columns + source_column / block_size];
+            let value = f8e4m3_byte_to_f32(fp8) * scale;
+            anyhow::ensure!(
+                value.is_finite(),
+                "{label} dequantized to a non-finite value at local row {local_row} column {local_column}"
+            );
+            let bits = f32_to_bf16_rne_bits(value).to_le_bytes();
+            output_row[local_column * 2] = bits[0];
+            output_row[local_column * 2 + 1] = bits[1];
+        }
+    }
+    Ok(bf16)
+}
+
 fn bf16_bytes_amax(parts: &[&[u8]], label: &str) -> Result<f32> {
     let mut maximum = 0.0_f32;
     for part in parts {
@@ -2795,6 +2885,7 @@ struct RouteCudaExl3LayerExpertSlab {
     expert_count: usize,
     hidden_dim: usize,
     intermediate_dim: usize,
+    trellis_bits: usize,
     w13_trellis: Arc<OwnedDeviceAllocation>,
     w2_trellis: Arc<OwnedDeviceAllocation>,
     unit_global_scale: Arc<OwnedDeviceAllocation>,
@@ -2812,19 +2903,21 @@ impl RouteCudaExl3LayerExpertSlab {
         expert_count: usize,
         hidden_dim: usize,
         intermediate_dim: usize,
+        trellis_bits: usize,
     ) -> Result<Self> {
         anyhow::ensure!(expert_count > 0, "EXL3 expert slab requires experts");
         anyhow::ensure!(
             hidden_dim % EXL3_K3_TRELLIS_TILE == 0 && intermediate_dim % EXL3_K3_TRELLIS_TILE == 0,
             "layer {layer_id} EXL3 geometry {hidden_dim}x{intermediate_dim} is not tile aligned"
         );
+        anyhow::ensure!(
+            matches!(trellis_bits, 3 | 4),
+            "layer {layer_id} EXL3 bitrate K{trellis_bits} is unsupported"
+        );
         let trellis_expert_stride_bytes = hidden_dim
-            .checked_div(EXL3_K3_TRELLIS_TILE)
-            .and_then(|hidden_tiles| {
-                hidden_tiles.checked_mul(intermediate_dim / EXL3_K3_TRELLIS_TILE)
-            })
-            .and_then(|tiles| tiles.checked_mul(EXL3_K3_TRELLIS_WORDS_PER_TILE))
-            .and_then(|words| words.checked_mul(std::mem::size_of::<i16>()))
+            .checked_mul(intermediate_dim)
+            .and_then(|values| values.checked_mul(trellis_bits))
+            .and_then(|bits| bits.checked_div(8))
             .context("EXL3 trellis expert stride overflow")?;
         let w13_bytes = trellis_expert_stride_bytes
             .checked_mul(expert_count)
@@ -2856,6 +2949,7 @@ impl RouteCudaExl3LayerExpertSlab {
             expert_count,
             hidden_dim,
             intermediate_dim,
+            trellis_bits,
             w13_trellis: allocation(w13_bytes, "W13 trellis slab")?,
             w2_trellis: allocation(w2_bytes, "W2 trellis slab")?,
             unit_global_scale: allocation(
@@ -3245,7 +3339,7 @@ impl RouteCudaExl3LayerExpertSlab {
         .sum()
     }
 
-    fn exl3_k3_moe_buffers(
+    fn exl3_moe_buffers(
         &self,
         workspace: B12xSparkExl3AotRouteWorkspaceBuffers,
         output_f32: GlmrtDeviceBuffer,
@@ -3255,7 +3349,7 @@ impl RouteCudaExl3LayerExpertSlab {
                 && self.hidden_dim == GLM52_HIDDEN_SIZE
                 && self.intermediate_dim == 512
                 && self.trellis_expert_stride_bytes
-                    == self.hidden_dim * self.intermediate_dim * GLM52_EXL3_BITS / 8,
+                    == self.hidden_dim * self.intermediate_dim * self.trellis_bits / 8,
             "layer {} EXL3 slab has unsupported experts={} geometry={}x{} trellis_stride={}",
             self.layer_id,
             self.expert_count,
@@ -4395,16 +4489,17 @@ fn plan_packed_w4a16_topk8_prefill_flat(
     )
 }
 
-fn plan_packed_exl3_k3_topk8_prefill_flat(
+fn plan_packed_exl3_topk8_prefill_flat(
     row_count: usize,
     routes: &[PackedW4a16Topk8Route],
+    trellis_bits: usize,
 ) -> Result<PackedW4a16Topk8PrefillPlan> {
     plan_packed_topk8_prefill_flat_with_block_rows(
         row_count,
         routes,
-        b12x_exl3_k3_route_block_rows(row_count),
+        b12x_exl3_route_block_rows(row_count, trellis_bits),
         false,
-        B12X_EXL3_K3_TOPK8_CAPACITY_ROWS,
+        B12X_EXL3_TOPK8_CAPACITY_ROWS,
     )
 }
 
@@ -4534,6 +4629,7 @@ pub(in crate::commands::real_full) struct RouteNvfp4IngressStream {
     lane_count: usize,
     packed_w4a16_topk8_prefill: bool,
     exl3_topk8_prefill: bool,
+    exl3_trellis_bits: Option<usize>,
     m1_parity_grouped_small_m_w4a16: bool,
     split_m1_m2_w4a16: bool,
     w4a16_small_m_mode: W4a16SmallMMode,
@@ -4645,14 +4741,18 @@ pub(in crate::commands::real_full) fn try_begin_packed_w4a16_topk8_prefill_cache
         && slab
             .map(|slab| slab.w4a16_moe_buffers().is_ok())
             .unwrap_or(false);
-    let exl3_topk8_prefill = cuda_cache.exl3_expert_slabs.contains_key(&layer_id);
+    let exl3_trellis_bits = cuda_cache
+        .exl3_expert_slabs
+        .get(&layer_id)
+        .map(|slab| slab.trellis_bits);
+    let exl3_topk8_prefill = exl3_trellis_bits.is_some();
     if !packed_w4a16 && !exl3_topk8_prefill {
         return Ok(None);
     }
     if exl3_topk8_prefill {
         anyhow::ensure!(
-            row_count <= B12X_EXL3_K3_TOPK8_CAPACITY_ROWS,
-            "EXL3 top-k=8 host rows {row_count} exceed the combined prefill/decode/MTP capacity {B12X_EXL3_K3_TOPK8_CAPACITY_ROWS}"
+            row_count <= B12X_EXL3_TOPK8_CAPACITY_ROWS,
+            "EXL3 top-k=8 host rows {row_count} exceed the combined prefill/decode/MTP capacity {B12X_EXL3_TOPK8_CAPACITY_ROWS}"
         );
     } else {
         anyhow::ensure!(
@@ -4680,8 +4780,8 @@ pub(in crate::commands::real_full) fn try_begin_packed_w4a16_topk8_prefill_cache
         );
     }
 
-    let packed_plan = if exl3_topk8_prefill {
-        plan_packed_exl3_k3_topk8_prefill_flat(row_count, routes)?
+    let packed_plan = if let Some(trellis_bits) = exl3_trellis_bits {
+        plan_packed_exl3_topk8_prefill_flat(row_count, routes, trellis_bits)?
     } else {
         plan_packed_w4a16_topk8_prefill_flat(row_count, routes)?
     };
@@ -4708,15 +4808,15 @@ pub(in crate::commands::real_full) fn try_begin_packed_w4a16_topk8_prefill_cache
     if route_stage_timing_enabled() {
         eprintln!(
             "real_nvfp4_route_topk8_prefill_fast_selected layer_id={layer_id} rows={row_count} routes={route_count} layout={}",
-            if exl3_topk8_prefill { "exl3-k3-trellis" } else { "w4a16-packed" }
+            if exl3_topk8_prefill { "exl3-trellis" } else { "w4a16-packed" }
         );
     }
 
     let hidden_bytes = row_count
         .checked_mul(hidden_row_stride_bytes)
         .context("packed W4A16 prefill hidden byte count overflow")?;
-    let accumulator_rows = if exl3_topk8_prefill {
-        b12x_exl3_k3_capacity_rows(row_count)?
+    let accumulator_rows = if let Some(trellis_bits) = exl3_trellis_bits {
+        b12x_exl3_capacity_rows(row_count, trellis_bits)?
     } else {
         row_count
     };
@@ -4754,6 +4854,7 @@ pub(in crate::commands::real_full) fn try_begin_packed_w4a16_topk8_prefill_cache
             cuda_cache.workspace.ensure_b12x_exl3_aot_route_buffers(
                 Arc::clone(&library),
                 b12x_workspace_rows,
+                exl3_trellis_bits.expect("EXL3 workspace requires a trellis bitrate"),
                 hidden_dim,
                 512,
                 output_rows,
@@ -4941,6 +5042,7 @@ pub(in crate::commands::real_full) fn try_begin_packed_w4a16_topk8_prefill_cache
         lane_count,
         packed_w4a16_topk8_prefill: true,
         exl3_topk8_prefill,
+        exl3_trellis_bits,
         m1_parity_grouped_small_m_w4a16,
         split_m1_m2_w4a16,
         w4a16_small_m_mode,
@@ -5436,6 +5538,7 @@ pub(in crate::commands::real_full) fn begin_nvfp4_route_ingress_stream_cached(
         lane_count,
         packed_w4a16_topk8_prefill,
         exl3_topk8_prefill: false,
+        exl3_trellis_bits: None,
         m1_parity_grouped_small_m_w4a16,
         split_m1_m2_w4a16,
         w4a16_small_m_mode,
@@ -6040,8 +6143,8 @@ pub(in crate::commands::real_full) fn execute_nvfp4_route_ingress_stream_chunk_c
         .row_count
         .checked_mul(state.hidden_row_stride_bytes)
         .context("streamed NVFP4 route hidden byte count overflow")?;
-    let accumulator_rows = if state.exl3_topk8_prefill {
-        b12x_exl3_k3_capacity_rows(state.row_count)?
+    let accumulator_rows = if let Some(trellis_bits) = state.exl3_trellis_bits {
+        b12x_exl3_capacity_rows(state.row_count, trellis_bits)?
     } else {
         state.row_count
     };
@@ -6076,6 +6179,9 @@ pub(in crate::commands::real_full) fn execute_nvfp4_route_ingress_stream_chunk_c
             cuda_cache.workspace.ensure_b12x_exl3_aot_route_buffers(
                 Arc::clone(&library),
                 state.max_group_rows,
+                state
+                    .exl3_trellis_bits
+                    .expect("EXL3 workspace requires a trellis bitrate"),
                 state.hidden_dim,
                 state.max_intermediate_rows,
                 state.output_rows,
@@ -6154,11 +6260,18 @@ pub(in crate::commands::real_full) fn execute_nvfp4_route_ingress_stream_chunk_c
             )?);
             if state.exl3_topk8_prefill {
                 let exl3_workspace = exl3_workspace.context("EXL3 route lost its workspace")?;
-                let buffers = cuda_cache
+                let exl3_slab = cuda_cache
                     .exl3_expert_slabs
                     .get(&state.layer_id)
-                    .context("EXL3 top-k=8 route lost its resident expert slab")?
-                    .exl3_k3_moe_buffers(exl3_workspace, workspace.accumulator)?;
+                    .context("EXL3 top-k=8 route lost its resident expert slab")?;
+                anyhow::ensure!(
+                    state.exl3_trellis_bits == Some(exl3_slab.trellis_bits),
+                    "EXL3 route K{:?} no longer matches resident layer {} K{}",
+                    state.exl3_trellis_bits,
+                    state.layer_id,
+                    exl3_slab.trellis_bits
+                );
+                let buffers = exl3_slab.exl3_moe_buffers(exl3_workspace, workspace.accumulator)?;
                 // Preserve the qualified FP32 decode and speculative-verify
                 // paths. Verify executes several rows together too, so merely
                 // checking M > 1 is not a prefill discriminator. For genuine
@@ -6177,26 +6290,44 @@ pub(in crate::commands::real_full) fn execute_nvfp4_route_ingress_stream_chunk_c
                         )?;
                     }
                     if direct_bf16_output {
-                        library
-                            .cuda_b12x_spark_exl3_k3_topk8_nvfp4_bf16_async(
+                        match exl3_slab.trellis_bits {
+                            3 => library.cuda_b12x_spark_exl3_k3_topk8_nvfp4_bf16_async(
                                 &buffers,
                                 input_payload,
                                 state.hidden_row_stride_bytes,
                                 state.row_count,
                                 group_stream,
-                            )
-                            .context("launching packed B12X EXL3 K3 top-k=8 BF16-output MoE")?;
+                            ),
+                            4 => library.cuda_b12x_spark_exl3_k4_topk8_nvfp4_bf16_async(
+                                &buffers,
+                                input_payload,
+                                state.hidden_row_stride_bytes,
+                                state.row_count,
+                                group_stream,
+                            ),
+                            bits => anyhow::bail!("unsupported resident EXL3 bitrate K{bits}"),
+                        }
+                        .context("launching packed B12X EXL3 top-k=8 BF16-output MoE")?;
                         packed_prefill_bf16_output = Some(buffers.input_bf16);
                     } else {
-                        library
-                            .cuda_b12x_spark_exl3_k3_topk8_nvfp4_async(
+                        match exl3_slab.trellis_bits {
+                            3 => library.cuda_b12x_spark_exl3_k3_topk8_nvfp4_async(
                                 &buffers,
                                 input_payload,
                                 state.hidden_row_stride_bytes,
                                 state.row_count,
                                 group_stream,
-                            )
-                            .context("launching packed B12X EXL3 K3 top-k=8 MoE")?;
+                            ),
+                            4 => library.cuda_b12x_spark_exl3_k4_topk8_nvfp4_async(
+                                &buffers,
+                                input_payload,
+                                state.hidden_row_stride_bytes,
+                                state.row_count,
+                                group_stream,
+                            ),
+                            bits => anyhow::bail!("unsupported resident EXL3 bitrate K{bits}"),
+                        }
+                        .context("launching packed B12X EXL3 top-k=8 MoE")?;
                     }
                     if let Some(timeline) = packed_prefill_timeline.as_ref() {
                         timeline.record(
@@ -6207,7 +6338,7 @@ pub(in crate::commands::real_full) fn execute_nvfp4_route_ingress_stream_chunk_c
                     }
                     library
                         .cuda_event_record(cuda_cache.b12x_lane_event(0), group_stream)
-                        .context("recording packed B12X EXL3 K3 completion")?;
+                        .context("recording packed B12X EXL3 completion")?;
                 }
             } else {
                 let slab = cuda_cache
@@ -9725,18 +9856,26 @@ fn b12x_w4a16_capacity_rows(rows: usize) -> Result<usize> {
     }
 }
 
-fn b12x_exl3_k3_capacity_rows(rows: usize) -> Result<usize> {
+fn b12x_exl3_capacity_rows(rows: usize, trellis_bits: usize) -> Result<usize> {
     anyhow::ensure!(
-        rows > 0 && rows <= B12X_EXL3_K3_TOPK8_CAPACITY_ROWS,
-        "B12X EXL3 K3 rows {rows} are outside 1..={B12X_EXL3_K3_TOPK8_CAPACITY_ROWS}"
+        rows > 0 && rows <= B12X_EXL3_TOPK8_CAPACITY_ROWS,
+        "B12X EXL3 K{trellis_bits} rows {rows} are outside 1..={B12X_EXL3_TOPK8_CAPACITY_ROWS}"
     );
-    if matches!(rows, 9 | 257) {
+    anyhow::ensure!(
+        matches!(trellis_bits, 3 | 4),
+        "B12X EXL3 requires K3 or K4, got K{trellis_bits}"
+    );
+    if (trellis_bits == 4 && rows <= 32) || matches!(rows, 9 | 257) {
         Ok(rows)
     } else if rows > B12X_POWER_OF_TWO_CAPACITY_ROWS {
-        Ok(B12X_EXL3_K3_TOPK8_CAPACITY_ROWS)
+        Ok(B12X_EXL3_TOPK8_CAPACITY_ROWS)
     } else {
         Ok(rows.next_power_of_two())
     }
+}
+
+fn b12x_exl3_k3_capacity_rows(rows: usize) -> Result<usize> {
+    b12x_exl3_capacity_rows(rows, 3)
 }
 
 fn b12x_w4a16_prefill_route_block_rows(rows: usize) -> usize {
@@ -9750,15 +9889,19 @@ fn b12x_w4a16_prefill_route_block_rows(rows: usize) -> usize {
 }
 
 fn b12x_exl3_k3_route_block_rows(rows: usize) -> usize {
+    b12x_exl3_route_block_rows(rows, 3)
+}
+
+fn b12x_exl3_route_block_rows(rows: usize, trellis_bits: usize) -> usize {
     // This is SparkInfer's select_route_block_size_m policy with top_k=8 and
     // num_experts=256. It is part of the generated fused-kernel ABI, so use
     // the AOT capacity selected by the native dispatcher rather than the
     // request's active M. The final 2,064 regime is deliberately non-power-of-
     // two so a full prefill wave retains its decode/draft suffix.
-    let regime_rows = if matches!(rows, 9 | 257) {
+    let regime_rows = if (trellis_bits == 4 && rows <= 32) || matches!(rows, 9 | 257) {
         rows
     } else if rows > B12X_POWER_OF_TWO_CAPACITY_ROWS {
-        B12X_EXL3_K3_TOPK8_CAPACITY_ROWS
+        B12X_EXL3_TOPK8_CAPACITY_ROWS
     } else {
         rows.next_power_of_two()
     };
@@ -10491,6 +10634,144 @@ fn load_route_cuda_bf16_projection_shard(
     Ok(loaded)
 }
 
+fn load_route_cuda_block_fp8_projection_shard(
+    catalog: &TensorCatalog,
+    request: &RouteProjectionCachePreloadRequest,
+    shard: ExpertIntermediateShard,
+) -> Result<LoadedTensorRows> {
+    let base_name =
+        routed_quant_projection_base_name(request.layer_id, request.expert_id, request.projection);
+    let weight_name = format!("{base_name}.weight");
+    let scale_name = format!("{base_name}.weight_scale_inv");
+    let source_info = catalog_tensor(catalog, &weight_name)?;
+    anyhow::ensure!(
+        source_info.dtype == DType::F8E4M3 && source_info.shape.len() == 2,
+        "startup-quantized MTP projection {weight_name} must be a rank-2 E4M3 tensor, got {:?} {:?}",
+        source_info.dtype,
+        source_info.shape,
+    );
+    let full_rows = source_info.shape[0];
+    let full_width = source_info.shape[1];
+    let (source_row_start, source_column_start) = match request.projection {
+        "gate_proj" | "up_proj" => (shard.row_start(full_rows)?, 0),
+        "down_proj" => (0, shard.row_start(full_width)?),
+        projection => bail!("unsupported block-FP8 MTP projection {projection}"),
+    };
+    let loaded = load_routed_projection_rows_for_shard(
+        catalog,
+        &weight_name,
+        request.projection,
+        request.row_count,
+        shard,
+    )?;
+    anyhow::ensure!(
+        loaded.info.dtype == DType::F8E4M3 && loaded.bytes_per_scalar == 1,
+        "startup-quantized MTP projection {weight_name} loaded as {:?}/{} bytes per scalar",
+        loaded.info.dtype,
+        loaded.bytes_per_scalar,
+    );
+    let scale = load_tensor_bytes(catalog, &scale_name)?;
+    let expected_scale_shape = vec![
+        full_rows.div_ceil(GLM53_BLOCK_FP8_WEIGHT_BLOCK),
+        full_width.div_ceil(GLM53_BLOCK_FP8_WEIGHT_BLOCK),
+    ];
+    anyhow::ensure!(
+        scale.info.dtype == DType::F32 && scale.info.shape == expected_scale_shape,
+        "startup-quantized MTP inverse scale {scale_name} must be F32 {:?}, got {:?} {:?}",
+        expected_scale_shape,
+        scale.info.dtype,
+        scale.info.shape,
+    );
+    anyhow::ensure!(
+        scale.bytes.len() == expected_scale_shape.iter().product::<usize>() * 4,
+        "startup-quantized MTP inverse scale {scale_name} has an invalid payload length {}",
+        scale.bytes.len(),
+    );
+    let scale_values = scale
+        .bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte scale chunk")))
+        .collect::<Vec<_>>();
+    let conversion_started = Instant::now();
+    let bytes = dequantize_block_fp8_e4m3_to_bf16(
+        &loaded.bytes,
+        loaded.row_count,
+        loaded.row_width,
+        source_row_start,
+        source_column_start,
+        &scale_values,
+        expected_scale_shape[0],
+        expected_scale_shape[1],
+        GLM53_BLOCK_FP8_WEIGHT_BLOCK,
+        &weight_name,
+    )?;
+    let mut info = loaded.info;
+    info.dtype = DType::Bf16;
+    info.byte_length = bytes.len() as u64;
+    Ok(LoadedTensorRows {
+        info,
+        source_path: loaded.source_path,
+        start_row: loaded.start_row,
+        row_count: loaded.row_count,
+        row_width: loaded.row_width,
+        bytes_per_scalar: 2,
+        bytes,
+        elapsed_micros: loaded.elapsed_micros
+            + scale.elapsed_micros
+            + conversion_started.elapsed().as_micros(),
+        sha256: String::new(),
+    })
+}
+
+fn load_route_cuda_startup_quantized_projection_shard(
+    catalog: &TensorCatalog,
+    request: &RouteProjectionCachePreloadRequest,
+    shard: ExpertIntermediateShard,
+) -> Result<LoadedTensorRows> {
+    let base_name =
+        routed_quant_projection_base_name(request.layer_id, request.expert_id, request.projection);
+    match catalog_tensor(catalog, &format!("{base_name}.weight"))?.dtype {
+        DType::Bf16 => load_route_cuda_bf16_projection_shard(catalog, request, shard),
+        DType::F8E4M3 => load_route_cuda_block_fp8_projection_shard(catalog, request, shard),
+        ref dtype => bail!(
+            "startup-quantized MTP projection {base_name}.weight has unsupported source dtype {dtype:?}"
+        ),
+    }
+}
+
+fn load_route_cuda_startup_quantized_expert_shard(
+    catalog: &TensorCatalog,
+    layer_requests: &[&RouteProjectionCachePreloadRequest],
+    layer_id: usize,
+    expert_id: usize,
+    shard: ExpertIntermediateShard,
+) -> Result<LoadedRouteCudaBf16ExpertShard> {
+    let find = |projection| {
+        layer_requests
+            .iter()
+            .copied()
+            .find(|request| request.expert_id == expert_id && request.projection == projection)
+            .with_context(|| {
+                format!(
+                    "startup-quantized MTP layer {layer_id} expert {expert_id} is missing {projection}"
+                )
+            })
+    };
+    Ok(LoadedRouteCudaBf16ExpertShard {
+        gate: load_route_cuda_startup_quantized_projection_shard(
+            catalog,
+            find("gate_proj")?,
+            shard,
+        )?,
+        up: load_route_cuda_startup_quantized_projection_shard(catalog, find("up_proj")?, shard)?,
+        down: load_route_cuda_startup_quantized_projection_shard(
+            catalog,
+            find("down_proj")?,
+            shard,
+        )?,
+    })
+}
+
 fn load_route_cuda_bf16_expert_shard(
     catalog: &TensorCatalog,
     layer_requests: &[&RouteProjectionCachePreloadRequest],
@@ -10604,21 +10885,21 @@ pub(in crate::commands::real_full) fn preload_routed_bf16_projection_cuda_cache(
     Ok(preload)
 }
 
-pub(in crate::commands::real_full) fn preload_startup_quantized_bf16_projection_cuda_cache(
+pub(in crate::commands::real_full) fn preload_startup_quantized_mtp_projection_cuda_cache(
     catalog: &TensorCatalog,
     requests: &[RouteProjectionCachePreloadRequest],
     cache: &mut RouteTensorCache,
 ) -> Result<RouteCudaProjectionPreload> {
     anyhow::ensure!(
         !requests.is_empty(),
-        "startup BF16-to-NVFP4 preload requires projection requests"
+        "startup MTP-to-NVFP4 preload requires projection requests"
     );
     let shard = spark_expert_intermediate_shard_from_env()?
         .context("startup-quantized MTP experts require four intermediate shards")?;
     let cuda_cache = cache.cuda_cache()?;
     anyhow::ensure!(
         cuda_cache.b12x_w4a16_packed,
-        "startup BF16-to-NVFP4 experts require the packed W4A16 serving layout"
+        "startup MTP-to-NVFP4 experts require the packed W4A16 serving layout"
     );
     let stream = RouteCudaStream::new(Arc::clone(&cuda_cache.library))?;
     let cuda_stream = stream.as_ptr();
@@ -10645,7 +10926,7 @@ pub(in crate::commands::real_full) fn preload_startup_quantized_bf16_projection_
             !expert_ids.is_empty()
                 && expert_ids.iter().copied().eq(0..expert_ids.len())
                 && layer_requests.len() == expert_ids.len() * 3,
-            "startup-quantized BF16 layer {layer_id} requires three projections for dense expert IDs"
+            "startup-quantized MTP layer {layer_id} requires three projections for dense expert IDs"
         );
         if let Some(existing) = cuda_cache.expert_slabs.get(&layer_id) {
             preload.projection_groups += existing.expert_count * 3;
@@ -10655,7 +10936,7 @@ pub(in crate::commands::real_full) fn preload_startup_quantized_bf16_projection_
                 (existing.w13_scale.capacity_bytes() + existing.w2_scale.capacity_bytes()) as u64;
             continue;
         }
-        let mut first = Some(load_route_cuda_bf16_expert_shard(
+        let mut first = Some(load_route_cuda_startup_quantized_expert_shard(
             catalog,
             &layer_requests,
             layer_id,
@@ -10677,7 +10958,7 @@ pub(in crate::commands::real_full) fn preload_startup_quantized_bf16_projection_
             let loaded = if expert_id == 0 {
                 first.take().expect("first BF16 expert is consumed once")
             } else {
-                load_route_cuda_bf16_expert_shard(
+                load_route_cuda_startup_quantized_expert_shard(
                     catalog,
                     &layer_requests,
                     layer_id,
@@ -10700,7 +10981,7 @@ pub(in crate::commands::real_full) fn preload_startup_quantized_bf16_projection_
         slab.finalize_w4a16_global_scales(cuda_cache.library.as_ref(), cuda_stream)?;
         anyhow::ensure!(
             cuda_cache.expert_slabs.insert(layer_id, slab).is_none(),
-            "startup-quantized BF16 layer {layer_id} was preloaded twice"
+            "startup-quantized MTP layer {layer_id} was preloaded twice"
         );
     }
     Ok(preload)
@@ -11524,7 +11805,7 @@ fn cooperative_weight_preload_expert_groups(
         .iter()
         .copied()
         .map(|expert_id| {
-            let suffix = if is_glm52_exl3_recipe(&catalog.facts.quantization_recipe)
+            let suffix = if is_glm_exl3_recipe(&catalog.facts.quantization_recipe)
                 && layer_id < catalog.facts.num_hidden_layers
             {
                 "trellis"
@@ -12609,7 +12890,13 @@ fn queue_route_cuda_exl3_trellis_tp4<'a>(
     files: &mut HashMap<PathBuf, Arc<File>>,
     requests: &mut Vec<RouteCudaExl3ReadRequest<'a>>,
 ) -> Result<()> {
-    let tile_bytes = EXL3_K3_TRELLIS_WORDS_PER_TILE
+    let tile_words = projection
+        .trellis
+        .shape
+        .get(2)
+        .copied()
+        .context("EXL3 trellis tensor is missing its packed tile width")?;
+    let tile_bytes = tile_words
         .checked_mul(std::mem::size_of::<i16>())
         .context("EXL3 trellis tile byte count overflow")?;
     let input_tiles = projection.input_features / EXL3_K3_TRELLIS_TILE;
@@ -12886,6 +13173,7 @@ enum LoadedRouteCudaExl3LayerBytes {
 
 struct LoadedRouteCudaExl3LayerFull {
     expert_ids: Vec<usize>,
+    trellis_bits: usize,
     bytes: LoadedRouteCudaExl3LayerBytes,
     source_bytes: u64,
     source_requests: usize,
@@ -12988,11 +13276,11 @@ fn compact_exl3_trellis_for_shard(
     projection: &str,
     shard: ExpertIntermediateShard,
 ) -> Result<Vec<u8>> {
-    let local_bytes = GLM52_HIDDEN_SIZE
-        .checked_mul(shard.local_rows(GLM52_MOE_INTERMEDIATE_SIZE)?)
-        .and_then(|values| values.checked_mul(GLM52_EXL3_BITS))
-        .and_then(|bits| bits.checked_div(8))
-        .context("EXL3 local trellis byte count overflow")?;
+    anyhow::ensure!(
+        bytes.len() % shard.count == 0,
+        "EXL3 trellis {name} is not evenly TP sharded"
+    );
+    let local_bytes = bytes.len() / shard.count;
     let mut compact = vec![0_u8; local_bytes];
     copy_exl3_trellis_for_shard(name, bytes, projection, shard, &mut compact)?;
     Ok(compact)
@@ -13010,9 +13298,18 @@ fn copy_exl3_trellis_for_shard(
     let local_intermediate_tiles = shard.local_rows(intermediate_tiles)?;
     let shard_start = shard.row_start(intermediate_tiles)?;
     let word_bytes = std::mem::size_of::<i16>();
-    let tile_payload_bytes = EXL3_K3_TRELLIS_WORDS_PER_TILE
-        .checked_mul(word_bytes)
-        .context("EXL3 trellis tile byte count overflow")?;
+    let tile_count = hidden_tiles
+        .checked_mul(intermediate_tiles)
+        .context("EXL3 source trellis tile count overflow")?;
+    anyhow::ensure!(
+        bytes.len() % tile_count == 0,
+        "native EXL3 trellis {name} does not contain whole packed tiles"
+    );
+    let tile_payload_bytes = bytes.len() / tile_count;
+    anyhow::ensure!(
+        tile_payload_bytes % word_bytes == 0,
+        "native EXL3 trellis {name} has a fractional packed word"
+    );
     let expected_bytes = hidden_tiles
         .checked_mul(intermediate_tiles)
         .and_then(|tiles| tiles.checked_mul(tile_payload_bytes))
@@ -13140,11 +13437,12 @@ fn pack_route_cuda_exl3_exchange_rows_with_buffer(
     );
     let source_experts = loaded.expert_ids.len();
     let local_intermediate = GLM52_MOE_INTERMEDIATE_SIZE / world_size;
-    let trellis_stride = GLM52_HIDDEN_SIZE
-        .checked_mul(local_intermediate)
-        .and_then(|values| values.checked_mul(GLM52_EXL3_BITS))
-        .and_then(|bits| bits.checked_div(8))
-        .context("cooperative EXL3 trellis stride overflow")?;
+    let first_trellis = loaded.component(0, EXL3_FULL_GATE_TRELLIS)?;
+    anyhow::ensure!(
+        first_trellis.len() % world_size == 0,
+        "cooperative EXL3 trellis is not evenly TP sharded"
+    );
+    let trellis_stride = first_trellis.len() / world_size;
     let hidden_rotation_stride = GLM52_HIDDEN_SIZE
         .checked_mul(std::mem::size_of::<u16>())
         .context("cooperative EXL3 hidden rotation stride overflow")?;
@@ -13279,12 +13577,15 @@ fn load_route_cuda_exl3_projection_full(
     projection: &'static str,
 ) -> Result<LoadedRouteCudaExl3ProjectionFull> {
     let base_name = routed_quant_projection_base_name(layer_id, expert_id, projection);
+    let trellis_words_per_tile = exl3_bits_for_recipe(&catalog.facts.quantization_recipe)
+        .and_then(|bits| EXL3_K3_TRELLIS_TILE.checked_mul(bits))
+        .context("native EXL3 projection has no supported packed tile width")?;
     let (trellis_shape, suh_width, svh_width) = match projection {
         "gate_proj" | "up_proj" => (
             [
                 GLM52_HIDDEN_SIZE / EXL3_K3_TRELLIS_TILE,
                 GLM52_MOE_INTERMEDIATE_SIZE / EXL3_K3_TRELLIS_TILE,
-                EXL3_K3_TRELLIS_WORDS_PER_TILE,
+                trellis_words_per_tile,
             ],
             GLM52_HIDDEN_SIZE,
             GLM52_MOE_INTERMEDIATE_SIZE,
@@ -13293,7 +13594,7 @@ fn load_route_cuda_exl3_projection_full(
             [
                 GLM52_MOE_INTERMEDIATE_SIZE / EXL3_K3_TRELLIS_TILE,
                 GLM52_HIDDEN_SIZE / EXL3_K3_TRELLIS_TILE,
-                EXL3_K3_TRELLIS_WORDS_PER_TILE,
+                trellis_words_per_tile,
             ],
             GLM52_MOE_INTERMEDIATE_SIZE,
             GLM52_HIDDEN_SIZE,
@@ -13375,6 +13676,8 @@ fn load_route_cuda_exl3_layer_full(
         !expert_ids.is_empty(),
         "cooperative EXL3 layer {layer_id} has no source experts"
     );
+    let trellis_bits = exl3_bits_for_recipe(&catalog.facts.quantization_recipe)
+        .context("cooperative EXL3 source has no supported trellis bitrate")?;
     let mut windows = Vec::with_capacity(expert_ids.len() * EXL3_FULL_COMPONENTS);
     for (source_index, &expert_id) in expert_ids.iter().enumerate() {
         let expert = glm52_exl3_expert(catalog, layer_id, expert_id)?;
@@ -13464,6 +13767,7 @@ fn load_route_cuda_exl3_layer_full(
         let experts = load_route_cuda_exl3_layer_full_parallel(catalog, layer_id, expert_ids)?;
         return Ok(LoadedRouteCudaExl3LayerFull {
             expert_ids: expert_ids.to_vec(),
+            trellis_bits,
             bytes: LoadedRouteCudaExl3LayerBytes::Individual(experts),
             source_bytes,
             source_requests: windows.len(),
@@ -13542,6 +13846,7 @@ fn load_route_cuda_exl3_layer_full(
     );
     let loaded = LoadedRouteCudaExl3LayerFull {
         expert_ids: expert_ids.to_vec(),
+        trellis_bits,
         bytes: LoadedRouteCudaExl3LayerBytes::DirectSpans {
             buffers,
             component_locations,
@@ -13606,6 +13911,7 @@ fn preload_routed_exl3_layer_cuda_cache_cooperative(
     let source_requests = full.source_requests;
     let source_spans = full.source_spans;
     let direct_io = full.direct_io;
+    let trellis_bits = full.trellis_bits;
     let pack_started = Instant::now();
     let mut packed = pack_route_cuda_exl3_exchange_rows_with_buffer(
         &full,
@@ -13623,6 +13929,7 @@ fn preload_routed_exl3_layer_cuda_cache_cooperative(
         expert_ids.len(),
         GLM52_HIDDEN_SIZE,
         local_intermediate,
+        trellis_bits,
     )?);
     let receive_bytes = packed
         .row_stride
@@ -13827,8 +14134,8 @@ pub(in crate::commands::real_full) fn preload_routed_exl3_projection_cuda_cache(
     cache: &mut RouteTensorCache,
 ) -> Result<RouteCudaProjectionPreload> {
     anyhow::ensure!(
-        is_glm52_exl3_recipe(&catalog.facts.quantization_recipe),
-        "native EXL3 preload requires the GLM-5.2 EXL3 recipe"
+        is_glm_exl3_recipe(&catalog.facts.quantization_recipe),
+        "native EXL3 preload requires a supported GLM-5 EXL3 recipe"
     );
     anyhow::ensure!(
         !requests.is_empty(),
@@ -13885,6 +14192,8 @@ pub(in crate::commands::real_full) fn preload_routed_exl3_projection_cuda_cache(
         layer_plans.push((layer_id, expert_ids));
     }
     let mut preload = RouteCudaProjectionPreload::default();
+    let trellis_bits = exl3_bits_for_recipe(&catalog.facts.quantization_recipe)
+        .context("native EXL3 preload has no supported trellis bitrate")?;
     if cooperative {
         let cooperative_started = Instant::now();
         let world_size = cuda_cache
@@ -13984,6 +14293,7 @@ pub(in crate::commands::real_full) fn preload_routed_exl3_projection_cuda_cache(
                 expert_ids.len(),
                 GLM52_HIDDEN_SIZE,
                 local_intermediate,
+                trellis_bits,
             )?);
             let allocation_ms = elapsed_ms(allocation_started);
             let direct_started = Instant::now();
@@ -14405,21 +14715,21 @@ fn validate_packed_nvfp4_projection_shape(
 #[cfg(test)]
 mod tests {
     use super::{
-        b12x_exl3_k3_capacity_rows, b12x_exl3_k3_route_block_rows,
+        b12x_exl3_capacity_rows, b12x_exl3_k3_capacity_rows, b12x_exl3_k3_route_block_rows,
         b12x_projection_scale_shape_supported, b12x_spark_direct_route_shape_supported,
-        b12x_w4a16_capacity_rows, b12x_w4a16_prefill_route_block_rows,
+        b12x_w4a16_capacity_rows, b12x_w4a16_prefill_route_block_rows, bf16_bytes_to_f32,
         canonical_spark_collective_request_id, coalesce_streaming_completion_slices,
         collective_gap_ready, compact_exl3_intermediate_rotation_for_shard,
         compact_exl3_trellis_for_shard, copy_loaded_route_cuda_tensor_compact,
         cuda_reference_kernels_enabled, cuda_reference_kernels_test_override,
-        cuda_route_validation_test_override, execute_nvfp4_route_cached,
-        execute_nvfp4_route_rows_bf16_accumulated_cached,
+        cuda_route_validation_test_override, dequantize_block_fp8_e4m3_to_bf16,
+        execute_nvfp4_route_cached, execute_nvfp4_route_rows_bf16_accumulated_cached,
         execute_nvfp4_route_rows_bf16_accumulated_cached_device_input_device_output,
         execute_nvfp4_route_rows_bf16_accumulated_cached_device_output, f32_values_to_bf16_bytes,
         fused_fp8_reduction_eligible, load_bf16_route_projection_source,
         load_bf16_route_projections_for_group_cached, load_routed_projection_rows_for_shard,
         native_library_path, native_library_path_candidates, pack_route_cuda_exl3_exchange_rows,
-        packed_w4a16_topk8_prefill_eligible, plan_packed_exl3_k3_topk8_prefill_flat,
+        packed_w4a16_topk8_prefill_eligible, plan_packed_exl3_topk8_prefill_flat,
         plan_packed_w4a16_topk8_prefill, plan_packed_w4a16_topk8_prefill_flat,
         queue_route_cuda_exl3_trellis_tp4, read_exact_at_fd, route_cuda_graphs_test_override,
         routed_quant_scalar_metadata_from_loaded, should_use_grouped_route_launches,
@@ -14432,7 +14742,7 @@ mod tests {
         RoutedQuantProjectionKey, ScoredRoute, SparkCollectiveLaunchOrder,
         CPU_REFERENCE_NVFP4_ROUTE_BACKEND, CUDA_REFERENCE_NVFP4_ROUTE_BF16_ACCUMULATED_BACKEND,
         CUDA_REFERENCE_NVFP4_ROUTE_BF16_ACCUMULATED_DEVICE_INPUT_BACKEND,
-        CUDA_REFERENCE_NVFP4_ROUTE_BF16_ACCUMULATED_DEVICE_OUTPUT_BACKEND,
+        CUDA_REFERENCE_NVFP4_ROUTE_BF16_ACCUMULATED_DEVICE_OUTPUT_BACKEND, EXL3_K3_TRELLIS_TILE,
         EXL3_K3_TRELLIS_WORDS_PER_TILE,
     };
     use crate::commands::real_full::coordinator_kernels::{
@@ -14457,6 +14767,30 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|path| path.to_string_lossy().contains("native/build-cuda/")));
+    }
+
+    #[test]
+    fn block_fp8_mtp_dequantization_obeys_sharded_scale_coordinates() -> Result<()> {
+        // The local 2x3 window starts at global row/column (3, 2), so it
+        // crosses a row-scale boundary while also crossing a column-scale
+        // boundary when the synthetic block size is two.
+        let weights = [0x38, 0x40, 0xb8, 0x38, 0x40, 0xb8];
+        let scales = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let bf16 =
+            dequantize_block_fp8_e4m3_to_bf16(&weights, 2, 3, 3, 2, &scales, 3, 3, 2, "fixture")?;
+        let values = bf16_bytes_to_f32(&bf16)?;
+        assert_eq!(values, [5.0, 10.0, -6.0, 8.0, 16.0, -9.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn block_fp8_mtp_dequantization_rounds_bf16_ties_to_even() -> Result<()> {
+        let weights = [0x38, 0x38];
+        let scales = [1.003_906_25, 1.011_718_75];
+        let bf16 =
+            dequantize_block_fp8_e4m3_to_bf16(&weights, 1, 2, 0, 0, &scales, 1, 2, 1, "fixture")?;
+        assert_eq!(bf16_bytes_to_f32(&bf16)?, [1.0, 1.015_625]);
+        Ok(())
     }
 
     #[test]
@@ -14504,58 +14838,53 @@ mod tests {
     }
 
     #[test]
-    fn exl3_tp4_compaction_slices_fc1_output_and_fc2_input_axes() -> Result<()> {
+    fn exl3_tp4_compaction_slices_k3_and_k4_projection_axes() -> Result<()> {
         let shard = ExpertIntermediateShard::new(4, 2)?;
-        let tile_bytes = EXL3_K3_TRELLIS_WORDS_PER_TILE * std::mem::size_of::<i16>();
-        let mut fc1 = vec![0_u8; 384 * 128 * tile_bytes];
-        for hidden_tile in 0..384 {
-            for intermediate_tile in 0..128 {
-                let offset = (hidden_tile * 128 + intermediate_tile) * tile_bytes;
-                let marker = (hidden_tile * 128 + intermediate_tile) as u16;
-                fc1[offset..offset + 2].copy_from_slice(&marker.to_le_bytes());
-            }
-        }
-        let compact_fc1 = compact_exl3_trellis_for_shard("gate", &fc1, "gate_proj", shard)?;
-        assert_eq!(compact_fc1.len(), 384 * 32 * tile_bytes);
-        for hidden_tile in [0, 1, 383] {
-            for local_tile in [0, 1, 31] {
-                let offset = (hidden_tile * 32 + local_tile) * tile_bytes;
-                let actual =
-                    u16::from_le_bytes(compact_fc1[offset..offset + 2].try_into().unwrap());
-                assert_eq!(actual, (hidden_tile * 128 + 64 + local_tile) as u16);
-            }
-        }
-
-        let mut fc2 = vec![0_u8; 128 * 384 * tile_bytes];
-        for intermediate_tile in 0..128 {
+        for trellis_bits in [3, 4] {
+            let tile_bytes = 16 * trellis_bits * std::mem::size_of::<i16>();
+            let mut fc1 = vec![0_u8; 384 * 128 * tile_bytes];
             for hidden_tile in 0..384 {
-                let offset = (intermediate_tile * 384 + hidden_tile) * tile_bytes;
-                let marker = (intermediate_tile * 384 + hidden_tile) as u16;
-                fc2[offset..offset + 2].copy_from_slice(&marker.to_le_bytes());
+                for intermediate_tile in 0..128 {
+                    let offset = (hidden_tile * 128 + intermediate_tile) * tile_bytes;
+                    let marker = (hidden_tile * 128 + intermediate_tile) as u16;
+                    fc1[offset..offset + 2].copy_from_slice(&marker.to_le_bytes());
+                }
             }
-        }
-        let compact_fc2 = compact_exl3_trellis_for_shard("down", &fc2, "down_proj", shard)?;
-        assert_eq!(compact_fc2.len(), 32 * 384 * tile_bytes);
-        for local_tile in [0, 1, 31] {
+            let compact_fc1 = compact_exl3_trellis_for_shard("gate", &fc1, "gate_proj", shard)?;
+            assert_eq!(compact_fc1.len(), 384 * 32 * tile_bytes);
             for hidden_tile in [0, 1, 383] {
-                let offset = (local_tile * 384 + hidden_tile) * tile_bytes;
-                let actual =
-                    u16::from_le_bytes(compact_fc2[offset..offset + 2].try_into().unwrap());
-                assert_eq!(actual, ((64 + local_tile) * 384 + hidden_tile) as u16);
+                for local_tile in [0, 1, 31] {
+                    let offset = (hidden_tile * 32 + local_tile) * tile_bytes;
+                    let actual =
+                        u16::from_le_bytes(compact_fc1[offset..offset + 2].try_into().unwrap());
+                    assert_eq!(actual, (hidden_tile * 128 + 64 + local_tile) as u16);
+                }
+            }
+
+            let mut fc2 = vec![0_u8; 128 * 384 * tile_bytes];
+            for intermediate_tile in 0..128 {
+                for hidden_tile in 0..384 {
+                    let offset = (intermediate_tile * 384 + hidden_tile) * tile_bytes;
+                    let marker = (intermediate_tile * 384 + hidden_tile) as u16;
+                    fc2[offset..offset + 2].copy_from_slice(&marker.to_le_bytes());
+                }
+            }
+            let compact_fc2 = compact_exl3_trellis_for_shard("down", &fc2, "down_proj", shard)?;
+            assert_eq!(compact_fc2.len(), 32 * 384 * tile_bytes);
+            for local_tile in [0, 1, 31] {
+                for hidden_tile in [0, 1, 383] {
+                    let offset = (local_tile * 384 + hidden_tile) * tile_bytes;
+                    let actual =
+                        u16::from_le_bytes(compact_fc2[offset..offset + 2].try_into().unwrap());
+                    assert_eq!(actual, ((64 + local_tile) * 384 + hidden_tile) as u16);
+                }
             }
         }
         Ok(())
     }
 
     #[test]
-    fn exl3_cooperative_exchange_rows_match_each_tp4_compact_view() -> Result<()> {
-        let tile_bytes = EXL3_K3_TRELLIS_WORDS_PER_TILE * std::mem::size_of::<i16>();
-        let fc1_bytes = (0..384 * 128 * tile_bytes)
-            .map(|offset| (offset % 251) as u8)
-            .collect::<Vec<_>>();
-        let fc2_bytes = (0..128 * 384 * tile_bytes)
-            .map(|offset| 193_u8.wrapping_add((offset % 59) as u8))
-            .collect::<Vec<_>>();
+    fn exl3_k3_and_k4_cooperative_exchange_rows_match_each_tp4_view() -> Result<()> {
         let hidden_rotation = (0..GLM52_HIDDEN_SIZE as u16)
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
@@ -14565,58 +14894,84 @@ mod tests {
         let projection = |trellis: Vec<u8>, suh: Vec<u8>, svh: Vec<u8>| {
             LoadedRouteCudaExl3ProjectionFull { trellis, suh, svh }
         };
-        let expert = LoadedRouteCudaExl3ExpertFull {
-            gate: projection(
-                fc1_bytes.clone(),
-                hidden_rotation.clone(),
-                intermediate_rotation.clone(),
-            ),
-            up: projection(
-                fc1_bytes,
-                hidden_rotation.clone(),
-                intermediate_rotation.clone(),
-            ),
-            down: projection(fc2_bytes, intermediate_rotation, hidden_rotation),
-        };
+        for trellis_bits in [3, 4] {
+            let tile_bytes = 16 * trellis_bits * std::mem::size_of::<i16>();
+            let fc1_bytes = (0..384 * 128 * tile_bytes)
+                .map(|offset| (offset % 251) as u8)
+                .collect::<Vec<_>>();
+            let fc2_bytes = (0..128 * 384 * tile_bytes)
+                .map(|offset| 193_u8.wrapping_add((offset % 59) as u8))
+                .collect::<Vec<_>>();
+            let expert = LoadedRouteCudaExl3ExpertFull {
+                gate: projection(
+                    fc1_bytes.clone(),
+                    hidden_rotation.clone(),
+                    intermediate_rotation.clone(),
+                ),
+                up: projection(
+                    fc1_bytes,
+                    hidden_rotation.clone(),
+                    intermediate_rotation.clone(),
+                ),
+                down: projection(
+                    fc2_bytes,
+                    intermediate_rotation.clone(),
+                    hidden_rotation.clone(),
+                ),
+            };
 
-        let loaded = LoadedRouteCudaExl3LayerFull {
-            expert_ids: vec![0],
-            bytes: LoadedRouteCudaExl3LayerBytes::Individual(vec![expert]),
-            source_bytes: 0,
-            source_requests: 0,
-            source_spans: 0,
-            direct_io: false,
-        };
-        let packed = pack_route_cuda_exl3_exchange_rows(&loaded, 4)?;
-        let expert = match &loaded.bytes {
-            LoadedRouteCudaExl3LayerBytes::Individual(experts) => &experts[0],
-            LoadedRouteCudaExl3LayerBytes::DirectSpans { .. } => unreachable!(),
-        };
-        assert_eq!(packed.bytes.len(), packed.row_stride * 4);
-        for rank in 0..4 {
-            let shard = ExpertIntermediateShard::new(4, rank)?;
-            let row = &packed.bytes[rank * packed.row_stride..(rank + 1) * packed.row_stride];
-            let expected_gate =
-                compact_exl3_trellis_for_shard("gate", &expert.gate.trellis, "gate_proj", shard)?;
-            assert_eq!(
-                &row[packed.gate_trellis_offset
-                    ..packed.gate_trellis_offset + packed.trellis_stride],
-                expected_gate
-            );
-            let expected_down =
-                compact_exl3_trellis_for_shard("down", &expert.down.trellis, "down_proj", shard)?;
-            assert_eq!(
-                &row[packed.down_trellis_offset
-                    ..packed.down_trellis_offset + packed.trellis_stride],
-                expected_down
-            );
-            let expected_rotation =
-                compact_exl3_intermediate_rotation_for_shard("gate.svh", &expert.gate.svh, shard)?;
-            assert_eq!(
-                &row[packed.intermediate_rotations_offset
-                    ..packed.intermediate_rotations_offset + expected_rotation.len()],
-                expected_rotation
-            );
+            let loaded = LoadedRouteCudaExl3LayerFull {
+                expert_ids: vec![0],
+                trellis_bits,
+                bytes: LoadedRouteCudaExl3LayerBytes::Individual(vec![expert]),
+                source_bytes: 0,
+                source_requests: 0,
+                source_spans: 0,
+                direct_io: false,
+            };
+            let packed = pack_route_cuda_exl3_exchange_rows(&loaded, 4)?;
+            let expert = match &loaded.bytes {
+                LoadedRouteCudaExl3LayerBytes::Individual(experts) => &experts[0],
+                LoadedRouteCudaExl3LayerBytes::DirectSpans { .. } => unreachable!(),
+            };
+            assert_eq!(packed.bytes.len(), packed.row_stride * 4);
+            assert_eq!(packed.trellis_stride, 384 * 32 * tile_bytes);
+            for rank in 0..4 {
+                let shard = ExpertIntermediateShard::new(4, rank)?;
+                let row = &packed.bytes[rank * packed.row_stride..(rank + 1) * packed.row_stride];
+                let expected_gate = compact_exl3_trellis_for_shard(
+                    "gate",
+                    &expert.gate.trellis,
+                    "gate_proj",
+                    shard,
+                )?;
+                assert_eq!(
+                    &row[packed.gate_trellis_offset
+                        ..packed.gate_trellis_offset + packed.trellis_stride],
+                    expected_gate
+                );
+                let expected_down = compact_exl3_trellis_for_shard(
+                    "down",
+                    &expert.down.trellis,
+                    "down_proj",
+                    shard,
+                )?;
+                assert_eq!(
+                    &row[packed.down_trellis_offset
+                        ..packed.down_trellis_offset + packed.trellis_stride],
+                    expected_down
+                );
+                let expected_rotation = compact_exl3_intermediate_rotation_for_shard(
+                    "gate.svh",
+                    &expert.gate.svh,
+                    shard,
+                )?;
+                assert_eq!(
+                    &row[packed.intermediate_rotations_offset
+                        ..packed.intermediate_rotations_offset + expected_rotation.len()],
+                    expected_rotation
+                );
+            }
         }
         Ok(())
     }
@@ -14626,52 +14981,6 @@ mod tests {
         const HIDDEN: usize = 6_144;
         const INTERMEDIATE: usize = 2_048;
         const LOCAL_INTERMEDIATE: usize = 512;
-        let tile_bytes = EXL3_K3_TRELLIS_WORDS_PER_TILE * std::mem::size_of::<i16>();
-        let tempdir = tempfile::tempdir()?;
-        let source_path = tempdir.path().join("trellis.bin");
-        let gate_bytes = (0..(HIDDEN / 16) * (INTERMEDIATE / 16) * tile_bytes)
-            .map(|offset| ((offset / tile_bytes) % 251) as u8)
-            .collect::<Vec<_>>();
-        let down_bytes = (0..(INTERMEDIATE / 16) * (HIDDEN / 16) * tile_bytes)
-            .map(|offset| 193_u8.wrapping_add(((offset / tile_bytes) % 59) as u8))
-            .collect::<Vec<_>>();
-        let mut source = File::create(&source_path)?;
-        source.write_all(&gate_bytes)?;
-        source.write_all(&down_bytes)?;
-        drop(source);
-        let tensor = |name: &str, byte_offset: usize, shape: Vec<usize>, bytes: usize| TensorInfo {
-            name: name.to_owned(),
-            file: "trellis.bin".to_owned(),
-            dtype: DType::I16,
-            shape,
-            byte_offset: byte_offset as u64,
-            byte_length: bytes as u64,
-            role: TensorRole::RoutedExpert,
-            layer_id: Some(3),
-            expert_id: Some(0),
-            is_quantization_metadata: false,
-        };
-        let gate = tensor(
-            "gate.trellis",
-            0,
-            vec![
-                HIDDEN / 16,
-                INTERMEDIATE / 16,
-                EXL3_K3_TRELLIS_WORDS_PER_TILE,
-            ],
-            gate_bytes.len(),
-        );
-        let down = tensor(
-            "down.trellis",
-            gate_bytes.len(),
-            vec![
-                INTERMEDIATE / 16,
-                HIDDEN / 16,
-                EXL3_K3_TRELLIS_WORDS_PER_TILE,
-            ],
-            down_bytes.len(),
-        );
-        let shard = ExpertIntermediateShard::new(4, 2)?;
         fn projection<'a>(
             kind: Glm52Exl3ProjectionKind,
             trellis: &'a TensorInfo,
@@ -14688,55 +14997,98 @@ mod tests {
                 output_features,
             }
         }
-        let compact_bytes = HIDDEN * LOCAL_INTERMEDIATE * 3 / 8;
-        let mut compact_gate = vec![0_u8; compact_bytes];
-        let mut compact_down = vec![0_u8; compact_bytes];
-        let mut files = HashMap::new();
-        let mut requests = Vec::new();
-        queue_route_cuda_exl3_trellis_tp4(
-            tempdir.path(),
-            projection(Glm52Exl3ProjectionKind::Gate, &gate, HIDDEN, INTERMEDIATE),
-            shard,
-            LOCAL_INTERMEDIATE,
-            &mut compact_gate,
-            &mut files,
-            &mut requests,
-        )?;
-        assert_eq!(requests.len(), HIDDEN / 16);
-        assert_eq!(
-            requests.iter().map(|request| request.bytes).sum::<usize>(),
-            compact_bytes
-        );
-        queue_route_cuda_exl3_trellis_tp4(
-            tempdir.path(),
-            projection(Glm52Exl3ProjectionKind::Down, &down, INTERMEDIATE, HIDDEN),
-            shard,
-            LOCAL_INTERMEDIATE,
-            &mut compact_down,
-            &mut files,
-            &mut requests,
-        )?;
-        assert_eq!(requests.len(), HIDDEN / 16 + 1);
-        let mut source_reader = RouteCudaExl3ReadExecutor::new();
-        source_reader.execute(&requests)?;
-        compact_gate.fill(0);
-        compact_down.fill(0);
-        source_reader.execute(&requests)?;
 
-        let source_row_bytes = (INTERMEDIATE / 16) * tile_bytes;
-        let local_row_bytes = (LOCAL_INTERMEDIATE / 16) * tile_bytes;
-        for input_tile in 0..HIDDEN / 16 {
-            let source_start = input_tile * source_row_bytes + shard.rank * local_row_bytes;
-            let compact_start = input_tile * local_row_bytes;
+        for trellis_bits in [3, 4] {
+            let trellis_words_per_tile = EXL3_K3_TRELLIS_TILE * trellis_bits;
+            let tile_bytes = trellis_words_per_tile * std::mem::size_of::<i16>();
+            let tempdir = tempfile::tempdir()?;
+            let source_path = tempdir.path().join("trellis.bin");
+            let gate_bytes = (0..(HIDDEN / 16) * (INTERMEDIATE / 16) * tile_bytes)
+                .map(|offset| ((offset / tile_bytes) % 251) as u8)
+                .collect::<Vec<_>>();
+            let down_bytes = (0..(INTERMEDIATE / 16) * (HIDDEN / 16) * tile_bytes)
+                .map(|offset| 193_u8.wrapping_add(((offset / tile_bytes) % 59) as u8))
+                .collect::<Vec<_>>();
+            let mut source = File::create(&source_path)?;
+            source.write_all(&gate_bytes)?;
+            source.write_all(&down_bytes)?;
+            drop(source);
+            let tensor =
+                |name: &str, byte_offset: usize, shape: Vec<usize>, bytes: usize| TensorInfo {
+                    name: name.to_owned(),
+                    file: "trellis.bin".to_owned(),
+                    dtype: DType::I16,
+                    shape,
+                    byte_offset: byte_offset as u64,
+                    byte_length: bytes as u64,
+                    role: TensorRole::RoutedExpert,
+                    layer_id: Some(3),
+                    expert_id: Some(0),
+                    is_quantization_metadata: false,
+                };
+            let gate = tensor(
+                "gate.trellis",
+                0,
+                vec![HIDDEN / 16, INTERMEDIATE / 16, trellis_words_per_tile],
+                gate_bytes.len(),
+            );
+            let down = tensor(
+                "down.trellis",
+                gate_bytes.len(),
+                vec![INTERMEDIATE / 16, HIDDEN / 16, trellis_words_per_tile],
+                down_bytes.len(),
+            );
+            let shard = ExpertIntermediateShard::new(4, 2)?;
+            let compact_bytes = HIDDEN * LOCAL_INTERMEDIATE * trellis_bits / 8;
+            let mut compact_gate = vec![0_u8; compact_bytes];
+            let mut compact_down = vec![0_u8; compact_bytes];
+            let mut files = HashMap::new();
+            let mut requests = Vec::new();
+            queue_route_cuda_exl3_trellis_tp4(
+                tempdir.path(),
+                projection(Glm52Exl3ProjectionKind::Gate, &gate, HIDDEN, INTERMEDIATE),
+                shard,
+                LOCAL_INTERMEDIATE,
+                &mut compact_gate,
+                &mut files,
+                &mut requests,
+            )?;
+            assert_eq!(requests.len(), HIDDEN / 16);
             assert_eq!(
-                &compact_gate[compact_start..compact_start + local_row_bytes],
-                &gate_bytes[source_start..source_start + local_row_bytes]
+                requests.iter().map(|request| request.bytes).sum::<usize>(),
+                compact_bytes
+            );
+            queue_route_cuda_exl3_trellis_tp4(
+                tempdir.path(),
+                projection(Glm52Exl3ProjectionKind::Down, &down, INTERMEDIATE, HIDDEN),
+                shard,
+                LOCAL_INTERMEDIATE,
+                &mut compact_down,
+                &mut files,
+                &mut requests,
+            )?;
+            assert_eq!(requests.len(), HIDDEN / 16 + 1);
+            let mut source_reader = RouteCudaExl3ReadExecutor::new();
+            source_reader.execute(&requests)?;
+            compact_gate.fill(0);
+            compact_down.fill(0);
+            source_reader.execute(&requests)?;
+
+            let source_row_bytes = (INTERMEDIATE / 16) * tile_bytes;
+            let local_row_bytes = (LOCAL_INTERMEDIATE / 16) * tile_bytes;
+            for input_tile in 0..HIDDEN / 16 {
+                let source_start = input_tile * source_row_bytes + shard.rank * local_row_bytes;
+                let compact_start = input_tile * local_row_bytes;
+                assert_eq!(
+                    &compact_gate[compact_start..compact_start + local_row_bytes],
+                    &gate_bytes[source_start..source_start + local_row_bytes]
+                );
+            }
+            assert_eq!(
+                compact_down,
+                down_bytes[shard.rank * compact_bytes..(shard.rank + 1) * compact_bytes]
             );
         }
-        assert_eq!(
-            compact_down,
-            down_bytes[shard.rank * compact_bytes..(shard.rank + 1) * compact_bytes]
-        );
         Ok(())
     }
 
@@ -15023,6 +15375,19 @@ mod tests {
     }
 
     #[test]
+    fn exl3_k4_workspace_capacity_retains_every_exact_small_m_kernel() -> Result<()> {
+        for rows in 1..=32 {
+            assert_eq!(b12x_exl3_capacity_rows(rows, 4)?, rows);
+        }
+        assert_eq!(b12x_exl3_capacity_rows(33, 4)?, 64);
+        assert_eq!(b12x_exl3_capacity_rows(257, 4)?, 257);
+        assert_eq!(b12x_exl3_capacity_rows(258, 4)?, 512);
+        assert_eq!(b12x_exl3_capacity_rows(2_049, 4)?, 2_064);
+        assert!(b12x_exl3_capacity_rows(1, 5).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn packed_w4a16_prefill_uses_exported_route_block_regimes() {
         assert_eq!(b12x_w4a16_prefill_route_block_rows(2), 8);
         assert_eq!(b12x_w4a16_prefill_route_block_rows(8), 8);
@@ -15057,7 +15422,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let exl3 = plan_packed_exl3_k3_topk8_prefill_flat(256, &routes)?;
+        let exl3 = plan_packed_exl3_topk8_prefill_flat(256, &routes, 3)?;
         let w4a16 = plan_packed_w4a16_topk8_prefill_flat(256, &routes)?;
 
         assert_eq!(exl3.block_expert_ids.len(), 128);
@@ -15080,7 +15445,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let plan = plan_packed_exl3_k3_topk8_prefill_flat(2_064, &routes)?;
+        let plan = plan_packed_exl3_topk8_prefill_flat(2_064, &routes, 3)?;
 
         assert_eq!(plan.packed_route_indices.len(), 32_640);
         assert_eq!(plan.block_expert_ids.len(), 510);
@@ -15115,7 +15480,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let plan = plan_packed_exl3_k3_topk8_prefill_flat(1, &routes)?;
+        let plan = plan_packed_exl3_topk8_prefill_flat(1, &routes, 3)?;
 
         assert_eq!(plan.direct_topk_ids, (0..8).collect::<Vec<_>>());
         assert_eq!(plan.block_expert_ids, (0..8).collect::<Vec<_>>());

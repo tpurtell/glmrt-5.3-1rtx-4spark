@@ -16,6 +16,9 @@ assert SPEC is not None and SPEC.loader is not None
 TOOL = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = TOOL
 SPEC.loader.exec_module(TOOL)
+NATIVE_VALIDATOR_SHA256 = hashlib.sha256(
+    (ROOT / "python" / "tools" / "validate_b12x_exl3_native.py").read_bytes()
+).hexdigest()
 
 
 def signed(path: Path, body: dict) -> Path:
@@ -43,6 +46,9 @@ def native_validations(root: Path) -> tuple[list[Path], dict]:
             {
                 "schema": "glmrt-b12x-exl3-native-validation-v1",
                 "status": "accepted",
+                "script_sha256": NATIVE_VALIDATOR_SHA256,
+                "expert_slot_fingerprint": "2" * 64,
+                "trellis_bits": 3,
                 "sparkinfer_revision": "3" * 40,
                 "native_library": library_identity,
                 "device": {
@@ -96,6 +102,8 @@ def native_validations(root: Path) -> tuple[list[Path], dict]:
         )
         paths.append(path)
     summary = {
+        "expert_slot_fingerprint": "2" * 64,
+        "trellis_bits": 3,
         "tp_ranks": [0, 1, 2, 3],
         "layer_id": 3,
         "checkpoint_inventory_sha256": "f" * 64,

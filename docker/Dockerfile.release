@@ -23,7 +23,7 @@ RUN python3 -m pip install --no-cache-dir uv && \
     uv pip install --system --break-system-packages --no-cache \
       safetensors \
       huggingface-hub \
-      "nvidia-cutlass-dsl[cu13]==4.6.1" \
+      "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
       "cuda-tile==1.5.0" \
       "nvidia-cudnn-frontend==1.26.0" \
@@ -56,7 +56,8 @@ ENV GLMRT_CUDA_ARCH=${CUDA_ARCH}
 ENV GLMRT_ENGINE_COMMIT=${GLMRT_ENGINE_COMMIT}
 ENV GLMRT_SPARKINFER_COMMIT=${GLMRT_SPARKINFER_COMMIT}
 
-LABEL org.opencontainers.image.title="GLMRT inference"
+LABEL org.opencontainers.image.title="GLMRT GLM-5.3 inference"
+LABEL org.opencontainers.image.source="https://github.com/tpurtell/glmrt-5.3-1rtx-4spark"
 LABEL org.opencontainers.image.revision=${GLMRT_ENGINE_COMMIT}
 LABEL io.glmrt.role=${GLMRT_ROLE}
 LABEL io.glmrt.cuda_arch=${CUDA_ARCH}
@@ -120,7 +121,7 @@ RUN cmp -s \
       /opt/glmrt/bin/glmrt \
       /opt/glmrt/scripts/real-full-tcp-serve.sh \
       /usr/local/bin/glmrt-release-entrypoint && \
-    python3 -c 'import b12x_mla_capture, b12x_spark_capture, dspark_capture, dspark_body_capture, dspark_head_capture, dspark_update_capture, triton_kv_pack_capture, triton_mlp_capture, triton_router_capture, triton_sampling_capture'
+    python3 -c 'import b12x_mla_capture, b12x_spark_capture, dflash_head_capture, dflash_tuning_profile, dspark_capture, dspark_body_capture, dspark_head_capture, dspark_update_capture, triton_kv_pack_capture, triton_mlp_capture, triton_router_capture, triton_sampling_capture'
 
 WORKDIR /opt/glmrt
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/glmrt-release-entrypoint"]

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from real_full_matrix import MODEL_ID, default_tokenizer_path
+
 
 @dataclass(frozen=True)
 class Fixture:
@@ -42,11 +44,63 @@ FIXTURES = {
 }
 
 
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while block := source.read(8 * 1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def concurrency_contract(
+    *,
+    model: str,
+    fixture_name: str,
+    concurrency: int,
+    warmups: int,
+    repeats: int,
+    cache_state: str,
+    nonce_seed: int,
+    tokenizer_sha256: str | None,
+    batches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    fixture = FIXTURES[fixture_name]
+    return {
+        "model": model,
+        "fixture": fixture_name,
+        "prompt": fixture.prompt,
+        "max_tokens": fixture.max_tokens,
+        "enable_thinking": False,
+        "concurrency": concurrency,
+        "warmups": warmups,
+        "repeats": repeats,
+        "cache_state": cache_state,
+        "nonce_seed": nonce_seed,
+        "tokenizer_sha256": tokenizer_sha256,
+        "request_sha256": [
+            [lane["request_sha256"] for lane in batch["lanes"]]
+            for batch in batches
+        ],
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixture", choices=FIXTURES)
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/chat/completions")
-    parser.add_argument("--model", default="lukealonso/GLM-5.2-NVFP4")
+    parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
@@ -75,7 +129,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "tokenizer.json used to verify nonce tokens; defaults to the local "
-            "lukealonso Hugging Face snapshot"
+            "Hugging Face snapshot for --model"
         ),
     )
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -98,27 +152,10 @@ def payload(model: str, fixture: Fixture, prompt_prefix: str = "") -> bytes:
                 {"role": "user", "content": f"{prompt_prefix}{fixture.prompt}"}
             ],
             "temperature": 0,
+            "enable_thinking": False,
             "max_tokens": fixture.max_tokens,
         }
     ).encode()
-
-
-def default_tokenizer_path() -> Path:
-    snapshot_root = (
-        Path.home()
-        / ".cache"
-        / "huggingface"
-        / "hub"
-        / "models--lukealonso--GLM-5.2-NVFP4"
-        / "snapshots"
-    )
-    candidates = sorted(snapshot_root.glob("*/tokenizer.json"))
-    if not candidates:
-        raise SystemExit(
-            "--tokenizer is required because the local lukealonso tokenizer "
-            f"was not found below {snapshot_root}"
-        )
-    return candidates[-1]
 
 
 def token_zero_nonces(
@@ -144,7 +181,7 @@ def token_zero_nonces(
     for offset in range(candidate_count):
         codepoint = first_codepoint + ((start + offset) % candidate_count)
         marker = chr(codepoint)
-        prefix = f"{marker} request nonce {seed}-{len(nonces)}.\\n"
+        prefix = f"{marker} request nonce {seed}-{len(nonces)}.\n"
         encoded = tokenizer.encode(prefix, add_special_tokens=False).ids
         if not encoded or encoded[0] in seen_token_ids:
             continue
@@ -310,6 +347,9 @@ def execute_batch(
     ]
     for lane in lanes:
         nonce = prompt_nonces[lane["lane"]]
+        lane["request_sha256"] = hashlib.sha256(
+            request_payloads[lane["lane"]]
+        ).hexdigest()
         lane["prompt_nonce"] = (
             None
             if nonce is None
@@ -359,7 +399,7 @@ def main() -> None:
     fixture = FIXTURES[args.fixture]
     request_count = (args.warmups + args.repeats) * args.concurrency
     if args.cache_state == "token-zero-nonce":
-        tokenizer_path = args.tokenizer or default_tokenizer_path()
+        tokenizer_path = args.tokenizer or default_tokenizer_path(args.model)
         nonce_bank: list[dict[str, Any] | None] = token_zero_nonces(
             count=request_count,
             seed=args.nonce_seed,
@@ -444,7 +484,23 @@ def main() -> None:
     response_window_samples = [
         batch["aggregate_response_window_tps"] for batch in batches
     ]
+    tokenizer_sha256 = (
+        None if tokenizer_path is None else hash_file(Path(tokenizer_path).resolve())
+    )
+    contract = concurrency_contract(
+        model=args.model,
+        fixture_name=args.fixture,
+        concurrency=args.concurrency,
+        warmups=args.warmups,
+        repeats=args.repeats,
+        cache_state=args.cache_state,
+        nonce_seed=args.nonce_seed,
+        tokenizer_sha256=tokenizer_sha256,
+        batches=[*warmups, *batches],
+    )
     summary = {
+        "schema": "glmrt-decode-concurrency-summary-v1",
+        "model": args.model,
         "fixture": args.fixture,
         "concurrency": args.concurrency,
         "warmups": args.warmups,
@@ -452,6 +508,9 @@ def main() -> None:
         "cache_state": args.cache_state,
         "nonce_seed": args.nonce_seed,
         "tokenizer": None if tokenizer_path is None else str(tokenizer_path),
+        "tokenizer_sha256": tokenizer_sha256,
+        "request_contract_sha256": canonical_sha256(contract),
+        "request_contract": contract,
         "mean_aggregate_decode_tps": statistics.mean(samples),
         "median_aggregate_decode_tps": statistics.median(samples),
         "min_aggregate_decode_tps": min(samples),

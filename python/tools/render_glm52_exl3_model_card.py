@@ -153,6 +153,12 @@ def render_section(
         for value in (blended, repeat, prefill, tools, startup, native)
     ):
         raise ModelCardError("serving report has incomplete result groups")
+    if (
+        native.get("trellis_bits") != 3
+        or native.get("expert_slot_fingerprint")
+        != serving.get("runtime", {}).get("expert_slot_fingerprint")
+    ):
+        raise ModelCardError("serving report native evidence is not EXL3 K3")
     if blended.get("candidate_all_quality_contracts_passed") is not True:
         raise ModelCardError("serving report does not prove candidate semantic contracts")
     semantic_cases = integer(blended.get("cases"), "semantic contract cases")
@@ -357,6 +363,9 @@ def render(
             expected_checkpoint_root=Path(
                 artifact["projection_checkpoint"]["root"]
             ).expanduser().resolve(),
+            expected_expert_slot_fingerprint=runtime[
+                "expert_slot_fingerprint"
+            ],
         )
     except (QualificationError, KeyError, TypeError) as error:
         raise ModelCardError(

@@ -19,7 +19,7 @@ import urllib.request
 from tokenizers import Tokenizer
 
 
-MODEL_ID = "lukealonso/GLM-5.2-NVFP4"
+from real_full_matrix import MODEL_ID, default_tokenizer_path
 DEFAULT_CHECKPOINTS = (
     1_024,
     8_192,
@@ -77,25 +77,6 @@ def merge_spans(spans: list[Span]) -> list[Span]:
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
-
-
-def default_tokenizer_path() -> Path:
-    cache_root = Path(
-        os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")
-    )
-    candidates = sorted(
-        (
-            cache_root
-            / "hub"
-            / "models--lukealonso--GLM-5.2-NVFP4"
-            / "snapshots"
-        ).glob("*/tokenizer.json")
-    )
-    if not candidates:
-        raise FileNotFoundError(
-            "no local GLM-5.2-NVFP4 tokenizer.json; pass --tokenizer"
-        )
-    return candidates[-1]
 
 
 def parse_checkpoint(value: str) -> int:
@@ -778,7 +759,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = repo_root()
-    tokenizer_path = (args.tokenizer or default_tokenizer_path()).resolve()
+    tokenizer_path = (args.tokenizer or default_tokenizer_path(args.model)).resolve()
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     corpus, corpus_sha256, source_manifest = load_corpus(args.source)
     corpus_ids = tokenizer.encode(corpus, add_special_tokens=False).ids

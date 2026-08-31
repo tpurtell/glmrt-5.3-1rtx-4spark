@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quantize GLM-5.2 base routed experts to calibrated EXL3 K3."""
+"""Quantize supported GLM-5 base routed experts to calibrated EXL3."""
 
 from __future__ import annotations
 
@@ -8,9 +8,11 @@ from contextlib import contextmanager
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,13 +37,25 @@ from glm52_execution_upgrade import (
 from preflight import report_identity_sha256
 
 LEGACY_PLAN_SCHEMA = "glmrt-glm52-gptqmodel-plan-v1"
-PLAN_SCHEMA = "glmrt-glm52-gptqmodel-plan-v2"
-SUPPORTED_PLAN_SCHEMAS = frozenset((LEGACY_PLAN_SCHEMA, PLAN_SCHEMA))
-RUN_SCHEMA = "glmrt-glm52-gptqmodel-run-v1"
-ARTIFACT_MANIFEST_SCHEMA = "glmrt-glm52-gptqmodel-artifact-v1"
+GLM52_PLAN_SCHEMA = "glmrt-glm52-gptqmodel-plan-v2"
+PLAN_SCHEMA = "glmrt-glm5-gptqmodel-plan-v3"
+SUPPORTED_PLAN_SCHEMAS = frozenset(
+    (LEGACY_PLAN_SCHEMA, GLM52_PLAN_SCHEMA, PLAN_SCHEMA)
+)
+LEGACY_RUN_SCHEMA = "glmrt-glm52-gptqmodel-run-v1"
+RUN_SCHEMA = "glmrt-glm5-gptqmodel-run-v2"
+LEGACY_ARTIFACT_MANIFEST_SCHEMA = "glmrt-glm52-gptqmodel-artifact-v1"
+ARTIFACT_MANIFEST_SCHEMA = "glmrt-glm5-gptqmodel-artifact-v2"
 CALIBRATION_MANIFEST_SCHEMA = "ds4rt-flash-exl3-calibration-corpus-v3"
 ROUTE_QUALIFICATION_INLINE = "inline-full-corpus"
-NATURAL_ROUTE_RECIPE = "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1"
+GLM52_NATURAL_ROUTE_RECIPE = (
+    "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1"
+)
+GLM53_NATURAL_ROUTE_RECIPE = (
+    "glm53_exl3_trellis_4bpw_calibrated_natural_route_v1"
+)
+# Compatibility alias used by the existing K3 evidence and tests.
+NATURAL_ROUTE_RECIPE = GLM52_NATURAL_ROUTE_RECIPE
 ROUTE_EVIDENCE_CONTRACT = "ds4rt.exl3-natural-route"
 ZERO_ROUTE_RECOVERY_CONTRACT = "ds4rt.exl3-zero-route-recovery"
 ZERO_ROUTE_RECOVERY_TRIGGER = "natural-route-count-below-1024"
@@ -82,6 +96,7 @@ BASE_EXPERT_PATTERN = (
 )
 EXL3_SEED = 787
 EXL3_SIGMA_REG = 0.025
+EXL3_MCG_MULTIPLIER = 0xCBAC1FED
 EXL3_HESSIAN_CAPTURE_CONTRACT = "raw-xtx-sum-fp32-v1"
 EXL3_HESSIAN_NUMERICAL_CONTRACT = "signed-block-hadamard-congruence-fp64-v1"
 EXL3_HESSIAN_SYMMETRY_CONTRACT = "mean-with-transpose-fp64"
@@ -89,6 +104,7 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 HF_BLOB_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 TOKENIZER_SOURCE_FILES = ("tokenizer.json", "tokenizer_config.json")
+EXACT_SOURCE_METADATA_FILES = (*TOKENIZER_SOURCE_FILES, "generation_config.json")
 PREFLIGHT_ROLE_CONTRACTS = {
     "coordinator": ("linux/amd64", "120"),
     "expert": ("linux/arm64", "121"),
@@ -120,7 +136,7 @@ BOUNDARY_DIRECTORY_RE = re.compile(
 )
 FORWARD_REPLICA_POLICY = "serialized-deepcopy-v1"
 FORWARD_REPLICA_ENV = "GPTQMODEL_USE_TORCH_REPLICATE"
-STORAGE_CONTRACT = "glmrt-glm52-exl3-storage-v1"
+STORAGE_CONTRACT = "glmrt-glm5-exl3-storage-v2"
 ARTIFACT_EXPORT_OVERHEAD_BYTES = 4 * 1024**3
 PROJECTION_CHECKPOINT_OVERHEAD_BYTES = 2 * 1024**3
 RUN_STATE_PEAK_BYTES = 128 * 1024**3
@@ -141,7 +157,6 @@ def exllamav3_jit_cache_scope(root: Path):
     previous = os.environ.get(variable)
     if previous not in {None, expected}:
         raise LaunchError(f"{variable} conflicts with the immutable run state")
-    root.mkdir(parents=True, exist_ok=True)
     os.environ[variable] = expected
     try:
         yield
@@ -152,10 +167,45 @@ def exllamav3_jit_cache_scope(root: Path):
             os.environ[variable] = previous
 
 
+def quantization_variant(source: dict[str, Any], bits: int) -> dict[str, str]:
+    """Select only the two reviewed GLM source/EXL3 production pairings."""
+
+    release = source.get("release")
+    source_format = source.get("format")
+    if (release, source_format, bits) == ("glm-5.2", "bf16", 3):
+        return {
+            "recipe": GLM52_NATURAL_ROUTE_RECIPE,
+            "operator_contract": "glmrt-glm52-base-routed-exl3-k3-v1",
+        }
+    if (release, source_format, bits) == (
+        "glm-5.3",
+        "fp8-e4m3-block128x128-dynamic",
+        4,
+    ):
+        return {
+            "recipe": GLM53_NATURAL_ROUTE_RECIPE,
+            "operator_contract": "glmrt-glm53-base-routed-exl3-k4-v1",
+        }
+    raise LaunchError(
+        "supported production pairings are GLM-5.2 BF16 -> EXL3 K3 and "
+        "GLM-5.3 block-FP8 -> EXL3 K4"
+    )
+
+
 def natural_route_recipe(bits: int) -> str:
+    """Return a recipe by bitrate for compatibility with older callers."""
+
     if bits == 3:
-        return NATURAL_ROUTE_RECIPE
-    raise LaunchError("the GLM-5.2 production recipe requires EXL3 K3")
+        return GLM52_NATURAL_ROUTE_RECIPE
+    if bits == 4:
+        return GLM53_NATURAL_ROUTE_RECIPE
+    raise LaunchError("supported GLM production recipes require EXL3 K3 or K4")
+
+
+def artifact_contract_schemas(plan: dict[str, Any]) -> tuple[str, str]:
+    if plan.get("schema") in {LEGACY_PLAN_SCHEMA, GLM52_PLAN_SCHEMA}:
+        return LEGACY_RUN_SCHEMA, LEGACY_ARTIFACT_MANIFEST_SCHEMA
+    return RUN_SCHEMA, ARTIFACT_MANIFEST_SCHEMA
 
 
 @contextmanager
@@ -357,8 +407,37 @@ def source_metadata_identity(snapshot: Path, name: str) -> dict[str, Any]:
     return identity
 
 
+def source_variant(config: dict[str, Any]) -> dict[str, Any]:
+    """Identify the reviewed full-model GLM source format."""
+
+    quantization = config.get("quantization_config")
+    if quantization is None:
+        return {
+            "release": "glm-5.2",
+            "format": "bf16",
+            "quantization_config_sha256": None,
+        }
+    if not isinstance(quantization, dict):
+        raise LaunchError("source quantization_config is not an object")
+    required = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    if any(quantization.get(key) != value for key, value in required.items()):
+        raise LaunchError("source uses an unsupported quantization format")
+    return {
+        "release": "glm-5.3",
+        "format": "fp8-e4m3-block128x128-dynamic",
+        "quantization_config_sha256": hashlib.sha256(
+            canonical_json(quantization)
+        ).hexdigest(),
+    }
+
+
 def snapshot_identity(snapshot: Path) -> dict[str, Any]:
-    """Bind the immutable GLM-5.2 source and its exact tensor inventory."""
+    """Bind an immutable supported GLM-5 source and its tensor inventory."""
 
     snapshot = snapshot.expanduser().resolve(strict=True)
     if not snapshot.is_dir() or not REVISION_RE.fullmatch(snapshot.name):
@@ -416,9 +495,14 @@ def snapshot_identity(snapshot: Path) -> dict[str, Any]:
         or config.get("architectures") != ["GlmMoeDsaForCausalLM"]
     ):
         raise LaunchError(
-            f"source snapshot is not supported GLM-5.2 geometry: {geometry}"
+            f"source snapshot is not supported GLM-5 geometry: {geometry}"
         )
-    namespace_audit = glm52_namespace_audit(config, weight_map)
+    variant = source_variant(config)
+    namespace_audit = glm52_namespace_audit(
+        config,
+        weight_map,
+        source_format=variant["format"],
+    )
     return {
         "path": os.fspath(snapshot),
         "revision": snapshot.name,
@@ -427,13 +511,14 @@ def snapshot_identity(snapshot: Path) -> dict[str, Any]:
         "shards": shard_records,
         "tokenizer_files": tokenizer_files,
         "total_shard_bytes": sum(record["bytes"] for record in shard_records),
+        **variant,
         "geometry": geometry,
         "namespace_audit": namespace_audit,
     }
 
 
-def storage_contract(source: dict[str, Any]) -> dict[str, Any]:
-    """Return deterministic peak-space targets for the K3 production run."""
+def storage_contract(source: dict[str, Any], bits: int = 3) -> dict[str, Any]:
+    """Return deterministic peak-space targets for a supported production run."""
 
     geometry = source.get("geometry")
     source_bytes = source.get("total_shard_bytes")
@@ -465,19 +550,40 @@ def storage_contract(source: dict[str, Any]) -> dict[str, Any]:
         or intermediate != 2048
     ):
         raise LaunchError("source identity has unsupported storage geometry")
-    native_projection_bytes = hidden * intermediate * 2
-    native_replaced_bytes = layers * experts * 3 * native_projection_bytes
-    trellis_bytes = hidden * intermediate * 3 // 8
+    source_format = source.get("format", "bf16")
+    if source_format == "bf16":
+        native_projection_bytes = hidden * intermediate * 2
+        native_projection_scale_bytes = 0
+    elif source_format == "fp8-e4m3-block128x128-dynamic":
+        native_projection_bytes = hidden * intermediate
+        native_projection_scale_bytes = (
+            ((hidden + 127) // 128)
+            * ((intermediate + 127) // 128)
+            * 4
+        )
+    else:
+        raise LaunchError("source identity has an unsupported native format")
+    projection_count = layers * experts * 3
+    native_replaced_bytes = projection_count * (
+        native_projection_bytes + native_projection_scale_bytes
+    )
+    if bits not in (3, 4):
+        raise LaunchError("storage contract requires EXL3 K3 or K4")
+    trellis_bytes = hidden * intermediate * bits // 8
     rotation_bytes = (hidden + intermediate) * 2
     exl3_projection_bytes = trellis_bytes + rotation_bytes + 4
-    exl3_payload_bytes = layers * experts * 3 * exl3_projection_bytes
+    exl3_payload_bytes = projection_count * exl3_projection_bytes
     artifact_payload_estimate = (
         source_bytes - native_replaced_bytes + exl3_payload_bytes
     )
     if artifact_payload_estimate <= 0:
         raise LaunchError("computed EXL3 artifact payload is invalid")
-    return {
-        "contract": STORAGE_CONTRACT,
+    contract = {
+        "contract": (
+            "glmrt-glm52-exl3-storage-v1"
+            if "format" not in source and bits == 3
+            else STORAGE_CONTRACT
+        ),
         "source_shard_bytes": source_bytes,
         "native_replaced_payload_bytes": native_replaced_bytes,
         "exl3_projection_payload_bytes": exl3_payload_bytes,
@@ -497,11 +603,24 @@ def storage_contract(source: dict[str, Any]) -> dict[str, Any]:
             "export": "one-atomic-final-stage",
         },
     }
+    if "format" in source or bits != 3:
+        contract.update(
+            {
+                "source_format": source_format,
+                "trellis_bits": bits,
+                "native_replaced_scale_payload_bytes": (
+                    projection_count * native_projection_scale_bytes
+                ),
+            }
+        )
+    return contract
 
 
 def glm52_namespace_audit(
     config: dict[str, Any],
     weight_map: dict[str, Any],
+    *,
+    source_format: str = "bf16",
 ) -> dict[str, Any]:
     """Prove the base and checkpoint-only native-MTP tensor inventory."""
 
@@ -540,6 +659,27 @@ def glm52_namespace_audit(
             f"unexpected={sorted(actual_experts - expected_all_experts)[:4]}"
         )
 
+    actual_expert_scales = {
+        name
+        for name in names
+        if re.fullmatch(
+            r"model\.layers\.\d+\.mlp\.experts\.\d+\."
+            r"(?:gate_proj|up_proj|down_proj)\.weight_scale_inv",
+            name,
+        )
+    }
+    expected_expert_scales = (
+        {f"{name[:-len('.weight')]}.weight_scale_inv" for name in expected_all_experts}
+        if source_format == "fp8-e4m3-block128x128-dynamic"
+        else set()
+    )
+    if actual_expert_scales != expected_expert_scales:
+        raise LaunchError(
+            "source routed-expert scale inventory differs: "
+            f"missing={sorted(expected_expert_scales - actual_expert_scales)[:4]} "
+            f"unexpected={sorted(actual_expert_scales - expected_expert_scales)[:4]}"
+        )
+
     sparse_layers = range(first_sparse, mtp_layer + 1)
     expected_shared = {
         f"model.layers.{layer}.mlp.shared_experts.{projection}.weight"
@@ -572,7 +712,8 @@ def glm52_namespace_audit(
         raise LaunchError("source dense prefix unexpectedly contains routed experts")
 
     return {
-        "contract": "glmrt.glm52-native-namespace-audit-v1",
+        "contract": "glmrt.glm5-native-namespace-audit-v2",
+        "source_format": source_format,
         "base_layers": layer_count,
         "dense_prefix_layers": first_sparse,
         "base_routed_layers": layer_count - first_sparse,
@@ -581,6 +722,18 @@ def glm52_namespace_audit(
         "routed_experts_per_block": expert_count,
         "base_routed_projection_tensors": len(expected_base_experts),
         "mtp_routed_projection_tensors": len(expected_mtp_experts),
+        "base_routed_projection_scale_tensors": len(
+            expected_expert_scales & {
+                f"{name[:-len('.weight')]}.weight_scale_inv"
+                for name in expected_base_experts
+            }
+        ),
+        "mtp_routed_projection_scale_tensors": len(
+            expected_expert_scales & {
+                f"{name[:-len('.weight')]}.weight_scale_inv"
+                for name in expected_mtp_experts
+            }
+        ),
         "shared_expert_tensors": len(expected_shared),
         "learned_router_layers": list(sparse_layers),
         "quantized_scope": "base-routed-expert-gate-up-down-only",
@@ -659,10 +812,9 @@ def calibration_evidence(
 ) -> dict[str, Any]:
     """Bind the frozen corpus; natural routing is measured on the full replay."""
 
-    del source
     if route_screen_path is not None:
         raise LaunchError(
-            "GLM-5.2 uses inline full-corpus routing evidence, not a screen report"
+            "GLM-5 uses inline full-corpus routing evidence, not a screen report"
         )
     manifest_path = manifest_path.expanduser().resolve(strict=True)
     manifest = read_json_object(manifest_path)
@@ -692,6 +844,19 @@ def calibration_evidence(
         or SHA256_RE.fullmatch(str(manifest.get("tokenizer_sha256", ""))) is None
     ):
         raise LaunchError("calibration manifest does not bind a reproducible corpus")
+    tokenizer_files = source.get("tokenizer_files")
+    source_tokenizer_sha256 = next(
+        (
+            record.get("sha256")
+            for record in tokenizer_files
+            if isinstance(record, dict) and record.get("name") == "tokenizer.json"
+        ),
+        None,
+    ) if isinstance(tokenizer_files, list) else None
+    if manifest.get("tokenizer_sha256") != source_tokenizer_sha256:
+        raise LaunchError(
+            "calibration tokenizer differs from the immutable model tokenizer"
+        )
     manifest_corpus_path = (
         manifest_path.parent / str(calibration.get("file", ""))
     ).resolve()
@@ -842,10 +1007,10 @@ def preflight_identity(
 
 
 def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
-    """Create the immutable local dual-RTX K3 production plan."""
+    """Create an immutable local dual-RTX GLM-5 production plan."""
 
     if getattr(args, "remote_worker", None):
-        raise LaunchError("GLM-5.2 quantization currently supports local RTX GPUs only")
+        raise LaunchError("GLM-5 quantization currently supports local RTX GPUs only")
     lock_path = args.gptqmodel_lock.expanduser().resolve(strict=True)
     lock = read_json_object(lock_path)
     if (
@@ -866,7 +1031,8 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
     )
     toolchain = quantization_toolchain_identity()
     bits = int(getattr(args, "bits", 3))
-    recipe = natural_route_recipe(bits)
+    variant = quantization_variant(source, bits)
+    recipe = variant["recipe"]
     coordinator_gpu_count = int(getattr(args, "coordinator_gpu_count", 2))
     preflight = preflight_identity(
         args.preflight_report,
@@ -980,7 +1146,7 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
         "bits": bits,
         "codebook": "mcg",
         "module_include": BASE_EXPERT_PATTERN,
-        "operator_contract": "glmrt-glm52-base-routed-exl3-k3-v1",
+        "operator_contract": variant["operator_contract"],
         "route_evidence_contract": ROUTE_EVIDENCE_CONTRACT,
         "zero_route_recovery_contract": ZERO_ROUTE_RECOVERY_CONTRACT,
         "zero_route_recovery_recipe": recovery_recipe,
@@ -1014,7 +1180,7 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
         "contract": PROJECTION_CHECKPOINT_CONTRACT,
         "root": os.fspath(projection_root),
     }
-    storage = storage_contract(source)
+    storage = storage_contract(source, bits)
     geometry = source["geometry"]
     layer_boundary = {
         "contract": BOUNDARY_CONTRACT,
@@ -1341,7 +1507,7 @@ def _valid_projection_checkpoint_seed(value: Any) -> bool:
 
 def _validate_plan(plan: dict[str, Any]) -> None:
     if plan.get("schema") not in SUPPORTED_PLAN_SCHEMAS:
-        raise LaunchError("plan does not use the GLM-5.2 GPTQModel schema")
+        raise LaunchError("plan does not use a supported GLM-5 GPTQModel schema")
     digest = plan.get("plan_sha256")
     body = {key: value for key, value in plan.items() if key != "plan_sha256"}
     exl3 = plan.get("exl3")
@@ -1353,12 +1519,20 @@ def _validate_plan(plan: dict[str, Any]) -> None:
     tokenizer_files = (
         source.get("tokenizer_files") if isinstance(source, dict) else None
     )
+    bits = exl3.get("bits") if isinstance(exl3, dict) else None
+    if plan.get("schema") == PLAN_SCHEMA and isinstance(source, dict):
+        variant = quantization_variant(source, bits)
+        variant_valid = plan.get("recipe") == variant["recipe"]
+    else:
+        variant_valid = (
+            bits == 3 and plan.get("recipe") == GLM52_NATURAL_ROUTE_RECIPE
+        )
     schema_contract_valid = (
         plan.get("schema") == LEGACY_PLAN_SCHEMA
         and storage is None
         and tokenizer_files is None
     ) or (
-        plan.get("schema") == PLAN_SCHEMA
+        plan.get("schema") == GLM52_PLAN_SCHEMA
         and isinstance(source, dict)
         and isinstance(tokenizer_files, list)
         and all(
@@ -1371,6 +1545,21 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         and [record["name"] for record in tokenizer_files]
         == list(TOKENIZER_SOURCE_FILES)
         and storage == storage_contract(source)
+    ) or (
+        plan.get("schema") == PLAN_SCHEMA
+        and isinstance(source, dict)
+        and source.get("release") in {"glm-5.2", "glm-5.3"}
+        and isinstance(tokenizer_files, list)
+        and all(
+            isinstance(record, dict)
+            and isinstance(record.get("bytes"), int)
+            and record["bytes"] > 0
+            and SHA256_RE.fullmatch(str(record.get("sha256", ""))) is not None
+            for record in tokenizer_files
+        )
+        and [record["name"] for record in tokenizer_files]
+        == list(TOKENIZER_SOURCE_FILES)
+        and storage == storage_contract(source, bits)
     )
     path_fields = (
         "output",
@@ -1384,8 +1573,9 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         or SHA256_RE.fullmatch(digest) is None
         or hashlib.sha256(canonical_json(body)).hexdigest() != digest
         or not schema_contract_valid
+        or not variant_valid
         or not isinstance(exl3, dict)
-        or exl3.get("bits") != 3
+        or bits not in (3, 4)
         or exl3.get("codebook") != "mcg"
         or exl3.get("module_include") != [BASE_EXPERT_PATTERN]
         or plan.get("remote_workers") is not None
@@ -1500,7 +1690,9 @@ def validate_storage_capacity(plan: dict[str, Any]) -> dict[str, Any]:
     """Fail before model loading if bounded durable stores cannot finish."""
 
     _validate_plan(plan)
-    contract = plan.get("storage") or storage_contract(plan["source"])
+    contract = plan.get("storage") or storage_contract(
+        plan["source"], plan["exl3"]["bits"]
+    )
     output = Path(plan["output"])
     run_state = Path(plan["run_state_dir"])
     projection = Path(plan["projection_checkpoint_dir"])
@@ -1577,13 +1769,13 @@ def validate_storage_capacity(plan: dict[str, Any]) -> dict[str, Any]:
         record["projected_free_bytes"] = available - record["required_future_bytes"]
         if available < record["required_future_bytes"]:
             raise LaunchError(
-                "insufficient storage for GLM-5.2 EXL3 completion on "
+                "insufficient storage for GLM-5 EXL3 completion on "
                 f"{record['anchor']}: available={available} "
                 f"required={record['required_future_bytes']}"
             )
     ordered = sorted(filesystems.values(), key=lambda record: record["device"])
     return {
-        "schema": "glmrt-glm52-exl3-storage-preflight-v1",
+        "schema": "glmrt-glm5-exl3-storage-preflight-v2",
         "status": "accepted",
         "plan_sha256": plan["plan_sha256"],
         "contract": contract,
@@ -1925,8 +2117,9 @@ def write_artifact_manifest(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
         name.endswith(".safetensors") for name in records
     ):
         raise LaunchError("export does not contain its plan and safetensor payload")
+    _, artifact_schema = artifact_contract_schemas(plan)
     body = {
-        "schema": ARTIFACT_MANIFEST_SCHEMA,
+        "schema": artifact_schema,
         "plan_sha256": plan["plan_sha256"],
         "files": records,
         "file_count": len(records),
@@ -1966,9 +2159,13 @@ def validate_published_artifact(
     )
     _validate_bound_record(run, digest_field="run_sha256", label="run manifest")
     records = manifest.get("files")
-    expected_layers = list(range(3, 78))
+    expected_run_schema, expected_artifact_schema = artifact_contract_schemas(plan)
+    geometry = plan["source"]["geometry"]
+    expected_layers = list(
+        range(geometry["first_target_layer"], geometry["last_target_layer"] + 1)
+    )
     if (
-        manifest.get("schema") != ARTIFACT_MANIFEST_SCHEMA
+        manifest.get("schema") != expected_artifact_schema
         or manifest.get("plan_sha256") != plan["plan_sha256"]
         or not isinstance(records, dict)
         or manifest.get("file_count") != len(records)
@@ -1978,13 +2175,13 @@ def validate_published_artifact(
             for record in records.values()
             if isinstance(record, dict)
         )
-        or run.get("schema") != RUN_SCHEMA
+        or run.get("schema") != expected_run_schema
         or run.get("status") != "complete"
         or run.get("plan_sha256") != plan["plan_sha256"]
         or run.get("artifact_manifest_sha256") != manifest.get("manifest_sha256")
         or run.get("execution_upgrade_sha256") != execution_upgrade_sha256
         or run.get("quantized_base_layers") != expected_layers
-        or run.get("preserved_mtp_layer") != 78
+        or run.get("preserved_mtp_layer") != geometry["mtp_layer_index"]
     ):
         raise LaunchError("published artifact manifests are inconsistent")
     expected_paths = set(records) | {ARTIFACT_MANIFEST_FILENAME, RUN_FILENAME}
@@ -2173,6 +2370,16 @@ def execution_upgrade_source_matches_parent(
         return False
     if plan.get("schema") == PLAN_SCHEMA:
         return current_source == parent_source
+    if plan.get("schema") == GLM52_PLAN_SCHEMA:
+        allowed_additions = {
+            "release",
+            "format",
+            "quantization_config_sha256",
+        }
+        return all(
+            current_source.get(key) == value
+            for key, value in parent_source.items()
+        ) and set(current_source).issubset(set(parent_source) | allowed_additions)
     return all(
         current_source.get(key) == value for key, value in parent_source.items()
     )
@@ -2184,7 +2391,7 @@ def build_execution_upgrade(
     """Bind corrected execution code while preserving the parent GLM plan."""
 
     if getattr(args, "remote_worker", None):
-        raise LaunchError("GLM-5.2 execution upgrades cannot add remote workers")
+        raise LaunchError("GLM-5 execution upgrades cannot add remote workers")
     output = args.output.expanduser().resolve()
     raw_run_state = getattr(args, "run_state_dir", None)
     run_state = (
@@ -2505,6 +2712,350 @@ def preflight_lazy_nonpersistent_buffers(
     return report
 
 
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "F8_E4M3FNUZ": 1,
+    "F8_E5M2": 1,
+    "F8_E5M2FNUZ": 1,
+    "U16": 2,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "U32": 4,
+    "I32": 4,
+    "F32": 4,
+    "U64": 8,
+    "I64": 8,
+    "F64": 8,
+}
+
+
+def _export_safetensors_inventory(
+    root: Path,
+) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """Read and fully cross-check the exported index and shard headers."""
+
+    index = read_json_object(root / "model.safetensors.index.json")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise LaunchError("exported safetensors index has no weight_map")
+    names_by_file: dict[str, set[str]] = {}
+    for name, shard in weight_map.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(shard, str)
+            or Path(shard).name != shard
+            or not shard.endswith(".safetensors")
+        ):
+            raise LaunchError("exported safetensors index contains an unsafe entry")
+        names_by_file.setdefault(shard, set()).add(name)
+
+    inventory: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for shard, expected_names in sorted(names_by_file.items()):
+        path = root / shard
+        if not path.is_file() or path.is_symlink():
+            raise LaunchError(f"exported safetensors shard is not a regular file: {shard}")
+        size = path.stat().st_size
+        try:
+            with path.open("rb") as source:
+                prefix = source.read(8)
+                if len(prefix) != 8:
+                    raise LaunchError(f"exported safetensors shard has no header: {shard}")
+                header_bytes = struct.unpack("<Q", prefix)[0]
+                if header_bytes <= 0 or header_bytes > min(size - 8, 1 << 30):
+                    raise LaunchError(
+                        f"exported safetensors shard has an invalid header length: {shard}"
+                    )
+                header = json.loads(source.read(header_bytes))
+        except LaunchError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError, struct.error) as error:
+            raise LaunchError(
+                f"cannot inspect exported safetensors shard {shard}: {error}"
+            ) from error
+        if not isinstance(header, dict):
+            raise LaunchError(f"exported safetensors header is not an object: {shard}")
+        metadata = header.pop("__metadata__", None)
+        if metadata is not None and not isinstance(metadata, dict):
+            raise LaunchError(f"exported safetensors metadata is malformed: {shard}")
+        if set(header) != expected_names:
+            raise LaunchError(
+                f"exported safetensors index/header names differ for {shard}"
+            )
+        ranges: list[tuple[int, int, str]] = []
+        for name, entry in header.items():
+            if not isinstance(entry, dict):
+                raise LaunchError(f"exported tensor metadata is malformed: {name}")
+            dtype = entry.get("dtype")
+            shape = entry.get("shape")
+            offsets = entry.get("data_offsets")
+            if (
+                dtype not in _SAFETENSORS_DTYPE_BYTES
+                or not isinstance(shape, list)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in shape
+                )
+                or not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in offsets
+                )
+                or offsets[0] < 0
+                or offsets[1] < offsets[0]
+                or offsets[1] - offsets[0]
+                != math.prod(shape) * _SAFETENSORS_DTYPE_BYTES[dtype]
+            ):
+                raise LaunchError(f"exported tensor metadata is invalid: {name}")
+            inventory[name] = (dtype, tuple(shape))
+            ranges.append((offsets[0], offsets[1], name))
+        cursor = 0
+        for start, end, name in sorted(ranges):
+            if start != cursor:
+                raise LaunchError(
+                    f"exported safetensors payload is not contiguous before {name}"
+                )
+            cursor = end
+        if 8 + header_bytes + cursor != size:
+            raise LaunchError(
+                f"exported safetensors payload length differs for {shard}"
+            )
+    if set(inventory) != set(weight_map):
+        raise LaunchError("exported safetensors inventory differs from its index")
+    return inventory
+
+
+def _expected_exl3_modules(plan: dict[str, Any]) -> dict[str, tuple[int, int]]:
+    geometry = plan["source"]["geometry"]
+    hidden = geometry["hidden_size"]
+    intermediate = geometry["moe_intermediate_size"]
+    experts = geometry["n_routed_experts"]
+    modules: dict[str, tuple[int, int]] = {}
+    for layer in range(
+        geometry["first_target_layer"],
+        geometry["last_target_layer"] + 1,
+    ):
+        for expert in range(experts):
+            prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+            modules[f"{prefix}.gate_proj"] = (hidden, intermediate)
+            modules[f"{prefix}.up_proj"] = (hidden, intermediate)
+            modules[f"{prefix}.down_proj"] = (intermediate, hidden)
+    return modules
+
+
+def _expected_exl3_tensor_metadata(
+    module: str,
+    input_features: int,
+    output_features: int,
+    bits: int,
+) -> dict[str, tuple[str, tuple[int, ...], str]]:
+    if (
+        input_features <= 0
+        or output_features <= 0
+        or input_features % 16
+        or output_features % 16
+    ):
+        raise LaunchError(f"EXL3 module geometry is not tile aligned: {module}")
+    return {
+        f"{module}.trellis": (
+            "I16",
+            (input_features // 16, output_features // 16, 16 * bits),
+            "int16",
+        ),
+        f"{module}.suh": ("F16", (input_features,), "float16"),
+        f"{module}.svh": ("F16", (output_features,), "float16"),
+        f"{module}.mcg": ("I32", (), "int32"),
+    }
+
+
+def compact_exl3_declaration(external: dict[str, Any]) -> dict[str, Any]:
+    """Keep only EXL3 discovery fields in the model's main config."""
+
+    return {
+        field: external.get(field)
+        for field in ("quant_method", "format", "checkpoint_format", "bits")
+    }
+
+
+def validate_export_quantization_contract(root: Path, plan: dict[str, Any]) -> None:
+    """Fail closed before publication if model or EXL3 metadata is incomplete."""
+
+    config = read_json_object(root / "config.json")
+    external = read_json_object(root / "quantize_config.json")
+    embedded = config.get("quantization_config")
+    if not isinstance(embedded, dict):
+        raise LaunchError("exported config.json has no quantization_config")
+    source_config = read_json_object(Path(plan["source"]["path"]) / "config.json")
+    # Quantization may update only its own declaration. It must not silently
+    # turn GLM-5.3 into a different architecture/configuration.
+    unexpected_config_fields = set(config) - (
+        set(source_config) | {"quantization_config"}
+    )
+    if unexpected_config_fields:
+        raise LaunchError(
+            "exported model config added fields absent from the source: "
+            f"{sorted(unexpected_config_fields)}"
+        )
+    for field, expected in source_config.items():
+        if field == "quantization_config":
+            continue
+        if config.get(field) != expected:
+            raise LaunchError(
+                f"exported model config changed source field {field}: "
+                f"{config.get(field)!r} != {expected!r}"
+            )
+    source_root = Path(plan["source"]["path"])
+    for name in EXACT_SOURCE_METADATA_FILES:
+        source_path = (source_root / name).resolve(strict=True)
+        exported_path = root / name
+        if _artifact_file_identity(source_path) != _artifact_file_identity(exported_path):
+            raise LaunchError(f"exported source metadata differs: {name}")
+
+    exl3 = plan["exl3"]
+    numeric_bits = float(exl3["bits"])
+    bits = int(numeric_bits)
+    if numeric_bits != bits or bits <= 0:
+        raise LaunchError(f"EXL3 export requires an integral bitrate, got {numeric_bits}")
+    required = {
+        "method": "exl3",
+        "quant_method": "exl3",
+        "format": "exl3",
+        "checkpoint_format": "exl3",
+        "bits": numeric_bits,
+        "codebook": exl3["codebook"],
+        "out_scales": exl3["out_scales"],
+        "group_size": -1,
+        "desc_act": False,
+        "module_include": exl3["module_include"],
+    }
+    for field, expected in required.items():
+        if external.get(field) != expected:
+            raise LaunchError(
+                f"exported external EXL3 field {field} differs from the plan"
+            )
+    compact = dict(external)
+    storage = compact.pop("tensor_storage", None)
+    if compact_exl3_declaration(external) != embedded:
+        raise LaunchError(
+            "config.json quantization_config is not the exact minimal EXL3 declaration"
+        )
+
+    modules = _expected_exl3_modules(plan)
+    if not isinstance(storage, dict) or set(storage) != set(modules):
+        actual = set(storage) if isinstance(storage, dict) else set()
+        raise LaunchError(
+            "exported tensor_storage module inventory differs: "
+            f"expected={len(modules)} actual={len(actual)} "
+            f"missing={sorted(set(modules) - actual)[:8]} "
+            f"unexpected={sorted(actual - set(modules))[:8]}"
+        )
+
+    expected_tensors: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for module, (input_features, output_features) in modules.items():
+        expected = _expected_exl3_tensor_metadata(
+            module,
+            input_features,
+            output_features,
+            bits,
+        )
+        entry = storage[module]
+        if (
+            not isinstance(entry, dict)
+            or set(entry)
+            != {
+                "stored_tensors",
+                "quant_format",
+                "bits_per_weight",
+                "mcg_multiplier",
+            }
+            or entry.get("quant_format") != "exl3"
+            or entry.get("bits_per_weight") != bits
+            or entry.get("mcg_multiplier") != EXL3_MCG_MULTIPLIER
+        ):
+            raise LaunchError(f"exported tensor_storage entry is invalid: {module}")
+        stored = entry.get("stored_tensors")
+        if not isinstance(stored, dict) or set(stored) != set(expected):
+            raise LaunchError(f"exported stored tensor set is incomplete: {module}")
+        for name, (dtype, shape, torch_dtype) in expected.items():
+            if stored[name] != {
+                "shape": list(shape),
+                "torch_dtype": torch_dtype,
+            }:
+                raise LaunchError(f"exported tensor_storage metadata is invalid: {name}")
+            expected_tensors[name] = (dtype, shape)
+
+    source_index = read_json_object(
+        Path(plan["source"]["path"]) / "model.safetensors.index.json"
+    )
+    source_weight_map = source_index.get("weight_map")
+    if not isinstance(source_weight_map, dict) or not source_weight_map:
+        raise LaunchError("source model index has no weight_map during export validation")
+    replaced = {f"{module}.weight" for module in modules}
+    if plan["source"].get("format") == "fp8-e4m3-block128x128-dynamic":
+        replaced.update(f"{module}.weight_scale_inv" for module in modules)
+    if not replaced.issubset(source_weight_map):
+        raise LaunchError("source model is missing tensors selected for EXL3 replacement")
+    expected_inventory = (set(source_weight_map) - replaced) | set(expected_tensors)
+    inventory = _export_safetensors_inventory(root)
+    if set(inventory) != expected_inventory:
+        raise LaunchError(
+            "exported tensor namespace differs from source replacement contract: "
+            f"missing={sorted(expected_inventory - set(inventory))[:8]} "
+            f"unexpected={sorted(set(inventory) - expected_inventory)[:8]}"
+        )
+    for name, expected in expected_tensors.items():
+        if inventory[name] != expected:
+            raise LaunchError(
+                f"exported EXL3 tensor metadata differs for {name}: "
+                f"{inventory[name]!r} != {expected!r}"
+            )
+
+
+def normalize_export_model_config(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    """Replace Transformers serialization drift with exact source metadata."""
+
+    source_config = read_json_object(Path(plan["source"]["path"]) / "config.json")
+    exported_config = read_json_object(root / "config.json")
+    external = read_json_object(root / "quantize_config.json")
+    embedded = exported_config.get("quantization_config")
+    compact_external = dict(external)
+    compact_external.pop("tensor_storage", None)
+    minimal_external = compact_exl3_declaration(external)
+    # GPTQModel serializers have emitted both shapes over time: either the
+    # metadata-rich declaration or the complete standalone object (including
+    # the large tensor_storage map) duplicated into config.json. Both are safe
+    # inputs only when they agree exactly with quantize_config.json. Always
+    # normalize to the four-field discovery declaration while leaving the
+    # standalone file byte-for-byte intact.
+    if not isinstance(embedded, dict) or embedded not in (
+        minimal_external,
+        compact_external,
+        external,
+    ):
+        raise LaunchError(
+            "cannot normalize an export whose embedded and standalone EXL3 configurations disagree"
+        )
+    normalized = dict(source_config)
+    normalized["quantization_config"] = minimal_external
+    atomic_json(root / "config.json", normalized)
+    source_root = Path(plan["source"]["path"])
+    for name in EXACT_SOURCE_METADATA_FILES:
+        source = (source_root / name).resolve(strict=True)
+        destination = root / name
+        if not source.is_file() or not destination.is_file() or destination.is_symlink():
+            raise LaunchError(f"cannot normalize exported source metadata: {name}")
+        shutil.copyfile(source, destination)
+    return normalized
+
+
 def publish_export(plan: dict[str, Any]) -> None:
     _validate_plan(plan)
     output = Path(plan["output"])
@@ -2527,18 +3078,27 @@ def publish_export(plan: dict[str, Any]) -> None:
                     export_history / archived.name,
                     read_json_object(archived),
                 )
+    normalize_export_model_config(export_stage, plan)
+    validate_export_quantization_contract(export_stage, plan)
     manifest = write_artifact_manifest(export_stage, plan)
+    geometry = plan["source"]["geometry"]
+    run_schema, _ = artifact_contract_schemas(plan)
     run = _bound_record(
         {
-            "schema": RUN_SCHEMA,
+            "schema": run_schema,
             "status": "complete",
             "plan_sha256": plan["plan_sha256"],
             "artifact_manifest_sha256": manifest["manifest_sha256"],
             "execution_upgrade_sha256": (
                 upgrade["upgrade_sha256"] if upgrade is not None else None
             ),
-            "quantized_base_layers": list(range(3, 78)),
-            "preserved_mtp_layer": 78,
+            "quantized_base_layers": list(
+                range(
+                    geometry["first_target_layer"],
+                    geometry["last_target_layer"] + 1,
+                )
+            ),
+            "preserved_mtp_layer": geometry["mtp_layer_index"],
         },
         "run_sha256",
     )
@@ -2585,6 +3145,10 @@ def _execute_bound(
         return
 
     run_state = Path(plan["run_state_dir"])
+    # The run-state emptiness/identity check above must happen before the
+    # persistent compiler cache creates its canonical child directory.
+    jit_root = run_state / EXLLAMAV3_JIT_DIRNAME
+    jit_root.mkdir(parents=True, exist_ok=True)
     storage_report = validate_storage_capacity(plan)
     atomic_json(run_state / STORAGE_PREFLIGHT_FILENAME, storage_report)
 
@@ -2606,7 +3170,7 @@ def _execute_bound(
     primary_device = coordinator_devices[0]
     ledger_provenance = runtime_ledger_provenance(plan)
     qcfg = EXL3Config(
-        bits=3.0,
+        bits=float(plan["exl3"]["bits"]),
         codebook="mcg",
         out_scales="auto",
         module_include=[BASE_EXPERT_PATTERN],
@@ -2633,7 +3197,7 @@ def _execute_bound(
         turtle, "configure_active_source_staging", None
     )
     if not callable(configure_active_source):
-        raise LaunchError("GLM-5.2 lazy source cannot stage active layers")
+        raise LaunchError("GLM-5 lazy source cannot stage active layers")
     configure_active_source(
         plan["active_layer_source_dir"],
         provenance={
@@ -2674,7 +3238,7 @@ def _execute_bound(
     model.quantization_layer_boundary_checkpoint = boundary_controller
     configure_base_replay = getattr(model, "configure_base_replay_store", None)
     if not callable(configure_base_replay):
-        raise LaunchError("GLM-5.2 model cannot checkpoint base replay batches")
+        raise LaunchError("GLM-5 model cannot checkpoint base replay batches")
     configure_base_replay(
         run_state / POST_QUANT_REPLAY_DIRNAME,
         provenance={
@@ -2762,9 +3326,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bits",
         type=int,
-        choices=(3,),
+        choices=(3, 4),
         default=3,
-        help="fixed EXL3 K3 bitrate for all routed expert families",
+        help=(
+            "EXL3 bitrate: K3 for GLM-5.2 BF16 or K4 for GLM-5.3 block-FP8"
+        ),
     )
     parser.add_argument(
         "--coordinator-gpu-count",
@@ -2830,5 +3396,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except LaunchError as exc:
-        print(f"quantize-glm52-gptqmodel: {exc}", file=sys.stderr)
+        print(f"quantize-glm5-gptqmodel: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

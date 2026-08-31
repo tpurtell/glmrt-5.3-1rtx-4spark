@@ -1,6 +1,6 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-model_id := env_var_or_default("GLMRT_MODEL_ID", "lukealonso/GLM-5.2-NVFP4")
+model_id := env_var_or_default("GLMRT_MODEL_ID", "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1")
 expert_roles := env_var_or_default("GLMRT_EXPERT_HOSTS", "spark-0,spark-1,spark-2,spark-3")
 spark_hosts := env_var_or_default("GLMRT_SPARK_HOSTS", "ostrich,dodo,emu,kiwi")
 base_image := env_var_or_default("GLMRT_CONTAINER_BASE", "nvcr.io/nvidia/pytorch:26.05-py3")
@@ -25,20 +25,38 @@ doctor-hosts HOSTS=spark_hosts:
   scripts/run-on-hosts.sh "{{HOSTS}}" 'cd {{justfile_directory()}} && scripts/doctor.sh --role expert --model-id "{{model_id}}"'
 
 build-rust:
-  cargo build --manifest-path rust/Cargo.toml --workspace
+  python="{{justfile_directory()}}/.venv/bin/python"; test -x "$python"; \
+    python_home="$("$python" -c 'import sys; print(sys.base_prefix)')"; \
+    PYTHONHOME="$python_home" \
+    PYO3_PYTHON="$python" \
+    cargo build --manifest-path rust/Cargo.toml --workspace
 
 test-rust:
-  python_lib="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"; \
+  python="{{justfile_directory()}}/.venv/bin/python"; test -x "$python"; \
+    python_lib="$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"; \
+    python_home="$("$python" -c 'import sys; print(sys.base_prefix)')"; \
     LD_LIBRARY_PATH="$python_lib:${LD_LIBRARY_PATH:-}" \
+    PYTHONHOME="$python_home" \
+    PYO3_PYTHON="$python" \
     cargo test --manifest-path rust/Cargo.toml --workspace
 
 test-rust-fast:
-  python_lib="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"; \
+  python="{{justfile_directory()}}/.venv/bin/python"; test -x "$python"; \
+    python_lib="$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"; \
+    python_home="$("$python" -c 'import sys; print(sys.base_prefix)')"; \
     LD_LIBRARY_PATH="$python_lib:${LD_LIBRARY_PATH:-}" \
+    PYTHONHOME="$python_home" \
+    PYO3_PYTHON="$python" \
     RUSTFLAGS="${RUSTFLAGS:--Awarnings}" \
+    env -u GLMRT_NATIVE_LIB -u GLMRT_REAL_FULL_CUDA_REFERENCE_KERNELS -u GLMRT_B12X \
+    GLMRT_DISABLE_NATIVE_AUTO_DISCOVERY=1 \
     cargo test --manifest-path rust/Cargo.toml --workspace --exclude glmrt-daemon
-  python_lib="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"; \
+  python="{{justfile_directory()}}/.venv/bin/python"; test -x "$python"; \
+    python_lib="$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"; \
+    python_home="$("$python" -c 'import sys; print(sys.base_prefix)')"; \
     LD_LIBRARY_PATH="$python_lib:${LD_LIBRARY_PATH:-}" \
+    PYTHONHOME="$python_home" \
+    PYO3_PYTHON="$python" \
     RUSTFLAGS="${RUSTFLAGS:--Awarnings}" \
     env -u GLMRT_NATIVE_LIB -u GLMRT_REAL_FULL_CUDA_REFERENCE_KERNELS -u GLMRT_B12X \
     GLMRT_DISABLE_NATIVE_AUTO_DISCOVERY=1 \

@@ -12,10 +12,13 @@ import re
 from typing import Any
 
 
-SCHEMA = "glmrt-wip-deployment-evidence-v1"
+SCHEMA = "glmrt-wip-deployment-evidence-v2"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REVISION_RE = re.compile(r"^[0-9a-f]{40,64}$")
 SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DFLASH2_MODEL_ID = "incoai/GLM-5.3-DFlash2"
+DFLASH2_REVISION = "425aa615ce320caac34400208b30808c8f14f76c"
+DFLASH2_TOPK_BACKENDS = frozenset(("torch", "flashinfer", "flashinfer-dsa"))
 
 
 class EvidenceError(RuntimeError):
@@ -57,6 +60,7 @@ def build_evidence(
     slot: str,
     profile: str,
     speculation: str,
+    launch_started_ns: int,
     power_limit_w: int,
     coordinator_slot_fingerprint: str,
     expert_slot_fingerprint: str,
@@ -79,8 +83,10 @@ def build_evidence(
         raise EvidenceError("WIP slot name is invalid")
     if profile not in {"balanced", "long", "accuracy"}:
         raise EvidenceError("serving profile is invalid")
-    if speculation not in {"plain", "mtp", "dspark"}:
+    if speculation not in {"plain", "mtp", "dspark", "dflash2"}:
         raise EvidenceError("speculation mode is invalid")
+    if isinstance(launch_started_ns, bool) or launch_started_ns <= 0:
+        raise EvidenceError("launcher start time must be a positive integer")
     if isinstance(power_limit_w, bool) or power_limit_w <= 0:
         raise EvidenceError("power limit must be positive")
     if any(SHA256_RE.fullmatch(value) is None for value in fingerprints.values()):
@@ -108,6 +114,46 @@ def build_evidence(
         or resolved.get("blockers") != []
     ):
         raise EvidenceError("resolved profile differs from the launched selection")
+    environment = resolved.get("environment")
+    if not isinstance(environment, dict):
+        raise EvidenceError("resolved profile has no environment contract")
+    speculation_settings: dict[str, Any] = {}
+    if speculation == "dflash2":
+        fixed_raw = environment.get("GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS")
+        topk_backend = environment.get("GLMRT_REAL_FULL_DFLASH2_TOPK_BACKEND")
+        adaptive = fixed_raw == "adaptive"
+        fixed_drafts: int | None = None
+        if not adaptive:
+            try:
+                fixed_drafts = int(fixed_raw)
+            except (TypeError, ValueError) as error:
+                raise EvidenceError(
+                    "resolved DFlash2 width is neither adaptive nor an integer"
+                ) from error
+        if (
+            environment.get("GLMRT_DFLASH2_MODEL_ID") != DFLASH2_MODEL_ID
+            or environment.get("GLMRT_DFLASH2_REVISION") != DFLASH2_REVISION
+            or (
+                not adaptive
+                and (
+                    fixed_drafts is None
+                    or str(fixed_drafts) != fixed_raw
+                    or not 1 <= fixed_drafts <= 7
+                )
+            )
+            or topk_backend not in DFLASH2_TOPK_BACKENDS
+        ):
+            raise EvidenceError(
+                "resolved DFlash2 checkpoint, width, or top-k backend is invalid"
+            )
+        speculation_settings = {
+            "checkpoint_model_id": DFLASH2_MODEL_ID,
+            "checkpoint_revision": DFLASH2_REVISION,
+            "draft_policy": "adaptive" if adaptive else "fixed",
+            "proposal_drafts": 7,
+            "fixed_drafts": fixed_drafts,
+            "topk_backend": topk_backend,
+        }
 
     body = {
         "schema": SCHEMA,
@@ -117,6 +163,8 @@ def build_evidence(
         "slot": slot,
         "profile": profile,
         "speculation": speculation,
+        "speculation_settings": speculation_settings,
+        "launch_started_ns": launch_started_ns,
         "power_limit_w": power_limit_w,
         "engine_identity": engine_identity,
         "sparkinfer_revision": sparkinfer_revision,
@@ -155,7 +203,12 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--slot", required=True)
     parser.add_argument("--profile", choices=("balanced", "long", "accuracy"), required=True)
-    parser.add_argument("--speculation", choices=("plain", "mtp", "dspark"), required=True)
+    parser.add_argument(
+        "--speculation",
+        choices=("plain", "mtp", "dspark", "dflash2"),
+        required=True,
+    )
+    parser.add_argument("--launch-started-ns", type=int, required=True)
     parser.add_argument("--power-limit-w", type=int, required=True)
     parser.add_argument("--coordinator-slot-fingerprint", required=True)
     parser.add_argument("--expert-slot-fingerprint", required=True)
@@ -173,6 +226,7 @@ def main() -> None:
         slot=args.slot,
         profile=args.profile,
         speculation=args.speculation,
+        launch_started_ns=args.launch_started_ns,
         power_limit_w=args.power_limit_w,
         coordinator_slot_fingerprint=args.coordinator_slot_fingerprint,
         expert_slot_fingerprint=args.expert_slot_fingerprint,

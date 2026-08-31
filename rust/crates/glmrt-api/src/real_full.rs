@@ -295,6 +295,11 @@ pub trait RealFullRequestExecutor: Send + Sync + 'static {
     fn prewarm_batched_dspark_graphs(&self) -> Result<(), String> {
         Ok(())
     }
+
+    #[doc(hidden)]
+    fn prewarm_dflash2_dsa_lane_graphs(&self, _max_draft_tokens: usize) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

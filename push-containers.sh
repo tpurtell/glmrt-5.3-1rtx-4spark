@@ -13,7 +13,7 @@ The supplied release tag and latest are published for both images. The
 coordinator image is local; the Spark image is published from SPARK_0_HOST.
 
 Example:
-  ./push-containers.sh v2
+  ./push-containers.sh v7
 EOF
 }
 
@@ -36,8 +36,8 @@ release_load_config "$repo_root/glmrt.config"
 release_need docker
 release_need ssh
 
-coordinator_repository="ghcr.io/tpurtell/glmrt-coordinator"
-spark_repository="ghcr.io/tpurtell/glmrt-spark-expert"
+coordinator_repository="ghcr.io/tpurtell/glmrt-5.3-coordinator"
+spark_repository="ghcr.io/tpurtell/glmrt-5.3-spark-expert"
 spark_host="$SPARK_0_HOST"
 
 docker info >/dev/null 2>&1 ||

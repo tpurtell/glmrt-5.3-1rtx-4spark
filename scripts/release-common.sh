@@ -21,7 +21,7 @@ release_trim() {
 
 release_known_key() {
   case "$1" in
-    PROFILE|MODEL|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|VISION_MODEL|SPECULATION|MTP_BF16_EXPERTS|DSPARK_MODEL|DSPARK_REVISION|DSPARK_FIXED_DRAFTS|SPARKINFER_GLM_H64_QUERY_PROJECTION|ADDR|EXPERT_PORT|SPARK_[0-3]_HOST|SPARK_[0-3]_LANE_A|SPARK_[0-3]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE)
+    PROFILE|MODEL|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|VISION_MODEL|SPECULATION|MTP_BF16_EXPERTS|DSPARK_MODEL|DSPARK_REVISION|DSPARK_FIXED_DRAFTS|DFLASH2_FIXED_DRAFTS|DFLASH2_TOPK_BACKEND|SPARKINFER_GLM_H64_QUERY_PROJECTION|ADDR|EXPERT_PORT|SPARK_[0-3]_HOST|SPARK_[0-3]_LANE_A|SPARK_[0-3]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE)
       return 0
       ;;
     *)
@@ -35,18 +35,20 @@ release_load_config() {
   [[ -f "$config" ]] || release_die "configuration file not found: $config"
 
   PROFILE=balanced
-  MODEL=luke
+  MODEL=glm53-exl3
   COORDINATOR_GPU_HEADROOM_GIB=8
   KV_POOL_TOKENS=
   MAX_CONTEXT_TOKENS=
   MAX_OUTPUT_TOKENS=
   CONCURRENCY=4
-  VISION_MODEL=
-  SPECULATION=dspark
+  VISION_MODEL=off
+  SPECULATION=dflash2
   MTP_BF16_EXPERTS=auto
   DSPARK_MODEL=redhat
   DSPARK_REVISION=
   DSPARK_FIXED_DRAFTS=
+  DFLASH2_FIXED_DRAFTS=
+  DFLASH2_TOPK_BACKEND=torch
   SPARKINFER_GLM_H64_QUERY_PROJECTION=auto
   ADDR=0.0.0.0:8000
   EXPERT_PORT=9100
@@ -79,7 +81,7 @@ release_load_config() {
   done <"$config"
 
   case "$PROFILE" in balanced|long|accuracy) ;; *) release_die "PROFILE must be balanced, long, or accuracy" ;; esac
-  case "$SPECULATION" in plain|mtp|dspark) ;; *) release_die "SPECULATION must be plain, mtp, or dspark" ;; esac
+  case "$SPECULATION" in plain|mtp|dspark|dflash2) ;; *) release_die "SPECULATION must be plain, mtp, dspark, or dflash2" ;; esac
   case "$MTP_BF16_EXPERTS" in auto|on|off) ;; *) release_die "MTP_BF16_EXPERTS must be auto, on, or off" ;; esac
   case "$SPARKINFER_GLM_H64_QUERY_PROJECTION" in
     auto|disable|force) ;;
@@ -91,6 +93,16 @@ release_load_config() {
     [[ "$SPECULATION" == dspark ]] ||
       release_die "DSPARK_FIXED_DRAFTS requires SPECULATION=dspark"
   fi
+  if [[ -n "$DFLASH2_FIXED_DRAFTS" ]]; then
+    [[ "$DFLASH2_FIXED_DRAFTS" =~ ^[1-7]$ ]] ||
+      release_die "DFLASH2_FIXED_DRAFTS must be empty or in 1..7; use SPECULATION=plain for target-only"
+    [[ "$SPECULATION" == dflash2 ]] ||
+      release_die "DFLASH2_FIXED_DRAFTS requires SPECULATION=dflash2"
+  fi
+  case "$DFLASH2_TOPK_BACKEND" in
+    torch|flashinfer|flashinfer-dsa) ;;
+    *) release_die "DFLASH2_TOPK_BACKEND must be torch, flashinfer, or flashinfer-dsa" ;;
+  esac
   case "${VISION_MODEL,,}" in ""|off|none|baseten) ;; *) release_die "VISION_MODEL must be baseten, off, or unset" ;; esac
   [[ "$CONCURRENCY" =~ ^[1-8]$ ]] || release_die "CONCURRENCY must be in 1..8"
   [[ "$EXPERT_PORT" =~ ^[0-9]+$ ]] && ((EXPERT_PORT >= 1 && EXPERT_PORT <= 65535)) || release_die "EXPERT_PORT must be in 1..65535"
@@ -130,7 +142,8 @@ release_load_config() {
     luke) RELEASE_MODEL_ID=lukealonso/GLM-5.2-NVFP4 ;;
     nvidia) RELEASE_MODEL_ID=nvidia/GLM-5.2-NVFP4 ;;
     exl3) RELEASE_MODEL_ID=wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1 ;;
-    *) release_die "MODEL must be luke, nvidia, or exl3" ;;
+    glm53-exl3) RELEASE_MODEL_ID=wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 ;;
+    *) release_die "MODEL must be luke, nvidia, exl3, or glm53-exl3" ;;
   esac
   case "${DSPARK_MODEL,,}" in
     redhat)

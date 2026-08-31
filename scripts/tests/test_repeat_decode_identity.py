@@ -36,6 +36,7 @@ def test_repeat_prompt_contract_is_model_independent_and_content_bound() -> None
         "repeats": 5,
         "nonce_seed": 2026082301,
         "temperature": 0,
+        "enable_thinking": False,
         "tokenizer_sha256": "a" * 64,
     }
     assert TOOL.canonical_sha256(contract) != TOOL.canonical_sha256(

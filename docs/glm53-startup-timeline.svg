@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+<title id="title">GLMRT GLM-5.3 cold and warm startup timelines</title>
+<desc id="desc">Measured aligned startup phases for a full four-Spark expert reload and a fingerprint-matched retained-expert restart.</desc>
+<defs><style>
+.title{font:700 31px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+.subtitle{font:400 14px Inter,Segoe UI,sans-serif;fill:#91a8bf}
+.section{font:700 18px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+.body{font:500 12px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+.small{font:400 11px Inter,Segoe UI,sans-serif;fill:#91a8bf}
+.metric{font:700 25px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+</style></defs>
+<rect width="1600" height="1050" fill="#07111f"/>
+<text id="title" x="52" y="52" class="title">GLMRT GLM-5.3 STARTUP</text>
+<text x="52" y="78" class="subtitle">balanced · dflash2 · 400 W · revision dd270970a59e</text>
+<rect x="52" y="104" width="340" height="86" rx="14" fill="#0d1b2d" stroke="#56d69c"/>
+<text x="72" y="139" class="metric" fill="#56d69c">74.34 s</text>
+<text x="72" y="169" class="small">COLD · FULL EXPERT RELOAD</text>
+<rect x="430" y="104" width="340" height="86" rx="14" fill="#0d1b2d" stroke="#46d7e8"/>
+<text x="450" y="139" class="metric" fill="#46d7e8">46.27 s</text>
+<text x="450" y="169" class="small">WARM · RETAINED EXPERTS</text>
+<rect x="808" y="104" width="340" height="86" rx="14" fill="#0d1b2d" stroke="#a978ff"/>
+<text x="828" y="139" class="metric" fill="#a978ff">1.61×</text>
+<text x="828" y="169" class="small">COLD / WARM WALL RATIO</text>
+<rect x="1186" y="104" width="340" height="86" rx="14" fill="#0d1b2d" stroke="#ffc35a"/>
+<text x="1206" y="139" class="metric" fill="#ffc35a">29.26 s</text>
+<text x="1206" y="169" class="small">COLD · ALL SPARKS READY</text>
+<path d="M190.00,230 V970" stroke="#203a55" stroke-width="1" opacity=".55"/>
+<text x="190.00" y="1010" class="small" text-anchor="middle">0.0 s</text>
+<path d="M458.00,230 V970" stroke="#203a55" stroke-width="1" opacity=".55"/>
+<text x="458.00" y="1010" class="small" text-anchor="middle">15.0 s</text>
+<path d="M726.00,230 V970" stroke="#203a55" stroke-width="1" opacity=".55"/>
+<text x="726.00" y="1010" class="small" text-anchor="middle">30.0 s</text>
+<path d="M994.00,230 V970" stroke="#203a55" stroke-width="1" opacity=".55"/>
+<text x="994.00" y="1010" class="small" text-anchor="middle">45.0 s</text>
+<path d="M1262.00,230 V970" stroke="#203a55" stroke-width="1" opacity=".55"/>
+<text x="1262.00" y="1010" class="small" text-anchor="middle">60.0 s</text>
+<path d="M1530.00,230 V970" stroke="#203a55" stroke-width="1" opacity=".55"/>
+<text x="1530.00" y="1010" class="small" text-anchor="middle">75.0 s</text>
+<rect x="52" y="220.0" width="1490" height="320" rx="17" fill="#0d1b2d" stroke="#203a55"/>
+<text x="78" y="255.0" class="section">COLD START</text>
+<text x="172.0" y="324.0" class="body" text-anchor="end">launcher</text>
+<rect x="190.00" y="297.00" width="4.16" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<rect x="194.16" y="297.00" width="29.02" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<rect x="223.18" y="297.00" width="2.61" height="46.00" rx="6" fill="#46d7e8" fill-opacity="0.8" stroke="#46d7e8"/>
+<rect x="225.79" y="297.00" width="47.29" height="46.00" rx="6" fill="#ffc35a" fill-opacity="0.8" stroke="#ffc35a"/>
+<rect x="273.08" y="297.00" width="1.50" height="46.00" rx="6" fill="#56d69c" fill-opacity="0.8" stroke="#56d69c"/>
+<rect x="273.33" y="297.00" width="33.57" height="46.00" rx="6" fill="#ff8f5a" fill-opacity="0.8" stroke="#ff8f5a"/>
+<rect x="306.90" y="297.00" width="1.50" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<rect x="306.99" y="297.00" width="1.50" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<rect x="307.99" y="297.00" width="1210.20" height="46.00" rx="6" fill="#46d7e8" fill-opacity="0.8" stroke="#46d7e8"/>
+<text x="913.09" y="317.0" class="small" text-anchor="middle">api-ready</text>
+<text x="913.09" y="334.0" class="small" text-anchor="middle">67.73s</text>
+<text x="172.0" y="406.0" class="body" text-anchor="end">coordinator</text>
+<rect x="308.05" y="379.00" width="11.29" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<rect x="319.34" y="379.00" width="98.09" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<text x="368.38" y="399.0" class="small" text-anchor="middle">weights / draft preload</text>
+<text x="368.38" y="416.0" class="small" text-anchor="middle">5.49s</text>
+<rect x="417.43" y="379.00" width="353.00" height="46.00" rx="6" fill="#ffc35a" fill-opacity="0.8" stroke="#ffc35a"/>
+<text x="593.93" y="399.0" class="small" text-anchor="middle">Spark readiness</text>
+<text x="593.93" y="416.0" class="small" text-anchor="middle">19.76s</text>
+<rect x="770.42" y="379.00" width="26.82" height="46.00" rx="6" fill="#ff8f5a" fill-opacity="0.8" stroke="#ff8f5a"/>
+<rect x="797.24" y="379.00" width="1.50" height="46.00" rx="6" fill="#46d7e8" fill-opacity="0.8" stroke="#46d7e8"/>
+<rect x="798.63" y="379.00" width="716.25" height="46.00" rx="6" fill="#56d69c" fill-opacity="0.8" stroke="#56d69c"/>
+<text x="1156.75" y="399.0" class="small" text-anchor="middle">targeted graph prewarm</text>
+<text x="1156.75" y="416.0" class="small" text-anchor="middle">40.09s</text>
+<rect x="1514.87" y="379.00" width="1.50" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<text x="172.0" y="488.0" class="body" text-anchor="end">four Sparks</text>
+<rect x="307.03" y="461.00" width="405.82" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<text x="509.94" y="490.0" class="body" text-anchor="middle">parallel slab reload → all ready</text>
+<path d="M1518.24,280.0 V515.0" stroke="#e9f3ff" stroke-width="2" stroke-dasharray="5 5"/>
+<text x="1511.24" y="275.0" class="small" text-anchor="end">API ready</text>
+<rect x="52" y="585.0" width="1490" height="320" rx="17" fill="#0d1b2d" stroke="#203a55"/>
+<text x="78" y="620.0" class="section">WARM START</text>
+<text x="172.0" y="689.0" class="body" text-anchor="end">launcher</text>
+<rect x="190.00" y="662.00" width="1.79" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<rect x="191.79" y="662.00" width="28.09" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<rect x="219.87" y="662.00" width="2.47" height="46.00" rx="6" fill="#46d7e8" fill-opacity="0.8" stroke="#46d7e8"/>
+<rect x="222.34" y="662.00" width="19.24" height="46.00" rx="6" fill="#ffc35a" fill-opacity="0.8" stroke="#ffc35a"/>
+<rect x="241.58" y="662.00" width="1.50" height="46.00" rx="6" fill="#56d69c" fill-opacity="0.8" stroke="#56d69c"/>
+<rect x="241.65" y="662.00" width="1.50" height="46.00" rx="6" fill="#ff8f5a" fill-opacity="0.8" stroke="#ff8f5a"/>
+<rect x="242.58" y="662.00" width="1.50" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<rect x="242.65" y="662.00" width="1.50" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<rect x="243.92" y="662.00" width="772.66" height="46.00" rx="6" fill="#46d7e8" fill-opacity="0.8" stroke="#46d7e8"/>
+<text x="630.25" y="682.0" class="small" text-anchor="middle">api-ready</text>
+<text x="630.25" y="699.0" class="small" text-anchor="middle">43.25s</text>
+<text x="172.0" y="771.0" class="body" text-anchor="end">coordinator</text>
+<rect x="243.99" y="744.00" width="8.52" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<rect x="252.52" y="744.00" width="84.04" height="46.00" rx="6" fill="#a978ff" fill-opacity="0.8" stroke="#a978ff"/>
+<text x="294.54" y="764.0" class="small" text-anchor="middle">weights / draft preload</text>
+<text x="294.54" y="781.0" class="small" text-anchor="middle">4.70s</text>
+<rect x="336.56" y="744.00" width="1.50" height="46.00" rx="6" fill="#ffc35a" fill-opacity="0.8" stroke="#ffc35a"/>
+<rect x="336.58" y="744.00" width="1.50" height="46.00" rx="6" fill="#ff8f5a" fill-opacity="0.8" stroke="#ff8f5a"/>
+<rect x="336.58" y="744.00" width="1.50" height="46.00" rx="6" fill="#46d7e8" fill-opacity="0.8" stroke="#46d7e8"/>
+<rect x="337.76" y="744.00" width="674.85" height="46.00" rx="6" fill="#56d69c" fill-opacity="0.8" stroke="#56d69c"/>
+<text x="675.19" y="764.0" class="small" text-anchor="middle">targeted graph prewarm</text>
+<text x="675.19" y="781.0" class="small" text-anchor="middle">37.77s</text>
+<rect x="1012.61" y="744.00" width="1.50" height="46.00" rx="6" fill="#5d8cff" fill-opacity="0.8" stroke="#5d8cff"/>
+<text x="172.0" y="853.0" class="body" text-anchor="end">four Sparks</text>
+<rect x="190.00" y="826.00" width="170.00" height="46.00" rx="6" fill="#56d69c" fill-opacity="0.8" stroke="#56d69c"/>
+<text x="275.0" y="855.0" class="body" text-anchor="middle">resident at t=0</text>
+<path d="M1016.67,645.0 V880.0" stroke="#e9f3ff" stroke-width="2" stroke-dasharray="5 5"/>
+<text x="1009.67" y="640.0" class="small" text-anchor="end">API ready</text>
+<text x="52" y="1034" class="subtitle">All bars are measured phase clocks. Coordinator rows are aligned at launcher dispatch; four Spark reloads run in parallel.</text>
+</svg>

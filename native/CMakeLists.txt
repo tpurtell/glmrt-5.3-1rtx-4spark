@@ -235,6 +235,11 @@ if(GLMRT_ENABLE_SPARKINFER_AOT)
   set(GLMRT_B12X_AOT_REGIMES 1 2 4 8 16 32 64 128 256)
   set(GLMRT_B12X_AOT_TOPK8_PREFILL_REGIMES 2 4 8 16 32 64 128 256 512 1024 2048 2064)
   set(GLMRT_B12X_EXL3_K3_REGIMES 1 2 4 8 9 16 32 64 128 256 257 512 1024 2048 2064)
+  set(GLMRT_B12X_EXL3_K4_REGIMES
+    1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+    17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+    64 128 256 257 512 1024 2048 2064
+  )
   set(GLMRT_B12X_AOT_OBJECTS)
   set(GLMRT_B12X_AOT_HEADERS)
   list(APPEND GLMRT_B12X_AOT_OBJECTS
@@ -254,6 +259,11 @@ if(GLMRT_ENABLE_SPARKINFER_AOT)
   foreach(regime IN LISTS GLMRT_B12X_EXL3_K3_REGIMES)
     list(APPEND GLMRT_B12X_AOT_OBJECTS
       "${GLMRT_B12X_AOT_DIR}/moe_tp4_exl3_k3_m${regime}_topk8.o"
+    )
+  endforeach()
+  foreach(regime IN LISTS GLMRT_B12X_EXL3_K4_REGIMES)
+    list(APPEND GLMRT_B12X_AOT_OBJECTS
+      "${GLMRT_B12X_AOT_DIR}/moe_tp4_exl3_k4_m${regime}_topk8.o"
     )
   endforeach()
   list(APPEND GLMRT_B12X_AOT_OBJECTS
@@ -280,6 +290,11 @@ if(GLMRT_ENABLE_SPARKINFER_AOT)
       "${GLMRT_B12X_AOT_DIR}/moe_tp4_exl3_k3_m${regime}_topk8.h"
     )
   endforeach()
+  foreach(regime IN LISTS GLMRT_B12X_EXL3_K4_REGIMES)
+    list(APPEND GLMRT_B12X_AOT_HEADERS
+      "${GLMRT_B12X_AOT_DIR}/moe_tp4_exl3_k4_m${regime}_topk8.h"
+    )
+  endforeach()
   list(APPEND GLMRT_B12X_AOT_HEADERS
     "${GLMRT_B12X_AOT_DIR}/moe_tp4_exl3_k3_topk_sum.h"
     "${GLMRT_B12X_AOT_DIR}/moe_tp4_exl3_k3_topk_sum_bf16.h"
@@ -302,6 +317,7 @@ if(GLMRT_ENABLE_SPARKINFER_AOT)
     DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_spark_moe_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/_b12x_exl3_k3_profile.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/_b12x_exl3_k4_profile.py"
       ${GLMRT_SPARKINFER_PROVENANCE_INPUTS}
       ${GLMRT_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting Spark-side SparkInfer AOT kernels"

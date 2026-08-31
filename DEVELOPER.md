@@ -20,12 +20,14 @@
   lanes, GPU-resident weights, direct packed attention, and no timed graph
   captures.
 - `balanced`, `long`, and `accuracy` are launch profiles over one engine;
-  `plain`, `mtp`, and `dspark` are independent speculation modes.
-- `MODEL=luke` and `MODEL=nvidia` select ModelOpt NVFP4 checkpoints;
-  `MODEL=exl3` selects the calibrated routed-expert-only EXL3 K3 checkpoint.
+  the public GLM-5.3 path qualifies `plain`, `mtp`, and `dflash2` speculation.
+- `MODEL=glm53-exl3` selects the calibrated GLM-5.3 EXL3 K4 checkpoint;
+  adaptive DFlash2 K1–K7 is the production default.
 - The EXL3 artifact keeps attention, dense/shared MLP, router, and other
   non-routed-expert tensors in their source dtype; only routed experts in
-  layers 3–77 use native K3/MCG tensors.
+  layers 3–77 use native K4/MCG tensors.
+- DFlash2 consumes six target residual taps, keeps bounded request-local draft
+  KV, and selects verification width from the checked-in route-cost profile.
 - Production builds derive tensor catalogs and deterministic modulo expert
   placement directly from local safetensors metadata; generated catalog and
   load-plan JSON files are diagnostic only.
@@ -156,8 +158,11 @@ streaming, usage, finish reason, and continuation token identity.
 | `python3 python/tools/bench_real_full_concurrency.py --help` | Discover real-model C=1/C=2/C=4 concurrency options. |
 | `python3 python/tools/bench_real_full_prefill_concurrency.py --help` | Discover cache-cold prefill concurrency options. |
 | `python3 python/tools/bench_real_full_long_context_session.py --help` | Discover the growing semantic long-context gate. |
-| `python3 python/tools/bench_real_full_mtp_acceptance.py --help` | Discover MTP/dSpark acceptance and throughput options. |
+| `python3 python/tools/bench_real_full_mtp_acceptance.py --help` | Discover native-MTP/DFlash2 acceptance and throughput options. |
 | `python3 python/tools/bench_release_prefill_matrix.py --help` | Run the exact cache-aware public prefill matrix or a selected cell. |
+| `python3 python/tools/bench_release_decode_matrix.py --help` | Run the retained-context GLM-5.3 decode matrix. |
+| `python3 python/tools/bench_real_full_needle.py --help` | Run exact long-context needle-recall cases. |
+| `python3 python/tools/validate_glm53_exl3_serving_qualification.py --help` | Validate matched native-MTP and DFlash2 release evidence. |
 | `tool-eval-bench --base-url http://127.0.0.1:8000/v1/ --parallel 1 --model MODEL` | Run the serial 69-scenario tool-call correctness gate. |
 | `python3 scripts/bench-real-full-mixed-concurrency.py --help` | Discover mixed streaming/admission/cancellation scenarios. |
 | `just inspect-model` | Build a diagnostic tensor catalog from the selected snapshot. |
@@ -186,7 +191,7 @@ retention, and aggregate concurrency as separate measurements.
 | `rust/crates/glmrt-transport/` | ExpertProtocolV2 framing/batching plus TCP, verbs, synthetic, capabilities, and metrics paths. |
 | `native/include/glmrt_native.h` | Stable C ABI between Rust and the native library. |
 | `native/src/` | C++ native dispatch, validation, resource ownership, and ABI implementation. |
-| `native/cuda/kernels/` | CUDA kernels for attention/KV, routing/MoE, projections, residuals, sampling, dSpark, and AOT launchers. |
+| `native/cuda/kernels/` | CUDA kernels for attention/KV, routing/MoE, projections, residuals, sampling, DFlash2, and AOT launchers. |
 | `native/tests/` | CPU/native and CUDA self-tests. |
 | `native/tools/` | Native benchmark utilities, including constrained-generation/XGrammar coverage. |
 | `python/reference/glmrt_reference/` | Independent math/config oracles and PyO3 graph-capture adapters used by tests/runtime. |
@@ -194,9 +199,9 @@ retention, and aggregate concurrency as separate measurements.
 | `python/tools/` | Kernel exporters, tuners, model/cache inspection, real-model benchmarks, and vision worker. |
 | `scripts/` | Development launcher, doctors, remote staging, expert lifecycle, API smokes, release support, and network benchmarks. |
 | `docker/` | Development and inference Dockerfiles plus runtime entrypoints. |
-| `quantization/` | Reproducible calibrated GLM-5.2 routed-expert EXL3 K3 pipeline, validation, and model-card tooling. |
+| `quantization/` | Reproducible calibrated GLM-5.3 routed-expert EXL3 K4 recipe, validation, and model-card tooling. |
 | `third_party/gptqmodel/` | Pinned build-only GPTQModel fork used by the EXL3 quantization image. |
-| `third_party/sparkinfer/` | Pinned runtime/build source for NVFP4 and EXL3 Spark expert kernels. |
+| `third_party/sparkinfer/` | Pinned runtime/build source for EXL3 K4 Spark expert kernels. |
 | `dist/` | Ignored exported release binaries/libraries and `SHA256SUMS`. |
 
 ## Change routing
@@ -209,7 +214,8 @@ retention, and aggregate concurrency as separate measurements.
 | Protocol/frame/TCP/verbs | `glmrt-transport`, native RDMA ABI | Transport tests + app-level verbs bench |
 | Coordinator CUDA path | daemon `real_full/coordinator_kernels`, `native/cuda/kernels` | Native CTest + CUDA graph gate + targeted real probe |
 | Spark expert kernel/layout | daemon `expertd`, `native/cuda/kernels`, Python AOT exporters | Spark-native rebuild + real expert smoke/bench |
-| EXL3 loading/kernel/quantization | daemon EXL3 loader, `SparkInfer`, `quantization/` | Quantization tests + paired NVFP4/EXL3 live qualification |
+| EXL3 loading/kernel/quantization | daemon EXL3 loader, `SparkInfer`, `quantization/` | Quantization tests + four-rank K4 native parity + live qualification |
+| DFlash2 draft execution/policy | daemon `real_full/dflash*`, Python capture modules, checked-in cost profile | Capture tests + preflight + matched native-MTP/DFlash2 live qualification |
 | Profile/capacity/defaults | `serve_profiles.py`, `resolve_serve_profile.py`, `release-common.sh`, config | Python profile tests + `run.sh --dry-run` + live memory gate |
 | Image/runtime dependency | `docker/`, `build-release-artifacts.sh` | Clean role build + import gates + five-container smoke |
 

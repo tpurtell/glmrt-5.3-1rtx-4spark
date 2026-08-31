@@ -63,6 +63,32 @@ def test_native_replay_rejects_tampered_route_profile(tmp_path: Path) -> None:
         TOOL._load_route_profile_sample(path, 0, 9)
 
 
+def test_native_replay_rejects_a_route_profile_from_another_bitrate(
+    tmp_path: Path,
+) -> None:
+    body = {
+        "schema": TOOL.GLM5_ROUTE_PROFILE_SCHEMA,
+        "status": "accepted",
+        "capture_id": "glm53-k4-v1",
+        "geometry": {"trellis_bits": 4},
+        "samples": [
+            {
+                "rows": 9,
+                "layer_id": 3,
+                "expert_route_counts": [[expert_id, 9] for expert_id in range(8)],
+            }
+        ],
+    }
+    body["report_sha256"] = hashlib.sha256(TOOL._canonical_json(body)).hexdigest()
+    path = tmp_path / "glm53-route-profile.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+    counts, _ = TOOL._load_route_profile_sample(path, 0, 9, 4)
+    assert counts == [9] * 8 + [0] * 248
+    with pytest.raises(ValueError, match="bitrate"):
+        TOOL._load_route_profile_sample(path, 0, 9, 3)
+
+
 @pytest.mark.parametrize("rows", [2048, 2064])
 def test_checked_in_high_reuse_tail_fixture_is_a_legal_topk8_plan(rows: int) -> None:
     path = (

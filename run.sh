@@ -212,6 +212,8 @@ profile_args=(
 [[ -z "$KV_POOL_TOKENS" ]] || profile_args+=(--kv-pool-tokens "$KV_POOL_TOKENS")
 [[ -z "$MAX_CONTEXT_TOKENS" ]] || profile_args+=(--max-context-tokens "$MAX_CONTEXT_TOKENS")
 [[ -z "$MAX_OUTPUT_TOKENS" ]] || profile_args+=(--max-output-tokens "$MAX_OUTPUT_TOKENS")
+[[ -z "$DFLASH2_FIXED_DRAFTS" ]] || profile_args+=(--dflash2-fixed-drafts "$DFLASH2_FIXED_DRAFTS")
+profile_args+=(--dflash2-topk-backend "$DFLASH2_TOPK_BACKEND")
 
 resolve_profile() {
   docker run --rm \
@@ -233,6 +235,9 @@ jq -e . "$resolved_json" >/dev/null || release_die "profile resolver returned in
 
 blockers="$(jq -r '.blockers[]?' "$resolved_json")"
 [[ -z "$blockers" ]] || release_die "profile blockers:\n$blockers"
+resolved_dflash2_fixed_drafts="$(
+  jq -r '.environment.GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS // empty' "$resolved_json"
+)"
 check_model_cache_local() {
   local model_id="$1"
   local revision="${2:-}"
@@ -291,6 +296,7 @@ deployment_fingerprint="$(
       "$coordinator_model_revision" \
       "$SPARKINFER_GLM_H64_QUERY_PROJECTION" \
       "$DSPARK_FIXED_DRAFTS" \
+      "$DFLASH2_FIXED_DRAFTS" \
       "$SPARK_0_HOST" "$SPARK_0_LANE_A" "$SPARK_0_LANE_B" \
       "$SPARK_1_HOST" "$SPARK_1_LANE_A" "$SPARK_1_LANE_B" \
       "$SPARK_2_HOST" "$SPARK_2_LANE_A" "$SPARK_2_LANE_B" \
@@ -406,6 +412,7 @@ for host in "$SPARK_0_HOST" "$SPARK_1_HOST" "$SPARK_2_HOST" "$SPARK_3_HOST"; do
 done
 echo "  SparkInfer H64 query projection: $SPARKINFER_GLM_H64_QUERY_PROJECTION"
 echo "  fixed dSpark drafts: ${DSPARK_FIXED_DRAFTS:-adaptive}"
+echo "  fixed DFlash2 drafts: ${resolved_dflash2_fixed_drafts:-inactive}"
 if ((dry_run)); then
   echo "Dry-run checks passed."
   exit 0
@@ -459,8 +466,16 @@ if [[ -n "${GLMRT_REAL_FULL_DSPARK_PROFILE_SAMPLES:-}" ]]; then
   echo "GLMRT_REAL_FULL_DSPARK_PROFILE_SAMPLES=$GLMRT_REAL_FULL_DSPARK_PROFILE_SAMPLES" \
     >>"$env_file"
 fi
+if [[ -n "${GLMRT_REAL_FULL_GRAPH_CAPTURE_TRACE:-}" ]]; then
+  echo "GLMRT_REAL_FULL_GRAPH_CAPTURE_TRACE=$GLMRT_REAL_FULL_GRAPH_CAPTURE_TRACE" \
+    >>"$env_file"
+fi
 if [[ -n "${GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS:-}" ]]; then
   echo "GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS=$GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS" \
+    >>"$env_file"
+fi
+if [[ -n "${GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES:-}" ]]; then
+  echo "GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES=$GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES" \
     >>"$env_file"
 fi
 if [[ -n "${GLMRT_PROTOCOL_V2_EXPERT_QUEUE_CAPTURE_ID:-}" ]]; then
@@ -562,6 +577,10 @@ echo "  profile:     $PROFILE"
 echo "  model:       $RELEASE_MODEL_ID"
 echo "  speculation: $SPECULATION"
 echo "  H64 query:   $SPARKINFER_GLM_H64_QUERY_PROJECTION"
-echo "  fixed draft: ${DSPARK_FIXED_DRAFTS:-adaptive}"
+if [[ "$SPECULATION" == dflash2 ]]; then
+  echo "  fixed draft: $resolved_dflash2_fixed_drafts"
+else
+  echo "  fixed draft: ${DSPARK_FIXED_DRAFTS:-adaptive}"
+fi
 echo "  concurrency: $CONCURRENCY"
 echo "  containers:  $coordinator_container + four $spark_container_prefix experts"

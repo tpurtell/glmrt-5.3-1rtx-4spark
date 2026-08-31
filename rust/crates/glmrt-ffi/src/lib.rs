@@ -198,6 +198,8 @@ pub struct GlmrtB12xSparkExl3K3MoeBuffers {
     pub down_svh: GlmrtDeviceBuffer,
 }
 
+pub type GlmrtB12xSparkExl3K4MoeBuffers = GlmrtB12xSparkExl3K3MoeBuffers;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GlmrtB12xCoordinatorW4a16Buffers {
@@ -1234,6 +1236,7 @@ type CudaB12xSparkExl3K3Topk8Nvfp4AsyncFn = unsafe extern "C" fn(
     rows: usize,
     cuda_stream: *mut c_void,
 ) -> GlmrtStatus;
+type CudaB12xSparkExl3K4Topk8Nvfp4AsyncFn = CudaB12xSparkExl3K3Topk8Nvfp4AsyncFn;
 type CudaB12xSparkW4a16PrefillTopk8Nvfp4Fp8AsyncFn = unsafe extern "C" fn(
     buffers: *const GlmrtB12xSparkW4a16MoeBuffers,
     input_payload: GlmrtDeviceBuffer,
@@ -1810,6 +1813,14 @@ type CudaQuantizeBf16W8a16Group256PackedAsyncFn = unsafe extern "C" fn(
     source: *const u16,
     weight: *mut i8,
     scales: *mut f32,
+    input_dim: usize,
+    output_dim: usize,
+    cuda_stream: *mut c_void,
+) -> GlmrtStatus;
+type CudaDequantizeBlockFp8E4m3Bf16AsyncFn = unsafe extern "C" fn(
+    source: *const u8,
+    scales: *const f32,
+    output: *mut u16,
     input_dim: usize,
     output_dim: usize,
     cuda_stream: *mut c_void,
@@ -6462,6 +6473,57 @@ impl NativeLibrary {
         )
     }
 
+    pub unsafe fn cuda_b12x_spark_exl3_k4_topk8_nvfp4_async(
+        &self,
+        buffers: &GlmrtB12xSparkExl3K4MoeBuffers,
+        input_payload: GlmrtDeviceBuffer,
+        input_payload_stride_bytes: usize,
+        rows: usize,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        let kernel_fn: Symbol<CudaB12xSparkExl3K4Topk8Nvfp4AsyncFn> = unsafe {
+            self.lib
+                .get(b"glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_async")?
+        };
+        let status = unsafe {
+            kernel_fn(
+                buffers,
+                input_payload,
+                input_payload_stride_bytes,
+                rows,
+                cuda_stream,
+            )
+        };
+        self.status_to_result("glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_async", status)
+    }
+
+    pub unsafe fn cuda_b12x_spark_exl3_k4_topk8_nvfp4_bf16_async(
+        &self,
+        buffers: &GlmrtB12xSparkExl3K4MoeBuffers,
+        input_payload: GlmrtDeviceBuffer,
+        input_payload_stride_bytes: usize,
+        rows: usize,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        let kernel_fn: Symbol<CudaB12xSparkExl3K4Topk8Nvfp4AsyncFn> = unsafe {
+            self.lib
+                .get(b"glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_bf16_async")?
+        };
+        let status = unsafe {
+            kernel_fn(
+                buffers,
+                input_payload,
+                input_payload_stride_bytes,
+                rows,
+                cuda_stream,
+            )
+        };
+        self.status_to_result(
+            "glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_bf16_async",
+            status,
+        )
+    }
+
     pub unsafe fn cuda_b12x_spark_w4a16_prefill_topk8_nvfp4_fp8_async(
         &self,
         buffers: &GlmrtB12xSparkW4a16MoeBuffers,
@@ -10759,6 +10821,59 @@ impl NativeLibrary {
             "glmrt_cuda_quantize_bf16_w8a16_group256_packed_async",
             status,
         )
+    }
+
+    pub unsafe fn cuda_dequantize_block_fp8_e4m3_bf16_async(
+        &self,
+        source: GlmrtDeviceBuffer,
+        scales: GlmrtDeviceBuffer,
+        output: GlmrtDeviceBuffer,
+        input_dim: usize,
+        output_dim: usize,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        let source_bytes = output_dim
+            .checked_mul(input_dim)
+            .context("block-FP8 dequantizer source bytes overflow")?;
+        let output_bytes = source_bytes
+            .checked_mul(std::mem::size_of::<u16>())
+            .context("block-FP8 dequantizer output bytes overflow")?;
+        let scale_rows = output_dim.div_ceil(128);
+        let scale_columns = input_dim.div_ceil(128);
+        let scale_bytes = scale_rows
+            .checked_mul(scale_columns)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .context("block-FP8 dequantizer scale bytes overflow")?;
+        anyhow::ensure!(
+            input_dim > 0 && output_dim > 0,
+            "block-FP8 dequantizer requires positive dimensions"
+        );
+        for (label, buffer, expected) in [
+            ("source", source, source_bytes),
+            ("scales", scales, scale_bytes),
+            ("output", output, output_bytes),
+        ] {
+            anyhow::ensure!(
+                !buffer.ptr.is_null() && buffer.bytes >= expected,
+                "block-FP8 dequantizer {label} buffer has {} bytes, expected at least {expected}",
+                buffer.bytes
+            );
+        }
+        let kernel_fn: Symbol<CudaDequantizeBlockFp8E4m3Bf16AsyncFn> = unsafe {
+            self.lib
+                .get(b"glmrt_cuda_dequantize_block_fp8_e4m3_bf16_async")?
+        };
+        let status = unsafe {
+            kernel_fn(
+                source.ptr.cast::<u8>() as *const u8,
+                scales.ptr.cast::<f32>() as *const f32,
+                output.ptr.cast::<u16>(),
+                input_dim,
+                output_dim,
+                cuda_stream,
+            )
+        };
+        self.status_to_result("glmrt_cuda_dequantize_block_fp8_e4m3_bf16_async", status)
     }
 
     pub unsafe fn cuda_w8a16_packed_o_aot_init(&self) -> Result<()> {
@@ -16601,6 +16716,9 @@ mod tests {
     fn native_library_path() -> Option<PathBuf> {
         if let Ok(path) = env::var("GLMRT_NATIVE_LIB") {
             return Some(PathBuf::from(path));
+        }
+        if env::var("GLMRT_DISABLE_NATIVE_AUTO_DISCOVERY").as_deref() == Ok("1") {
+            return None;
         }
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")

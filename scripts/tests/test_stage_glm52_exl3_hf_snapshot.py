@@ -37,11 +37,13 @@ def bound(value: dict, field: str) -> dict:
     return value | {field: hashlib.sha256(TOOL._canonical_json(value)).hexdigest()}
 
 
-def make_quant_evidence(tmp_path: Path, plan_sha256: str) -> Path:
+def make_quant_evidence(
+    tmp_path: Path, plan_sha256: str, *, schema: str = TOOL.QUANT_EVIDENCE_SCHEMA
+) -> Path:
     path = tmp_path / "quant-evidence.json"
     report = bound(
         {
-            "schema": TOOL.QUANT_EVIDENCE_SCHEMA,
+            "schema": schema,
             "status": "accepted",
             "quality_scope": (
                 "projection-quantizer-evidence-not-end-to-end-model-quality"
@@ -71,19 +73,50 @@ def make_quant_evidence(tmp_path: Path, plan_sha256: str) -> Path:
     return path
 
 
-def make_candidate(tmp_path: Path) -> tuple[Path, Path, Path]:
+def make_candidate(tmp_path: Path, *, bits: int = 3) -> tuple[Path, Path, Path]:
     artifact = tmp_path / "artifact"
     artifact.mkdir()
     tensor = artifact / "model.safetensors"
     tensor.write_bytes(b"accepted-exl3-tensors")
     plan = artifact / "glmrt-gptqmodel-plan.json"
-    plan.write_text("{}\n", encoding="utf-8")
+    plan_contract = (
+        {
+            "schema": "glmrt-glm5-gptqmodel-plan-v3",
+            "recipe": "glm53_exl3_trellis_4bpw_calibrated_natural_route_v1",
+            "source": {
+                "release": "glm-5.3",
+                "format": "fp8-e4m3-block128x128-dynamic",
+            },
+        }
+        if bits == 4
+        else {
+            "schema": "glmrt-glm52-gptqmodel-plan-v2",
+            "recipe": "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1",
+            "source": {"release": "glm-5.2", "format": "bf16"},
+        }
+    )
+    plan.write_text(json.dumps(plan_contract) + "\n", encoding="utf-8")
+    if bits == 4:
+        (artifact / "quantize_config.json").write_text(
+            json.dumps({"fixture": "complete-k4-quantization-config"}) + "\n",
+            encoding="utf-8",
+        )
     records = {
         plan.name: {"bytes": plan.stat().st_size, "sha256": sha256(plan)},
         tensor.name: {"bytes": tensor.stat().st_size, "sha256": sha256(tensor)},
     }
+    if bits == 4:
+        qcfg = artifact / "quantize_config.json"
+        records[qcfg.name] = {
+            "bytes": qcfg.stat().st_size,
+            "sha256": sha256(qcfg),
+        }
     manifest = {
-        "schema": TOOL.ARTIFACT_SCHEMA,
+        "schema": (
+            "glmrt-glm5-gptqmodel-artifact-v2"
+            if bits == 4
+            else TOOL.ARTIFACT_SCHEMA
+        ),
         "manifest_sha256": "a" * 64,
         "files": records,
     }
@@ -93,9 +126,13 @@ def make_candidate(tmp_path: Path) -> tuple[Path, Path, Path]:
     (artifact / "glmrt-gptqmodel-run.json").write_text("{}\n", encoding="utf-8")
     report = tmp_path / "validation.json"
     report_body = {
-        "schema": TOOL.VALIDATION_SCHEMA,
+        "schema": (
+            "glmrt-glm5-exl3-artifact-validation-v1"
+            if bits == 4
+            else TOOL.VALIDATION_SCHEMA
+        ),
         "status": "accepted",
-        "model_id": TOOL.MODEL_ID,
+        "model_id": TOOL.GLM53_MODEL_ID if bits == 4 else TOOL.MODEL_ID,
         "artifact": str(artifact.resolve()),
         "artifact_manifest_sha256": "a" * 64,
         "plan_sha256": "b" * 64,
@@ -112,19 +149,53 @@ def make_candidate(tmp_path: Path) -> tuple[Path, Path, Path]:
         "tokenizer_evidence": {
             "mode": "plan-bound",
             "tokenizer_files": [
-                {"name": "tokenizer.json", "bytes": 1, "sha256": "c" * 64},
+                {
+                    "name": "tokenizer.json",
+                    "bytes": 1,
+                    "sha256": "c" * 64,
+                    **({"hf_blob_id": "1" * 64} if bits == 4 else {}),
+                },
                 {
                     "name": "tokenizer_config.json",
                     "bytes": 1,
                     "sha256": "d" * 64,
+                    **({"hf_blob_id": "2" * 64} if bits == 4 else {}),
                 },
             ],
         },
     }
+    if bits == 4:
+        report_body["quantization_config"] = {
+            "sha256": sha256(artifact / "quantize_config.json"),
+            "tensor_storage_entries": TOOL.EXPECTED_PROJECTIONS,
+            "stored_tensor_descriptions": TOOL.EXPECTED_PROJECTIONS * 4,
+            "ledger_provenance_sha256": "9" * 64,
+        }
+        report_body["source_metadata"] = [
+            {"name": "tokenizer.json", "bytes": 1, "sha256": "c" * 64},
+            {
+                "name": "tokenizer_config.json",
+                "bytes": 1,
+                "sha256": "d" * 64,
+            },
+            {
+                "name": "generation_config.json",
+                "bytes": 1,
+                "sha256": "f" * 64,
+            },
+        ]
     report.write_bytes(
         TOOL._canonical_json(bound(report_body, "report_sha256")) + b"\n"
     )
-    return artifact, report, make_quant_evidence(tmp_path, "b" * 64)
+    return artifact, report, make_quant_evidence(
+        tmp_path,
+        "b" * 64,
+        schema=(
+            TOOL.GLM53_QUANT_EVIDENCE_SCHEMA
+            if bits == 4
+            else TOOL.QUANT_EVIDENCE_SCHEMA
+        ),
+    )
 
 
 def test_hardlink_stage_uses_standard_blob_snapshot_and_plain_ref(tmp_path: Path) -> None:
@@ -152,6 +223,99 @@ def test_hardlink_stage_uses_standard_blob_snapshot_and_plain_ref(tmp_path: Path
     assert contract.revision == staged["revision"]
     assert contract.files == staged["files"]
     assert contract.bytes == staged["bytes"]
+
+
+def test_glm53_k4_stages_only_under_exact_publication_id(tmp_path: Path) -> None:
+    artifact, report, quant_evidence = make_candidate(tmp_path, bits=4)
+
+    staged = TOOL.stage(
+        artifact,
+        report,
+        quant_evidence_report_path=quant_evidence,
+        model_id=TOOL.GLM53_MODEL_ID,
+        hf_home=tmp_path / "hf",
+        link_mode="hardlink",
+        update_ref=False,
+    )
+
+    assert staged["model_id"] == "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
+    assert "models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1" in staged["snapshot"]
+
+    with pytest.raises(TOOL.StagingError, match="must be staged as"):
+        TOOL.stage(
+            artifact,
+            report,
+            quant_evidence_report_path=quant_evidence,
+            model_id=TOOL.MODEL_ID,
+            hf_home=tmp_path / "wrong-hf",
+            link_mode="hardlink",
+            update_ref=False,
+        )
+
+
+def test_glm53_stage_rejects_missing_exact_source_metadata(tmp_path: Path) -> None:
+    artifact, report, quant_evidence = make_candidate(tmp_path, bits=4)
+    value = json.loads(report.read_text(encoding="utf-8"))
+    value.pop("source_metadata")
+    body = {key: item for key, item in value.items() if key != "report_sha256"}
+    report.write_bytes(
+        TOOL._canonical_json(bound(body, "report_sha256")) + b"\n"
+    )
+
+    with pytest.raises(TOOL.StagingError, match="does not accept"):
+        TOOL.stage(
+            artifact,
+            report,
+            quant_evidence_report_path=quant_evidence,
+            model_id=TOOL.GLM53_MODEL_ID,
+            hf_home=tmp_path / "hf",
+            link_mode="hardlink",
+            update_ref=False,
+        )
+
+
+def test_glm53_stage_rejects_source_metadata_that_disagrees_with_tokenizer_evidence(
+    tmp_path: Path,
+) -> None:
+    artifact, report, quant_evidence = make_candidate(tmp_path, bits=4)
+    value = json.loads(report.read_text(encoding="utf-8"))
+    value["source_metadata"][0]["sha256"] = "0" * 64
+    body = {key: item for key, item in value.items() if key != "report_sha256"}
+    report.write_bytes(
+        TOOL._canonical_json(bound(body, "report_sha256")) + b"\n"
+    )
+
+    with pytest.raises(TOOL.StagingError, match="does not accept"):
+        TOOL.stage(
+            artifact,
+            report,
+            quant_evidence_report_path=quant_evidence,
+            model_id=TOOL.GLM53_MODEL_ID,
+            hf_home=tmp_path / "hf",
+            link_mode="hardlink",
+            update_ref=False,
+        )
+
+
+def test_glm53_stage_rejects_missing_quantization_config_proof(tmp_path: Path) -> None:
+    artifact, report, quant_evidence = make_candidate(tmp_path, bits=4)
+    value = json.loads(report.read_text(encoding="utf-8"))
+    value.pop("quantization_config")
+    body = {key: item for key, item in value.items() if key != "report_sha256"}
+    report.write_bytes(
+        TOOL._canonical_json(bound(body, "report_sha256")) + b"\n"
+    )
+
+    with pytest.raises(TOOL.StagingError, match="does not accept"):
+        TOOL.stage(
+            artifact,
+            report,
+            quant_evidence_report_path=quant_evidence,
+            model_id=TOOL.GLM53_MODEL_ID,
+            hf_home=tmp_path / "hf",
+            link_mode="hardlink",
+            update_ref=False,
+        )
 
 
 def test_stage_ref_move_requires_explicit_permission(tmp_path: Path) -> None:
@@ -349,3 +513,69 @@ def test_sync_fans_out_all_hosts_concurrently_and_sorts_evidence(
     assert set(observed) == set(hosts)
     assert [entry["host"] for entry in result["hosts"]] == sorted(hosts)
     assert result["remote_payload_hashes_verified"] is True
+
+
+def test_glm53_sync_uses_exact_k4_cache_root_and_full_hash_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = SYNC.LocalContract(
+        root=tmp_path
+        / "hf"
+        / "hub"
+        / "models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1",
+        revision="a" * 64,
+        files=42,
+        bytes=987_654,
+    )
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        SYNC,
+        "_remote_hf_home",
+        lambda host: Path("/home/tj/.cache/huggingface"),
+    )
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if kwargs.get("stdout") == subprocess.PIPE:
+            payload = {
+                "revision": contract.revision,
+                "files": contract.files,
+                "bytes": contract.bytes,
+                "verified_blobs": contract.files,
+            }
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(payload),
+            )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(SYNC.subprocess, "run", fake_run)
+
+    report = SYNC._sync_host(
+        "ostrich",
+        contract,
+        model_id=TOOL.GLM53_MODEL_ID,
+        verify_hashes=True,
+    )
+
+    exact_root = (
+        "/home/tj/.cache/huggingface/hub/"
+        "models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1"
+    )
+    assert report["host"] == "ostrich"
+    assert commands[1] == [
+        "rdmasync",
+        "-aH",
+        "--rdma=required",
+        f"{contract.root}/",
+        f"ostrich:{exact_root}/",
+    ]
+    remote_verify = shlex.split(commands[2][-1])
+    assert remote_verify[-4:] == [
+        exact_root,
+        contract.revision,
+        TOOL.GLM53_MODEL_ID,
+        "1",
+    ]

@@ -13,6 +13,12 @@ from _b12x_exl3_k3_profile import (
     exl3_k3_route_block_rows,
     exl3_k3_tile_config,
 )
+from _b12x_exl3_k4_profile import (
+    EXL3_K4_AOT_REGIMES,
+    exl3_k4_grid_x,
+    exl3_k4_route_block_rows,
+    exl3_k4_tile_config,
+)
 
 
 PREFILL_REGIMES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
@@ -182,8 +188,8 @@ def export_kernels(output_dir: Path, target_sms: int) -> None:
             f"tc_decode_fused_sum:{int(tc_decode_fused_sum)}"
         )
 
-    def export_exl3_k3(*, rows: int) -> None:
-        """Export checkpoint-native EXL3 K3 with exact full rotations.
+    def export_exl3(*, rows: int, trellis_bits: int) -> None:
+        """Export checkpoint-native EXL3 with exact full rotations.
 
         EXL3 keeps FP16 rotation scratch even though the layer input on the
         Spark wire is BF16.  The raw BF16 input, the two routed FP16 A
@@ -195,10 +201,19 @@ def export_kernels(output_dir: Path, target_sms: int) -> None:
 
         top_k = 8
         block_size = select_route_block_size_m(rows, top_k, 256)
-        expected_block_size = exl3_k3_route_block_rows(rows)
+        if trellis_bits == 3:
+            expected_block_size = exl3_k3_route_block_rows(rows)
+            tile_config = exl3_k3_tile_config(rows)
+            persistent_grid = exl3_k3_grid_x(rows)
+        elif trellis_bits == 4:
+            expected_block_size = exl3_k4_route_block_rows(rows)
+            tile_config = exl3_k4_tile_config(rows)
+            persistent_grid = exl3_k4_grid_x(rows)
+        else:
+            raise ValueError(f"unsupported EXL3 trellis bitrate {trellis_bits}")
         if block_size != expected_block_size:
             raise ValueError(
-                f"SparkInfer EXL3 M={rows} route ABI changed: "
+                f"SparkInfer EXL3 K{trellis_bits} M={rows} route ABI changed: "
                 f"profile={expected_block_size}, source={block_size}"
             )
         packed_route_slots = max_packed_route_slots(
@@ -222,19 +237,19 @@ def export_kernels(output_dir: Path, target_sms: int) -> None:
             fast_math=True,
             sms=sms,
             max_shared_mem=max_shared_mem,
-            weight_layout="trellis3_t256",
+            weight_layout="trellis_t256",
             scale_format="e4m3_k32",
-            w13_layout="trellis3_t256_proj",
-            trellis_bits=3,
+            w13_layout="trellis_t256_proj",
+            trellis_bits=trellis_bits,
             trellis_codebook="mcg",
             direct_topk_routes=False,
             tc_decode_fused_sum=False,
-            force_tile_config=exl3_k3_tile_config(rows),
+            force_tile_config=tile_config,
             intermediate_rotation=True,
             full_rotation=True,
             rotation_input_dtype="bf16",
         )
-        label = f"exl3_k3_m{rows}_topk8"
+        label = f"exl3_k{trellis_bits}_m{rows}_topk8"
         export_name = f"moe_tp4_{label}"
         fused.compiled.export_to_c(
             str(output_dir),
@@ -250,10 +265,9 @@ def export_kernels(output_dir: Path, target_sms: int) -> None:
             direct_topk_routes=False,
             sms=sms,
         )
-        persistent_grid = exl3_k3_grid_x(rows)
         if persistent_grid <= 0 or persistent_grid > automatic_grid:
             raise ValueError(
-                f"EXL3 M={rows} grid {persistent_grid} is outside the safe "
+                f"EXL3 K{trellis_bits} M={rows} grid {persistent_grid} is outside the safe "
                 f"cooperative range 1..{automatic_grid} for its selected tiles"
             )
         macro = label.upper()
@@ -276,8 +290,8 @@ def export_kernels(output_dir: Path, target_sms: int) -> None:
             f"route_slots:{packed_route_slots},max_m_blocks:{max_m_blocks},"
             f"tiles:{int(fused.fc1_tile_k)}x{int(fused.fc1_tile_n)}+"
             f"{int(fused.fc2_tile_k)}x{int(fused.fc2_tile_n)},"
-            "layout:trellis3_t256,w13_layout:trellis3_t256_proj,"
-            "bits:3,codebook:mcg,full_rotation:1,rotation_input:bf16,"
+            "layout:trellis_t256,w13_layout:trellis_t256_proj,"
+            f"bits:{trellis_bits},codebook:mcg,full_rotation:1,rotation_input:bf16,"
             "direct_topk:0"
         )
 
@@ -298,7 +312,9 @@ def export_kernels(output_dir: Path, target_sms: int) -> None:
     for rows in PREFILL_REGIMES:
         export_w4a16(rows=rows, top_k=1, label=f"top1_m{rows}")
     for rows in EXL3_K3_AOT_REGIMES:
-        export_exl3_k3(rows=rows)
+        export_exl3(rows=rows, trellis_bits=3)
+    for rows in EXL3_K4_AOT_REGIMES:
+        export_exl3(rows=rows, trellis_bits=4)
     exl3_topk_sum = compile_w4a16_topk_sum(
         m=1,
         topk=8,

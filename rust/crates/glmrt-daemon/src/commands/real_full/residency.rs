@@ -15,7 +15,8 @@ use super::coordinator_kernels::{
     coordinator_w8a16_q_b_decode_enabled, cuda_native_library,
     preload_coordinator_w4a16_projection, preload_coordinator_w8a16_projection,
     preload_resident_weight_from_host_staging, preload_resident_weight_from_pinned_host_profiled,
-    release_preloaded_resident_weight_device_buffer, ResidentWeightPreloadTimings,
+    release_preloaded_resident_weight_device_buffer, replace_preloaded_block_fp8_weight_with_bf16,
+    ResidentWeightPreloadTimings,
 };
 use super::layer_blocks::{tensor_is_spark_layer_block_resident, SparkLayerBlock};
 use super::sparse_mlp::cache_router_correction_bias_host_values;
@@ -25,6 +26,8 @@ const COORDINATOR_RESIDENT_PRELOAD_SCOPE: &str =
     "select coordinator-owned immutable GLM-5.2 tensors for named startup GPU residency";
 const COORDINATOR_RESIDENT_SAMPLE_LIMIT: usize = 12;
 const COORDINATOR_RESIDENT_SOURCE_WORKERS: usize = 8;
+const COORDINATOR_BLOCK_FP8_BLOCK_ROWS: usize = 128;
+const COORDINATOR_BLOCK_FP8_BLOCK_COLUMNS: usize = 128;
 const COORDINATOR_INCLUDE_MTP_LAYER_ENV: &str = "GLMRT_COORDINATOR_INCLUDE_MTP_LAYER";
 const REAL_FULL_MTP_ENV: &str = "GLMRT_REAL_FULL_MTP";
 const REAL_FULL_MTP_PROBE_ENV: &str = "GLMRT_REAL_FULL_MTP_PROBE";
@@ -54,6 +57,8 @@ struct CoordinatorResidentTensorPreloadProfile {
     w4a16_pack_ms: f64,
     w8a16_pack_ms: f64,
     release_ms: f64,
+    block_fp8_dequant_ms: f64,
+    block_fp8_dequantized: bool,
     w4a16_packed: bool,
     w8a16_q_a_packed: bool,
     w8a16_q_b_packed: bool,
@@ -244,12 +249,14 @@ pub(super) fn preload_real_full_coordinator_resident_weights(
     let mut w4a16_pack_ms = 0.0_f64;
     let mut w8a16_pack_ms = 0.0_f64;
     let mut release_ms = 0.0_f64;
+    let mut block_fp8_dequant_ms = 0.0_f64;
     let mut uploaded_tensors = 0_usize;
     let mut w4a16_packed_tensors = 0_usize;
     let mut w8a16_q_a_packed_tensors = 0_usize;
     let mut w8a16_q_b_packed_tensors = 0_usize;
     let mut w8a16_o_packed_tensors = 0_usize;
     let mut released_source_tensors = 0_usize;
+    let mut block_fp8_dequantized_tensors = 0_usize;
     std::thread::scope(|scope| -> Result<()> {
         let mut source_return_senders = Vec::with_capacity(source_workers);
         for worker_id in 0..source_workers {
@@ -351,12 +358,14 @@ pub(super) fn preload_real_full_coordinator_resident_weights(
             w4a16_pack_ms += profile.w4a16_pack_ms;
             w8a16_pack_ms += profile.w8a16_pack_ms;
             release_ms += profile.release_ms;
+            block_fp8_dequant_ms += profile.block_fp8_dequant_ms;
             uploaded_tensors += usize::from(profile.resident.uploaded);
             w4a16_packed_tensors += usize::from(profile.w4a16_packed);
             w8a16_q_a_packed_tensors += usize::from(profile.w8a16_q_a_packed);
             w8a16_q_b_packed_tensors += usize::from(profile.w8a16_q_b_packed);
             w8a16_o_packed_tensors += usize::from(profile.w8a16_o_packed);
             released_source_tensors += usize::from(profile.source_released);
+            block_fp8_dequantized_tensors += usize::from(profile.block_fp8_dequantized);
             loaded_bytes = loaded_bytes
                 .checked_add(profile.bytes)
                 .context("coordinator resident loaded byte count overflow")?;
@@ -400,10 +409,11 @@ pub(super) fn preload_real_full_coordinator_resident_weights(
         + resident_finalize_ms
         + w4a16_pack_ms
         + w8a16_pack_ms
-        + release_ms;
+        + release_ms
+        + block_fp8_dequant_ms;
     let unattributed_ms = (upload_pack_ms - attributed_ms).max(0.0);
     eprintln!(
-        "real_full_coordinator_resident_preload_detail uploaded_tensors={uploaded_tensors} validation_cache_ms={validation_cache_ms:.3} library_ms={resident_library_ms:.3} lock_ms={resident_lock_ms:.3} device_allocation_ms={device_allocation_ms:.3} staging_allocation_ms={staging_allocation_ms:.3} staging_fill_ms={staging_fill_ms:.3} h2d_ms={h2d_ms:.3} finalize_ms={resident_finalize_ms:.3} w4a16_pack_tensors={w4a16_packed_tensors} w4a16_pack_ms={w4a16_pack_ms:.3} w8a16_q_a_tensors={w8a16_q_a_packed_tensors} w8a16_q_b_tensors={w8a16_q_b_packed_tensors} w8a16_o_tensors={w8a16_o_packed_tensors} w8a16_pack_ms={w8a16_pack_ms:.3} released_source_tensors={released_source_tensors} release_ms={release_ms:.3} unattributed_ms={unattributed_ms:.3}"
+        "real_full_coordinator_resident_preload_detail uploaded_tensors={uploaded_tensors} validation_cache_ms={validation_cache_ms:.3} library_ms={resident_library_ms:.3} lock_ms={resident_lock_ms:.3} device_allocation_ms={device_allocation_ms:.3} staging_allocation_ms={staging_allocation_ms:.3} staging_fill_ms={staging_fill_ms:.3} h2d_ms={h2d_ms:.3} finalize_ms={resident_finalize_ms:.3} block_fp8_dequantized_tensors={block_fp8_dequantized_tensors} block_fp8_dequant_ms={block_fp8_dequant_ms:.3} w4a16_pack_tensors={w4a16_packed_tensors} w4a16_pack_ms={w4a16_pack_ms:.3} w8a16_q_a_tensors={w8a16_q_a_packed_tensors} w8a16_q_b_tensors={w8a16_q_b_packed_tensors} w8a16_o_tensors={w8a16_o_packed_tensors} w8a16_pack_ms={w8a16_pack_ms:.3} released_source_tensors={released_source_tensors} release_ms={release_ms:.3} unattributed_ms={unattributed_ms:.3}"
     );
     Ok(coordinator_resident_preload_plan_for_tensors(
         catalog,
@@ -436,6 +446,26 @@ fn preload_real_full_coordinator_resident_tensor(
         source.buffer,
     )
     .with_context(|| format!("preloading coordinator resident tensor {}", tensor.name))?;
+    let mut resident_source_bytes = expected_bytes;
+    let mut block_fp8_dequant_ms = 0.0_f64;
+    let block_fp8_dequantized = tensor.dtype == DType::F8E4M3;
+    if block_fp8_dequantized {
+        anyhow::ensure!(
+            tensor.shape.len() == 2,
+            "block-FP8 coordinator tensor {} must be a matrix",
+            tensor.name
+        );
+        let size_n = tensor.shape[0];
+        let size_k = tensor.shape[1];
+        let scale_bytes = load_coordinator_block_fp8_scale_bytes(catalog, tensor)?;
+        let dequant_started = Instant::now();
+        replace_preloaded_block_fp8_weight_with_bf16(&tensor.name, &scale_bytes, size_k, size_n)
+            .with_context(|| format!("expanding block-FP8 coordinator tensor {}", tensor.name))?;
+        block_fp8_dequant_ms = dequant_started.elapsed().as_secs_f64() * 1_000.0;
+        resident_source_bytes = expected_bytes
+            .checked_mul(std::mem::size_of::<u16>())
+            .context("block-FP8 coordinator resident BF16 bytes overflow")?;
+    }
     let pack_w4a16_q_b = tensor.name.ends_with(".self_attn.q_b_proj.weight")
         && coordinator_w4a16_q_b_decode_enabled();
     let pack_w4a16_o_proj = tensor.name.ends_with(".self_attn.o_proj.weight")
@@ -459,7 +489,7 @@ fn preload_real_full_coordinator_resident_tensor(
     let mut release_ms = 0.0_f64;
     if pack_w4a16_q_b || pack_w4a16_o_proj {
         anyhow::ensure!(
-            tensor.dtype == DType::Bf16 && tensor.shape.len() == 2,
+            (tensor.dtype == DType::Bf16 || block_fp8_dequantized) && tensor.shape.len() == 2,
             "coordinator W4A16 projection {} must be a BF16 matrix",
             tensor.name
         );
@@ -479,7 +509,7 @@ fn preload_real_full_coordinator_resident_tensor(
     }
     if pack_w8a16_q_a || pack_w8a16_q_b || pack_w8a16_o_proj {
         anyhow::ensure!(
-            tensor.dtype == DType::Bf16 && tensor.shape.len() == 2,
+            (tensor.dtype == DType::Bf16 || block_fp8_dequantized) && tensor.shape.len() == 2,
             "coordinator W8A16 projection {} must be a BF16 matrix",
             tensor.name
         );
@@ -497,7 +527,7 @@ fn preload_real_full_coordinator_resident_tensor(
             .with_context(|| format!("packing coordinator W8A16 projection {}", tensor.name))?;
         w8a16_pack_ms = pack_started.elapsed().as_secs_f64() * 1_000.0;
         let release_started = Instant::now();
-        release_preloaded_resident_weight_device_buffer(&tensor.name, expected_bytes)
+        release_preloaded_resident_weight_device_buffer(&tensor.name, resident_source_bytes)
             .with_context(|| {
                 format!(
                     "releasing superseded BF16 coordinator projection {}",
@@ -514,12 +544,56 @@ fn preload_real_full_coordinator_resident_tensor(
         w4a16_pack_ms,
         w8a16_pack_ms,
         release_ms,
+        block_fp8_dequant_ms,
+        block_fp8_dequantized,
         w4a16_packed: pack_w4a16_q_b || pack_w4a16_o_proj,
         w8a16_q_a_packed: pack_w8a16_q_a,
         w8a16_q_b_packed: pack_w8a16_q_b,
         w8a16_o_packed: pack_w8a16_o_proj,
         source_released: pack_w8a16_q_a || pack_w8a16_q_b || pack_w8a16_o_proj,
     })
+}
+
+fn load_coordinator_block_fp8_scale_bytes(
+    catalog: &TensorCatalog,
+    weight: &TensorInfo,
+) -> Result<Vec<u8>> {
+    let base = weight.name.strip_suffix(".weight").with_context(|| {
+        format!(
+            "block-FP8 coordinator tensor {} is not a weight",
+            weight.name
+        )
+    })?;
+    let scale_name = format!("{base}.weight_scale_inv");
+    let scale = catalog
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == scale_name)
+        .with_context(|| {
+            format!(
+                "block-FP8 coordinator tensor {} is missing {scale_name}",
+                weight.name
+            )
+        })?;
+    let expected_shape = vec![
+        weight.shape[0].div_ceil(COORDINATOR_BLOCK_FP8_BLOCK_ROWS),
+        weight.shape[1].div_ceil(COORDINATOR_BLOCK_FP8_BLOCK_COLUMNS),
+    ];
+    anyhow::ensure!(
+        scale.dtype == DType::F32 && scale.shape == expected_shape,
+        "block-FP8 coordinator scale {scale_name} must be F32 {:?}, got {:?} {:?}",
+        expected_shape,
+        scale.dtype,
+        scale.shape
+    );
+    let scale_bytes: usize = scale.byte_length.try_into().with_context(|| {
+        format!("block-FP8 coordinator scale {scale_name} byte length overflows usize")
+    })?;
+    let mut bytes = vec![0_u8; scale_bytes];
+    let summary = read_tensor_bytes_into(catalog, &scale_name, &mut bytes)
+        .with_context(|| format!("reading block-FP8 coordinator scale {scale_name}"))?;
+    validate_coordinator_resident_tensor_summary(scale, &summary)?;
+    Ok(bytes)
 }
 
 fn coordinator_resident_preload_plan_for_tensors(

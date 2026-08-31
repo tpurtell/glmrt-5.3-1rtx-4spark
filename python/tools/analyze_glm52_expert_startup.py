@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Summarize one matched four-Spark GLM-5.2 expert startup from daemon logs."""
+"""Summarize one matched four-Spark GLM-5 expert startup from daemon logs."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -14,8 +15,10 @@ import statistics
 from typing import Any
 
 
-SCHEMA = "glmrt-glm52-expert-startup-v2"
+GLM52_SCHEMA = "glmrt-glm52-expert-startup-v2"
+GLM53_SCHEMA = "glmrt-glm53-expert-startup-v1"
 EXL3_MODEL = "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1"
+GLM53_EXL3_MODEL = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
 NVFP4_MODELS = {
     "lukealonso/GLM-5.2-NVFP4",
     "lukealonso/GLM-5.2-NVFP4-full",
@@ -24,9 +27,6 @@ NVFP4_MODELS = {
 }
 EXPECTED_HOSTS = 4
 EXPECTED_EXL3_LAYERS = set(range(3, 78))
-EXL3_DIRECT_SOURCE_BYTES_PER_RANK_LAYER = 916_196_352
-EXL3_COOPERATIVE_SOURCE_BYTES_PER_RANK_LAYER = 909_116_160
-EXL3_RESIDENT_BYTES_PER_RANK_LAYER = 916_194_304
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 START_RE = re.compile(r"^== .* starting expert-[0-9]+:")
 EXIT_RE = re.compile(r"^== .* expert-[0-9]+ exited status=(?P<status>-?[0-9]+) ==$")
@@ -37,6 +37,98 @@ PHASE_RE = re.compile(
 )
 FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>[^ ]+)")
 PROCESS_PREFIX = "starting expertd "
+
+
+@dataclass(frozen=True)
+class Exl3StartupGeometry:
+    trellis_bits: int
+    direct_source_bytes_per_rank_layer: int
+    cooperative_source_bytes_per_rank_layer: int
+    resident_bytes_per_rank_layer: int
+    startup_mtp_weight_bytes_per_rank_layer: int | None
+    startup_mtp_scale_bytes_per_rank_layer: int | None
+
+
+def exl3_startup_geometry(
+    trellis_bits: int, *, startup_quantized_mtp: bool = False
+) -> Exl3StartupGeometry:
+    if trellis_bits not in (3, 4):
+        raise ValueError(f"unsupported EXL3 trellis bitrate K{trellis_bits}")
+    hidden = 6_144
+    full_intermediate = 2_048
+    local_intermediate = full_intermediate // 4
+    experts = 256
+    source_experts = experts // 4
+    scalar_bytes = 2
+    marker_bytes_per_expert = 3 * 4
+    unit_scale_bytes = experts * 4
+    local_trellis_bytes_per_expert = (
+        3 * hidden * local_intermediate * trellis_bits // 8
+    )
+    full_trellis_bytes_per_expert = (
+        3 * hidden * full_intermediate * trellis_bits // 8
+    )
+    rotation_bytes_per_expert = (
+        3 * hidden + 3 * local_intermediate
+    ) * scalar_bytes
+    full_rotation_bytes_per_expert = (
+        3 * hidden + 3 * full_intermediate
+    ) * scalar_bytes
+    resident = (
+        experts * (local_trellis_bytes_per_expert + rotation_bytes_per_expert)
+        + unit_scale_bytes
+    )
+    direct_source = (
+        experts
+        * (
+            local_trellis_bytes_per_expert
+            + rotation_bytes_per_expert
+            + marker_bytes_per_expert
+        )
+    )
+    cooperative_source = source_experts * (
+        full_trellis_bytes_per_expert
+        + full_rotation_bytes_per_expert
+        + marker_bytes_per_expert
+    )
+    # GLM-5.3's retained block-FP8 MTP layer is converted to BF16 and packed
+    # once at startup into the existing W4A16 TP4 slab. The preload summary
+    # counts the packed weights and per-16-value scales, not its small alpha
+    # allocations. GLM-5.2 K3 qualification deliberately excludes layer 78.
+    startup_mtp_weight = (
+        experts * 3 * hidden * local_intermediate // 2
+        if startup_quantized_mtp
+        else None
+    )
+    startup_mtp_scale = (
+        experts * 3 * hidden * local_intermediate // 16
+        if startup_quantized_mtp
+        else None
+    )
+    return Exl3StartupGeometry(
+        trellis_bits=trellis_bits,
+        direct_source_bytes_per_rank_layer=direct_source,
+        cooperative_source_bytes_per_rank_layer=cooperative_source,
+        resident_bytes_per_rank_layer=resident,
+        startup_mtp_weight_bytes_per_rank_layer=startup_mtp_weight,
+        startup_mtp_scale_bytes_per_rank_layer=startup_mtp_scale,
+    )
+
+
+EXL3_GEOMETRY_BY_MODEL = {
+    EXL3_MODEL: exl3_startup_geometry(3),
+    GLM53_EXL3_MODEL: exl3_startup_geometry(4, startup_quantized_mtp=True),
+}
+# Retain the original public constants for downstream GLM-5.2 tooling.
+EXL3_DIRECT_SOURCE_BYTES_PER_RANK_LAYER = EXL3_GEOMETRY_BY_MODEL[
+    EXL3_MODEL
+].direct_source_bytes_per_rank_layer
+EXL3_COOPERATIVE_SOURCE_BYTES_PER_RANK_LAYER = EXL3_GEOMETRY_BY_MODEL[
+    EXL3_MODEL
+].cooperative_source_bytes_per_rank_layer
+EXL3_RESIDENT_BYTES_PER_RANK_LAYER = EXL3_GEOMETRY_BY_MODEL[
+    EXL3_MODEL
+].resident_bytes_per_rank_layer
 
 
 class StartupError(RuntimeError):
@@ -121,6 +213,9 @@ def summarize_log(
     include_mtp: bool,
     expert_runtime_fingerprint: str,
 ) -> dict[str, Any]:
+    exl3_geometry = EXL3_GEOMETRY_BY_MODEL.get(model)
+    if weight_format == "exl3" and exl3_geometry is None:
+        raise StartupError(f"no EXL3 startup geometry is registered for {model}")
     resolved, lines, start_line = final_start_segment(path)
     phases: dict[str, dict[str, float]] = {}
     process_lines: list[str] = []
@@ -218,7 +313,8 @@ def summarize_log(
             resident_bytes = integer_field(
                 parsed, "resident_bytes", os.fspath(resolved)
             )
-            if resident_bytes != EXL3_RESIDENT_BYTES_PER_RANK_LAYER:
+            assert exl3_geometry is not None
+            if resident_bytes != exl3_geometry.resident_bytes_per_rank_layer:
                 raise StartupError(
                     f"{resolved} layer {layer_id} resident geometry differs"
                 )
@@ -233,7 +329,8 @@ def summarize_log(
             if parsed.get("cooperative") == "false":
                 if (
                     parsed.get("direct_resident") != "true"
-                    or source_bytes != EXL3_DIRECT_SOURCE_BYTES_PER_RANK_LAYER
+                    or source_bytes
+                    != exl3_geometry.direct_source_bytes_per_rank_layer
                 ):
                     raise StartupError(
                         f"{resolved} layer {layer_id} direct source geometry differs"
@@ -255,7 +352,7 @@ def summarize_log(
                     parsed.get("packed_exchange") != "true"
                     or parsed.get("direct_io") != "true"
                     or source_bytes
-                    != EXL3_COOPERATIVE_SOURCE_BYTES_PER_RANK_LAYER
+                    != exl3_geometry.cooperative_source_bytes_per_rank_layer
                     or integer_field(parsed, "source_experts", os.fspath(resolved))
                     != 64
                     or integer_field(parsed, "source_requests", os.fspath(resolved))
@@ -300,6 +397,7 @@ def summarize_log(
             raise StartupError(f"{resolved} mixes EXL3 preload modes")
         preload_mode = preload_modes.pop()
         exl3 = {
+            "trellis_bits": exl3_geometry.trellis_bits,
             "preload_mode": preload_mode,
             "layers": len(by_layer),
             "source_bytes": sum(record["source_bytes"] for record in by_layer.values()),
@@ -336,13 +434,27 @@ def summarize_log(
                     for name in ("pack", "allocation", "upload", "exchange")
                 ),
             )
+        mtp_weight_bytes = 0
+        mtp_scale_bytes = 0
+        if include_mtp:
+            assert exl3_geometry.startup_mtp_weight_bytes_per_rank_layer is not None
+            assert exl3_geometry.startup_mtp_scale_bytes_per_rank_layer is not None
+            mtp_weight_bytes = (
+                exl3_geometry.startup_mtp_weight_bytes_per_rank_layer
+            )
+            mtp_scale_bytes = exl3_geometry.startup_mtp_scale_bytes_per_rank_layer
+        exl3["startup_quantized_mtp"] = {
+            "included": include_mtp,
+            "weight_bytes": mtp_weight_bytes,
+            "weight_scale_bytes": mtp_scale_bytes,
+        }
         if (
             integer_field(resident, "cuda_weight_bytes", os.fspath(resolved))
-            != exl3["resident_bytes"]
+            != exl3["resident_bytes"] + mtp_weight_bytes
             or integer_field(
                 resident, "cuda_weight_scale_bytes", os.fspath(resolved)
             )
-            != 0
+            != mtp_scale_bytes
         ):
             raise StartupError(
                 f"{resolved} resident summary differs from direct EXL3 layers"
@@ -403,10 +515,18 @@ def analyze(
     expert_runtime_fingerprint: str,
     logs: list[tuple[str, Path]],
 ) -> dict[str, Any]:
-    if weight_format == "exl3" and model != EXL3_MODEL:
-        raise StartupError("EXL3 startup must use the calibrated EXL3 model ID")
+    if weight_format == "exl3" and model not in EXL3_GEOMETRY_BY_MODEL:
+        raise StartupError("EXL3 startup must use a supported calibrated EXL3 model ID")
     if weight_format == "exl3" and include_mtp:
-        raise StartupError("EXL3 dSpark qualification must not load the native MTP layer")
+        geometry = EXL3_GEOMETRY_BY_MODEL.get(model)
+        if (
+            geometry is None
+            or geometry.startup_mtp_weight_bytes_per_rank_layer is None
+            or geometry.startup_mtp_scale_bytes_per_rank_layer is None
+        ):
+            raise StartupError(
+                "this EXL3 model does not support a startup-quantized native MTP layer"
+            )
     if weight_format == "nvfp4" and model not in NVFP4_MODELS:
         raise StartupError("NVFP4 startup must use a supported NVFP4 model ID")
     if SHA256_RE.fullmatch(expert_runtime_fingerprint) is None:
@@ -437,7 +557,7 @@ def analyze(
     else:
         preload_mode = "nvfp4-production"
     body = {
-        "schema": SCHEMA,
+        "schema": GLM53_SCHEMA if model == GLM53_EXL3_MODEL else GLM52_SCHEMA,
         "status": "accepted",
         "model": model,
         "expert_runtime_fingerprint": expert_runtime_fingerprint,

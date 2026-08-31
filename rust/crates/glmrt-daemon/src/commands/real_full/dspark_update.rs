@@ -792,14 +792,14 @@ fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Bf16Difference {
-    max_abs: f64,
-    bf16_steps_at_max_abs: u32,
-    reference_abs_at_max_error: f64,
-    relative_l2: f64,
+pub(super) struct Bf16Difference {
+    pub(super) max_abs: f64,
+    pub(super) bf16_steps_at_max_abs: u32,
+    pub(super) reference_abs_at_max_error: f64,
+    pub(super) relative_l2: f64,
 }
 
-fn bf16_difference(reference: &[u8], candidate: &[u8]) -> Result<Bf16Difference> {
+pub(super) fn bf16_difference(reference: &[u8], candidate: &[u8]) -> Result<Bf16Difference> {
     anyhow::ensure!(
         reference.len() == candidate.len() && reference.len() % 2 == 0,
         "dSpark update BF16 comparison byte lengths are invalid"

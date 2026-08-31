@@ -19,7 +19,7 @@ use commands::expertd::run_expertd;
 use commands::model_artifacts::{
     run_inspect_model, run_load_tensors, run_make_loadplan, run_tokenize,
 };
-use commands::real_full::run_dspark_preflight;
+use commands::real_full::{run_dflash_preflight, run_dspark_preflight};
 use commands::scheduler_row_audit::run_scheduler_row_audit;
 use commands::scheduler_smoke::run_scheduler_smoke;
 use commands::transport_capabilities::run_transport_capabilities;
@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
         Commands::LoadTensors(args) => run_load_tensors(args),
         Commands::Tokenize(args) => run_tokenize(args),
         Commands::DsparkPreflight(args) => run_dspark_preflight(args),
+        Commands::DflashPreflight(args) => run_dflash_preflight(args),
         Commands::Coordinator(args) => run_coordinator(args).await,
         Commands::Expertd(args) => run_expertd(args).await,
         Commands::BenchRdma(args) => run_bench_rdma(args),

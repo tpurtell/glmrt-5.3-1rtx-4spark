@@ -85,6 +85,8 @@ pub struct RealFullDiagnosticMetrics {
     pub mtp_draft_lengths: Vec<usize>,
     pub mtp_accepted_draft_lengths: Vec<usize>,
     pub mtp_verify_cycle_ms: Vec<f64>,
+    pub target_cycle_physical_m: Vec<usize>,
+    pub target_cycle_ms: Vec<f64>,
     pub request_coordinator_graph_slots: usize,
     pub request_coordinator_graph_captured_graphs: usize,
     pub request_coordinator_graph_captures: usize,

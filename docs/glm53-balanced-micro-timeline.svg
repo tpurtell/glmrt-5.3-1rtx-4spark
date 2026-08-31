@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="700" viewBox="0 0 1760 700" role="img" aria-labelledby="title desc">
+<title id="title">GLMRT GLM-5.3 balanced production micro-timeline</title>
+<desc id="desc">Measured target-cycle timing by physical M and the production target-cycle topology.</desc>
+<defs><style>
+.title{font:700 31px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+.subtitle{font:400 14px Inter,Segoe UI,sans-serif;fill:#91a8bf}
+.section{font:700 18px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+.body{font:500 12px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+.small{font:400 11px Inter,Segoe UI,sans-serif;fill:#91a8bf}
+.metric{font:700 24px Inter,Segoe UI,sans-serif;fill:#e9f3ff}
+</style></defs>
+<rect width="1760" height="700" fill="#07111f"/>
+<text x="52.00" y="51.00" class="title" text-anchor="start">GLMRT GLM-5.3 · PRODUCTION MICRO-TIMELINE</text>
+<text x="52.00" y="78.00" class="subtitle" text-anchor="start">balanced · dflash2 · code replay 1 · revision dd270970a59e · no synchronized instrumentation</text>
+<rect x="52" y="102" width="360" height="86" rx="14" fill="#0d1b2d" stroke="#56d69c"/>
+<text x="72.00" y="138.00" class="metric" text-anchor="start">25.96 tok/s</text>
+<text x="72.00" y="169.00" class="small" text-anchor="start">8-TYPE WEIGHTED</text>
+<rect x="452" y="102" width="360" height="86" rx="14" fill="#0d1b2d" stroke="#46d7e8"/>
+<text x="472.00" y="138.00" class="metric" text-anchor="start">41.31 tok/s</text>
+<text x="472.00" y="169.00" class="small" text-anchor="start">CODE REPLAY</text>
+<rect x="852" y="102" width="360" height="86" rx="14" fill="#0d1b2d" stroke="#a978ff"/>
+<text x="872.00" y="138.00" class="metric" text-anchor="start">49.8%</text>
+<text x="872.00" y="169.00" class="small" text-anchor="start">DRAFT ACCEPTANCE</text>
+<rect x="1252" y="102" width="360" height="86" rx="14" fill="#0d1b2d" stroke="#ffc35a"/>
+<text x="1272.00" y="138.00" class="metric" text-anchor="start">5.15</text>
+<text x="1272.00" y="169.00" class="small" text-anchor="start">TOKENS / TARGET CYCLE</text>
+<rect x="52" y="220" width="1050" height="405" rx="17" fill="#0d1b2d" stroke="#56d69c"/>
+<text x="80.00" y="258.00" class="section" text-anchor="start">A · MEASURED TARGET-CYCLE CURVE</text>
+<text x="80.00" y="283.00" class="subtitle" text-anchor="start">All five eight-type replays; medians use the exact decode clock.</text>
+<path d="M130.00,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="130.00" cy="475.77" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="130.00" y="459.77" class="small" text-anchor="middle">50.0 ms</text>
+<text x="130.00" y="565.00" class="body" text-anchor="middle">M1</text>
+<text x="130.00" y="583.00" class="small" text-anchor="middle">n=171</text>
+<path d="M258.57,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="258.57" cy="447.13" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="258.57" y="431.13" class="small" text-anchor="middle">72.3 ms</text>
+<text x="258.57" y="565.00" class="body" text-anchor="middle">M2</text>
+<text x="258.57" y="583.00" class="small" text-anchor="middle">n=434</text>
+<path d="M387.14,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="387.14" cy="424.17" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="387.14" y="408.17" class="small" text-anchor="middle">90.2 ms</text>
+<text x="387.14" y="565.00" class="body" text-anchor="middle">M3</text>
+<text x="387.14" y="583.00" class="small" text-anchor="middle">n=158</text>
+<path d="M515.71,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="515.71" cy="403.13" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="515.71" y="387.13" class="small" text-anchor="middle">106.6 ms</text>
+<text x="515.71" y="565.00" class="body" text-anchor="middle">M4</text>
+<text x="515.71" y="583.00" class="small" text-anchor="middle">n=2</text>
+<path d="M644.29,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="644.29" cy="402.01" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="644.29" y="386.01" class="small" text-anchor="middle">107.5 ms</text>
+<text x="644.29" y="565.00" class="body" text-anchor="middle">M5</text>
+<text x="644.29" y="583.00" class="small" text-anchor="middle">n=1182</text>
+<path d="M772.86,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="772.86" cy="385.20" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="772.86" y="369.20" class="small" text-anchor="middle">120.6 ms</text>
+<text x="772.86" y="565.00" class="body" text-anchor="middle">M6</text>
+<text x="772.86" y="583.00" class="small" text-anchor="middle">n=389</text>
+<path d="M901.43,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="901.43" cy="372.37" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="901.43" y="356.37" class="small" text-anchor="middle">130.6 ms</text>
+<text x="901.43" y="565.00" class="body" text-anchor="middle">M7</text>
+<text x="901.43" y="583.00" class="small" text-anchor="middle">n=5</text>
+<path d="M1030.00,330.0 V540.0" stroke="#203a55" stroke-dasharray="3 5"/>
+<circle cx="1030.00" cy="357.39" r="7" fill="#56d69c" stroke="#e9f3ff" stroke-width="2"/>
+<text x="1030.00" y="341.39" class="small" text-anchor="middle">142.2 ms</text>
+<text x="1030.00" y="565.00" class="body" text-anchor="middle">M8</text>
+<text x="1030.00" y="583.00" class="small" text-anchor="middle">n=4</text>
+<path d="M130.00,475.77 L258.57,447.13 L387.14,424.17 L515.71,403.13 L644.29,402.01 L772.86,385.20 L901.43,372.37 L1030.00,357.39" fill="none" stroke="#56d69c" stroke-width="3"/>
+<rect x="1132" y="220" width="576" height="405" rx="17" fill="#0d1b2d" stroke="#46d7e8"/>
+<text x="1160.00" y="258.00" class="section" text-anchor="start">B · ONE TARGET CYCLE</text>
+<text x="1160.00" y="283.00" class="subtitle" text-anchor="start">Collapsed topology · schematic, not time-scaled</text>
+<rect x="1165" y="325" width="235" height="72" rx="10" fill="#07111f" stroke="#5d8cff"/>
+<text x="1181.00" y="354.00" class="body" text-anchor="start">M target rows</text>
+<text x="1181.00" y="377.00" class="small" text-anchor="start">current token + proposals</text>
+<rect x="1425" y="325" width="235" height="72" rx="10" fill="#07111f" stroke="#56d69c"/>
+<text x="1441.00" y="354.00" class="body" text-anchor="start">L0–2 dense</text>
+<text x="1441.00" y="377.00" class="small" text-anchor="start">local coordinator</text>
+<rect x="1165" y="425" width="235" height="72" rx="10" fill="#07111f" stroke="#a978ff"/>
+<text x="1181.00" y="454.00" class="body" text-anchor="start">L3–77 sparse</text>
+<text x="1181.00" y="477.00" class="small" text-anchor="start">four-Spark TP4 per layer</text>
+<rect x="1425" y="425" width="235" height="72" rx="10" fill="#07111f" stroke="#ffc35a"/>
+<text x="1441.00" y="454.00" class="body" text-anchor="start">terminal</text>
+<text x="1441.00" y="477.00" class="small" text-anchor="start">score → accept → commit</text>
+<path d="M1400,361 H1425" stroke="#46d7e8" stroke-width="2"/>
+<path d="M1542,397 V425" stroke="#46d7e8" stroke-width="2"/>
+<path d="M1425,461 H1400" stroke="#46d7e8" stroke-width="2"/>
+<path d="M1282,425 V397" stroke="#46d7e8" stroke-width="2"/>
+<text x="1160.00" y="545.00" class="body" text-anchor="start">75 serial sparse dependency edges</text>
+<text x="1160.00" y="571.00" class="small" text-anchor="start">physical M changes compute/transport width</text>
+<text x="1160.00" y="597.00" class="small" text-anchor="start">committed tokens depend on acceptance</text>
+<text x="52.00" y="672.00" class="subtitle" text-anchor="start">Production request clocks only; no synchronized stage attribution or reused legacy data.</text>
+</svg>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a completed GLM-5.2 EXL3 K3 artifact before publication.
+"""Validate a completed GLM-5 EXL3 artifact before publication.
 
 The check is intentionally independent of GPTQModel.  It reads only JSON and
 safetensors headers, proves the exact routed-expert replacement namespace and
@@ -46,6 +46,10 @@ MODULE_INCLUDE = (
     r"(?:gate_proj|up_proj|down_proj)$"
 )
 MODEL_ID = "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1"
+GLM53_MODEL_ID = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
+GLM53_VALIDATION_SCHEMA = "glmrt-glm5-exl3-artifact-validation-v1"
+GLM53_ARTIFACT_SCHEMA = "glmrt-glm5-gptqmodel-artifact-v2"
+GLM53_RUN_SCHEMA = "glmrt-glm5-gptqmodel-run-v2"
 HIDDEN_SIZE = 6144
 MOE_INTERMEDIATE_SIZE = 2048
 FIRST_ROUTED_LAYER = 3
@@ -63,6 +67,13 @@ CHECKPOINT_SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 HF_BLOB_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json")
+EXACT_SOURCE_METADATA_FILES = (*TOKENIZER_FILES, "generation_config.json")
+COMPACT_EXL3_DECLARATION_FIELDS = (
+    "quant_method",
+    "format",
+    "checkpoint_format",
+    "bits",
+)
 TOKENIZER_ATTESTATION_SCHEMA = "glmrt-glm52-legacy-tokenizer-attestation-v1"
 TOKENIZATION_CONTRACT = "gptqmodel-raw-text-add-special-tokens-return-pt-v1"
 NATIVE_EXPERT_RE = re.compile(
@@ -96,8 +107,87 @@ TORCH_DTYPE = {
 }
 
 
+@dataclass(frozen=True)
+class ArtifactContract:
+    validation_schema: str
+    plan_schemas: frozenset[str]
+    artifact_schema: str
+    run_schema: str
+    recipe: str
+    model_id: str
+    release: str
+    source_format: str
+    exl3_bits: int
+    source_has_block_fp8_scales: bool
+
+    @property
+    def expected_tp4_resident_bytes(self) -> int:
+        # Each Spark owns one quarter of every projection's intermediate
+        # dimension. Rotations and the MCG marker follow that same TP4 view.
+        trellis_per_projection = (
+            (HIDDEN_SIZE // 16)
+            * (MOE_INTERMEDIATE_SIZE // 16 // 4)
+            * (16 * self.exl3_bits)
+            * 2
+        )
+        rotations_per_projection = (
+            HIDDEN_SIZE * 2 + (MOE_INTERMEDIATE_SIZE // 4) * 2
+        )
+        per_expert = 3 * (trellis_per_projection + rotations_per_projection) + 4
+        per_layer = per_expert * ROUTED_EXPERTS
+        return per_layer * (BASE_LAYER_END - FIRST_ROUTED_LAYER)
+
+
+def _artifact_contract(plan: dict[str, Any]) -> ArtifactContract:
+    recipe = plan.get("recipe")
+    source = plan.get("source")
+    if not isinstance(source, dict):
+        raise ArtifactValidationError("artifact plan has no source contract")
+    if recipe == "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1":
+        contract = ArtifactContract(
+            validation_schema=SCHEMA,
+            plan_schemas=frozenset(PLAN_SCHEMAS),
+            artifact_schema=ARTIFACT_SCHEMA,
+            run_schema=RUN_SCHEMA,
+            recipe=recipe,
+            model_id=MODEL_ID,
+            release="glm-5.2",
+            source_format="bf16",
+            exl3_bits=3,
+            source_has_block_fp8_scales=False,
+        )
+    elif recipe == "glm53_exl3_trellis_4bpw_calibrated_natural_route_v1":
+        contract = ArtifactContract(
+            validation_schema=GLM53_VALIDATION_SCHEMA,
+            plan_schemas=frozenset({"glmrt-glm5-gptqmodel-plan-v3"}),
+            artifact_schema=GLM53_ARTIFACT_SCHEMA,
+            run_schema=GLM53_RUN_SCHEMA,
+            recipe=recipe,
+            model_id=GLM53_MODEL_ID,
+            release="glm-5.3",
+            source_format="fp8-e4m3-block128x128-dynamic",
+            exl3_bits=4,
+            source_has_block_fp8_scales=True,
+        )
+    else:
+        raise ArtifactValidationError(f"unsupported GLM-5 EXL3 recipe: {recipe!r}")
+    if (
+        plan.get("schema") not in contract.plan_schemas
+        or source.get("release", contract.release) != contract.release
+        or source.get("format", contract.source_format) != contract.source_format
+    ):
+        raise ArtifactValidationError("artifact plan/source contract is inconsistent")
+    return contract
+
+
 class ArtifactValidationError(RuntimeError):
-    """The candidate cannot be accepted as the calibrated GLM-5.2 artifact."""
+    """The candidate cannot be accepted as a calibrated GLM-5 artifact."""
+
+
+def _compact_exl3_declaration(external: dict[str, Any]) -> dict[str, Any]:
+    """Return only the Hub/runtime discovery fields embedded in config.json."""
+
+    return {field: external.get(field) for field in COMPACT_EXL3_DECLARATION_FIELDS}
 
 
 @dataclass(frozen=True)
@@ -466,11 +556,17 @@ def _module_contract() -> dict[str, tuple[int, int]]:
     return result
 
 
-def _tensor_contract(module: str, input_features: int, output_features: int) -> dict[str, tuple[str, tuple[int, ...]]]:
+def _tensor_contract(
+    module: str,
+    input_features: int,
+    output_features: int,
+    *,
+    exl3_bits: int = EXL3_BITS,
+) -> dict[str, tuple[str, tuple[int, ...]]]:
     return {
         f"{module}.trellis": (
             "I16",
-            (input_features // 16, output_features // 16, 16 * EXL3_BITS),
+            (input_features // 16, output_features // 16, 16 * exl3_bits),
         ),
         f"{module}.suh": ("F16", (input_features,)),
         f"{module}.svh": ("F16", (output_features,)),
@@ -539,6 +635,7 @@ def _validate_checkpoint_artifact_join(
     plan: dict[str, Any],
     artifact_inventory: SnapshotInventory,
     modules: dict[str, tuple[int, int]],
+    contract: ArtifactContract,
 ) -> dict[str, Any]:
     resolved = _regular_root(
         checkpoint_root,
@@ -631,7 +728,11 @@ def _validate_checkpoint_artifact_join(
                     f"projection-checkpoint ledger differs for {module}"
                 )
 
-            expected = _tensor_contract(module, *modules[module])
+            expected = _tensor_contract(
+                module,
+                *modules[module],
+                exl3_bits=contract.exl3_bits,
+            )
             checkpoint_records = _parse_safetensors(
                 tensor_path,
                 reject_symlink=True,
@@ -709,8 +810,32 @@ def _validate_checkpoint_artifact_join(
     }
 
 
-def _validate_quantization_config(artifact: Path, modules: dict[str, tuple[int, int]]) -> dict[str, Any]:
+def _validate_quantization_config(
+    artifact: Path,
+    modules: dict[str, tuple[int, int]],
+    contract: ArtifactContract,
+    *,
+    source_config_path: Path | None = None,
+) -> dict[str, Any]:
     config = _json_object(artifact / "config.json")
+    if source_config_path is not None:
+        source_config = _json_object(source_config_path)
+        unexpected_config_fields = set(config) - (
+            set(source_config) | {"quantization_config"}
+        )
+        if unexpected_config_fields:
+            raise ArtifactValidationError(
+                "artifact config added fields absent from the source: "
+                f"{sorted(unexpected_config_fields)}"
+            )
+        for field, expected in source_config.items():
+            if field == "quantization_config":
+                continue
+            if config.get(field) != expected:
+                raise ArtifactValidationError(
+                    f"artifact config changed source field {field}: "
+                    f"{config.get(field)!r} != {expected!r}"
+                )
     expected_geometry = {
         "model_type": "glm_moe_dsa",
         "hidden_size": HIDDEN_SIZE,
@@ -735,7 +860,7 @@ def _validate_quantization_config(artifact: Path, modules: dict[str, tuple[int, 
         "quant_method": "exl3",
         "format": "exl3",
         "checkpoint_format": "exl3",
-        "bits": float(EXL3_BITS),
+        "bits": float(contract.exl3_bits),
         "codebook": "mcg",
         "out_scales": "auto",
         "group_size": -1,
@@ -743,11 +868,24 @@ def _validate_quantization_config(artifact: Path, modules: dict[str, tuple[int, 
         "module_include": [MODULE_INCLUDE],
     }
     for field, expected in required.items():
-        if external.get(field) != expected or embedded.get(field) != expected:
+        if external.get(field) != expected:
             raise ArtifactValidationError(
-                f"EXL3 config {field} differs between the required/external/embedded contracts"
+                f"external EXL3 config {field} differs from the required contract"
             )
-    storage = external.get("tensor_storage")
+    compact_external = dict(external)
+    storage = compact_external.pop("tensor_storage", None)
+    minimal_embedded = _compact_exl3_declaration(external)
+    if contract.exl3_bits == 4 and embedded != minimal_embedded:
+        raise ArtifactValidationError(
+            "GLM-5.3 embedded EXL3 declaration is not the exact minimal contract"
+        )
+    if contract.exl3_bits == 3 and embedded not in (
+        minimal_embedded,
+        compact_external,
+    ):
+        raise ArtifactValidationError(
+            "GLM-5.2 embedded EXL3 declaration differs from the external contract"
+        )
     if not isinstance(storage, dict) or set(storage) != set(modules):
         actual = set(storage) if isinstance(storage, dict) else set()
         raise ArtifactValidationError(
@@ -756,12 +894,14 @@ def _validate_quantization_config(artifact: Path, modules: dict[str, tuple[int, 
             f"missing={sorted(set(modules) - actual)[:8]} "
             f"unexpected={sorted(actual - set(modules))[:8]}"
         )
-    embedded_storage = embedded.get("tensor_storage")
-    if embedded_storage is not None and embedded_storage != storage:
-        raise ArtifactValidationError("embedded EXL3 tensor_storage conflicts with the external config")
     for module, (input_features, output_features) in modules.items():
         entry = storage[module]
-        expected_tensors = _tensor_contract(module, input_features, output_features)
+        expected_tensors = _tensor_contract(
+            module,
+            input_features,
+            output_features,
+            exl3_bits=contract.exl3_bits,
+        )
         if (
             not isinstance(entry, dict)
             or set(entry) != {
@@ -771,7 +911,7 @@ def _validate_quantization_config(artifact: Path, modules: dict[str, tuple[int, 
                 "mcg_multiplier",
             }
             or entry.get("quant_format") != "exl3"
-            or entry.get("bits_per_weight") != EXL3_BITS
+            or entry.get("bits_per_weight") != contract.exl3_bits
             or entry.get("mcg_multiplier") != MCG_MULTIPLIER
         ):
             raise ArtifactValidationError(f"invalid EXL3 tensor_storage entry for {module}")
@@ -790,6 +930,45 @@ def _validate_quantization_config(artifact: Path, modules: dict[str, tuple[int, 
     return external
 
 
+def _validate_quantization_provenance(
+    external: dict[str, Any],
+    plan: dict[str, Any],
+    execution_upgrade: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind the exported calibration ledger to the immutable execution plan."""
+
+    planned = plan.get("ledger_provenance")
+    if not isinstance(planned, dict):
+        raise ArtifactValidationError(
+            "artifact plan has no quantization ledger provenance"
+        )
+    expected = json.loads(json.dumps(planned))
+    if execution_upgrade is not None:
+        run = expected.get("run")
+        if not isinstance(run, dict):
+            raise ArtifactValidationError(
+                "artifact plan quantization ledger has no run provenance"
+            )
+        run["execution_upgrade"] = {
+            "schema": execution_upgrade["schema"],
+            "upgrade_sha256": execution_upgrade["upgrade_sha256"],
+            "parent_plan_sha256": execution_upgrade["parent_plan_sha256"],
+            "upgraded_execution": execution_upgrade["upgraded_execution"],
+            "resume_state": execution_upgrade.get("resume_state"),
+        }
+    meta = external.get("meta")
+    actual = (
+        meta.get("ds4rt_error_ledger")
+        if isinstance(meta, dict)
+        else None
+    )
+    if actual != expected:
+        raise ArtifactValidationError(
+            "standalone EXL3 quantization ledger differs from the immutable plan/execution"
+        )
+    return expected
+
+
 def _validate_manifest(
     artifact: Path,
     *,
@@ -799,8 +978,10 @@ def _validate_manifest(
     dict[str, Any],
     dict[str, Any],
     dict[str, Any] | None,
+    ArtifactContract,
 ]:
     plan = _json_object(artifact / "glmrt-gptqmodel-plan.json")
+    contract = _artifact_contract(plan)
     manifest = _json_object(artifact / "glmrt-gptqmodel-artifact.json")
     run = _json_object(artifact / "glmrt-gptqmodel-run.json")
 
@@ -833,11 +1014,11 @@ def _validate_manifest(
     )
     records = manifest.get("files")
     if (
-        plan.get("schema") not in PLAN_SCHEMAS
-        or plan.get("recipe") != RECIPE
-        or manifest.get("schema") != ARTIFACT_SCHEMA
+        plan.get("schema") not in contract.plan_schemas
+        or plan.get("recipe") != contract.recipe
+        or manifest.get("schema") != contract.artifact_schema
         or manifest.get("plan_sha256") != plan.get("plan_sha256")
-        or run.get("schema") != RUN_SCHEMA
+        or run.get("schema") != contract.run_schema
         or run.get("status") != "complete"
         or run.get("plan_sha256") != plan.get("plan_sha256")
         or run.get("artifact_manifest_sha256") != manifest.get("manifest_sha256")
@@ -892,7 +1073,7 @@ def _validate_manifest(
                 raise ArtifactValidationError(f"artifact file hash differs: {relative}")
     if manifest.get("total_bytes") != total_bytes:
         raise ArtifactValidationError("artifact manifest total_bytes differs")
-    return plan, manifest, run, execution_upgrade
+    return plan, manifest, run, execution_upgrade, contract
 
 
 def _compare_retained_tensor(name: str, source: TensorRecord, artifact: TensorRecord) -> str:
@@ -922,6 +1103,34 @@ def _compare_retained_tensor(name: str, source: TensorRecord, artifact: TensorRe
     return digest.hexdigest()
 
 
+def _validate_exact_source_metadata(artifact: Path, source: Path) -> list[dict[str, Any]]:
+    records = []
+    for name in EXACT_SOURCE_METADATA_FILES:
+        source_path = source / name
+        artifact_path = artifact / name
+        if (
+            not source_path.is_file()
+            or not artifact_path.is_file()
+            or artifact_path.is_symlink()
+        ):
+            raise ArtifactValidationError(f"artifact source metadata is missing: {name}")
+        source_digest = _hash_file(source_path)
+        artifact_digest = _hash_file(artifact_path)
+        if (
+            source_path.stat().st_size != artifact_path.stat().st_size
+            or source_digest != artifact_digest
+        ):
+            raise ArtifactValidationError(f"artifact source metadata differs: {name}")
+        records.append(
+            {
+                "name": name,
+                "bytes": artifact_path.stat().st_size,
+                "sha256": artifact_digest,
+            }
+        )
+    return records
+
+
 def validate(
     artifact_path: Path,
     source_path: Path,
@@ -933,7 +1142,7 @@ def validate(
 ) -> dict[str, Any]:
     artifact = _regular_root(artifact_path, label="artifact")
     source = _regular_root(source_path, label="source snapshot")
-    plan, manifest, run, execution_upgrade = _validate_manifest(
+    plan, manifest, run, execution_upgrade, contract = _validate_manifest(
         artifact,
         verify_hashes=verify_artifact_file_hashes,
     )
@@ -941,14 +1150,31 @@ def validate(
     artifact_inventory = _snapshot_inventory(artifact, reject_symlinks=True)
     modules = _module_contract()
     if len(modules) != EXPECTED_MODULES:
-        raise AssertionError("internal GLM-5.2 module geometry is inconsistent")
-    _validate_quantization_config(artifact, modules)
+        raise AssertionError("internal GLM-5 module geometry is inconsistent")
+    quantization_config = _validate_quantization_config(
+        artifact,
+        modules,
+        contract,
+        source_config_path=source / "config.json",
+    )
+    quantization_provenance = _validate_quantization_provenance(
+        quantization_config,
+        plan,
+        execution_upgrade,
+    )
+    source_metadata = _validate_exact_source_metadata(artifact, source)
 
     source_native = {f"{module}.weight" for module in modules}
+    source_scale_inv = (
+        {f"{module}.weight_scale_inv" for module in modules}
+        if contract.source_has_block_fp8_scales
+        else set()
+    )
+    source_native |= source_scale_inv
     if not source_native.issubset(source_inventory.tensors):
         missing = sorted(source_native - set(source_inventory.tensors))[:8]
         raise ArtifactValidationError(f"source snapshot lacks routed weights: {missing}")
-    for name in source_native:
+    for name in source_native - source_scale_inv:
         match = NATIVE_EXPERT_RE.fullmatch(name)
         assert match is not None
         module = name.removesuffix(".weight")
@@ -958,8 +1184,27 @@ def validate(
             raise ArtifactValidationError(f"source routed weight shape differs: {name}")
 
     expected_exl3: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for name in source_scale_inv:
+        record = source_inventory.tensors[name]
+        module = name.removesuffix(".weight_scale_inv")
+        input_features, output_features = modules[module]
+        expected_shape = (
+            output_features // 128,
+            input_features // 128,
+        )
+        if record.dtype != "F32" or record.shape != expected_shape:
+            raise ArtifactValidationError(
+                f"source block-FP8 inverse-scale metadata differs: {name}"
+            )
+
     for module, dimensions in modules.items():
-        expected_exl3.update(_tensor_contract(module, *dimensions))
+        expected_exl3.update(
+            _tensor_contract(
+                module,
+                *dimensions,
+                exl3_bits=contract.exl3_bits,
+            )
+        )
     retained = set(source_inventory.tensors) - source_native
     expected_artifact = retained | set(expected_exl3)
     actual_artifact = set(artifact_inventory.tensors)
@@ -992,6 +1237,7 @@ def validate(
         plan=plan,
         artifact_inventory=artifact_inventory,
         modules=modules,
+        contract=contract,
     )
     if checkpoint_join["tensor_bytes"] != sum(
         artifact_inventory.tensors[name].length for name in expected_exl3
@@ -1025,11 +1271,13 @@ def validate(
         or not isinstance(plan_exl3, dict)
         or plan_source.get("config_sha256") != source_config_sha256
         or plan_source.get("index_sha256") != source_index_sha256
-        or plan_exl3.get("bits") != EXL3_BITS
+        or plan_exl3.get("bits") != contract.exl3_bits
         or plan_exl3.get("codebook") != "mcg"
         or plan_exl3.get("module_include") != [MODULE_INCLUDE]
     ):
-        raise ArtifactValidationError("artifact plan is not bound to this source/K3 recipe")
+        raise ArtifactValidationError(
+            "artifact plan is not bound to this source/EXL3 recipe"
+        )
     tokenizer_evidence = _validate_tokenizer_evidence(
         plan=plan,
         source=source,
@@ -1042,10 +1290,18 @@ def validate(
     retained_tensor_bytes = sum(
         artifact_inventory.tensors[name].length for name in retained
     )
+    model_config_path = artifact / "config.json"
+    model_config = _json_object(model_config_path)
+    embedded_quantization = model_config.get("quantization_config")
+    if not isinstance(embedded_quantization, dict):
+        raise ArtifactValidationError(
+            "artifact config lost its quantization declaration"
+        )
+    quantize_config_path = artifact / "quantize_config.json"
     report = {
-        "schema": SCHEMA,
+        "schema": contract.validation_schema,
         "status": "accepted",
-        "model_id": MODEL_ID,
+        "model_id": contract.model_id,
         "artifact": os.fspath(artifact),
         "source_snapshot": os.fspath(source),
         "plan_sha256": plan["plan_sha256"],
@@ -1066,11 +1322,26 @@ def validate(
         "retained_native_bytes_verified": not skip_retained_native_bytes,
         "retained_native_content_sha256": retained_digest,
         "exl3_tensor_bytes": exl3_tensor_bytes,
+        "quantization_config": {
+            "model_config_bytes": model_config_path.stat().st_size,
+            "embedded_fields": sorted(embedded_quantization),
+            "standalone_bytes": quantize_config_path.stat().st_size,
+            "sha256": _hash_file(quantize_config_path),
+            "tensor_storage_entries": len(quantization_config["tensor_storage"]),
+            "stored_tensor_descriptions": sum(
+                len(entry["stored_tensors"])
+                for entry in quantization_config["tensor_storage"].values()
+            ),
+            "ledger_provenance_sha256": hashlib.sha256(
+                _canonical_json(quantization_provenance)
+            ).hexdigest(),
+        },
         "projection_checkpoint_bytes_verified": True,
         "projection_checkpoint": checkpoint_join,
-        "tp4_resident_bytes_per_spark": EXPECTED_TP4_RESIDENT_BYTES,
+        "tp4_resident_bytes_per_spark": contract.expected_tp4_resident_bytes,
         "artifact_manifest_file_hashes_verified": verify_artifact_file_hashes,
         "tokenizer_evidence": tokenizer_evidence,
+        "source_metadata": source_metadata,
     }
     report["report_sha256"] = hashlib.sha256(_canonical_json(report)).hexdigest()
     return report

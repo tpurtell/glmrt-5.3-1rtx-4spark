@@ -21,6 +21,9 @@ assert SPEC is not None and SPEC.loader is not None
 TOOL = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = TOOL
 SPEC.loader.exec_module(TOOL)
+NATIVE_VALIDATOR_SHA256 = hashlib.sha256(
+    (TOOLS / "validate_b12x_exl3_native.py").read_bytes()
+).hexdigest()
 
 
 BASELINE = "lukealonso/GLM-5.2-NVFP4"
@@ -48,6 +51,16 @@ def write_jsonl(path: Path, records: list[dict]) -> Path:
 def structural_evidence(root: Path) -> tuple[Path, Path, Path]:
     artifact = root / "artifact"
     artifact.mkdir()
+    (artifact / "glmrt-gptqmodel-plan.json").write_text(
+        json.dumps(
+            {
+                "schema": "glmrt-glm52-gptqmodel-plan-v2",
+                "recipe": "glm52_exl3_trellis_3bpw_calibrated_natural_route_v1",
+                "source": {"release": "glm-5.2", "format": "bf16"},
+            }
+        ),
+        encoding="utf-8",
+    )
     (artifact / "glmrt-gptqmodel-artifact.json").write_text(
         json.dumps(
             {
@@ -132,6 +145,7 @@ def blended(root: Path, name: str, model: str, tps: float, acceptance: float) ->
         "repeats": 1,
         "nonce_seed": 7,
         "temperature": 0,
+        "enable_thinking": False,
         "quality_contract_version": "glmrt-semantic-decode-contract-v2",
     }
     drafts = 100
@@ -194,6 +208,7 @@ def repeat(root: Path, name: str, model: str, tps: float) -> Path:
         "repeats": 1,
         "nonce_seed": 9,
         "temperature": 0,
+        "enable_thinking": False,
         "tokenizer_sha256": TOKENIZER_SHA256,
     }
     decode_ms = 99_000.0 / tps
@@ -263,6 +278,8 @@ def prefill(root: Path, name: str, model: str, tps: float) -> Path:
                 "model": model,
                 "base_context_tokens": 0,
                 "suffix_tokens": 1024,
+                "prompt_tokens": 1028,
+                "cached_prompt_tokens": 3,
                 "prefill_rows": 1024,
                 "repeat": 1,
                 "prompt_sha256": PROMPT_SHA256,
@@ -400,6 +417,7 @@ def deployment(root: Path, name: str, model: str, *, candidate: bool) -> Path:
         "slot": "exl3-qualified",
         "profile": "balanced",
         "speculation": "dspark",
+        "launch_started_ns": 1_725_000_000_000_000_001 if candidate else 1_725_000_000_000_000_002,
         "power_limit_w": 400,
         "engine_identity": (
             f"wip-exl3-qualified-{coordinator_slot[:12]}-{expert_slot[:12]}"
@@ -421,6 +439,56 @@ def deployment(root: Path, name: str, model: str, *, candidate: bool) -> Path:
     return path
 
 
+def test_dflash2_deployment_accepts_adaptive_policy_contract(tmp_path: Path) -> None:
+    path = deployment(tmp_path, "dflash2-adaptive.json", CANDIDATE, candidate=True)
+    report = json.loads(path.read_text())
+    report.pop("report_sha256")
+    report["speculation"] = "dflash2"
+    report["speculation_settings"] = {
+        "checkpoint_model_id": TOOL.DFLASH2_MODEL_ID,
+        "checkpoint_revision": TOOL.DFLASH2_REVISION,
+        "draft_policy": "adaptive",
+        "fixed_drafts": None,
+        "proposal_drafts": 7,
+        "topk_backend": "torch",
+    }
+    path.write_bytes(STAGE._canonical_json(bound(report, "report_sha256")) + b"\n")
+
+    parsed = TOOL.deployment(
+        path,
+        candidate=True,
+        expected_model=CANDIDATE,
+        expected_speculation="dflash2",
+    )
+
+    assert parsed["speculation_settings"]["draft_policy"] == "adaptive"
+    assert parsed["speculation_settings"]["proposal_drafts"] == 7
+
+
+def test_dflash2_deployment_rejects_incoherent_policy_contract(tmp_path: Path) -> None:
+    path = deployment(tmp_path, "dflash2-incoherent.json", CANDIDATE, candidate=True)
+    report = json.loads(path.read_text())
+    report.pop("report_sha256")
+    report["speculation"] = "dflash2"
+    report["speculation_settings"] = {
+        "checkpoint_model_id": TOOL.DFLASH2_MODEL_ID,
+        "checkpoint_revision": TOOL.DFLASH2_REVISION,
+        "draft_policy": "adaptive",
+        "fixed_drafts": 5,
+        "proposal_drafts": 7,
+        "topk_backend": "torch",
+    }
+    path.write_bytes(STAGE._canonical_json(bound(report, "report_sha256")) + b"\n")
+
+    with pytest.raises(TOOL.QualificationError, match="invalid DFlash2"):
+        TOOL.deployment(
+            path,
+            candidate=True,
+            expected_model=CANDIDATE,
+            expected_speculation="dflash2",
+        )
+
+
 def native_validations(root: Path) -> list[Path]:
     library = root / "libglmrt_native.so"
     library.write_bytes(b"test-native-library")
@@ -434,6 +502,9 @@ def native_validations(root: Path) -> list[Path]:
         body = {
             "schema": TOOL.NATIVE_VALIDATION_SCHEMA,
             "status": "accepted",
+            "script_sha256": NATIVE_VALIDATOR_SHA256,
+            "expert_slot_fingerprint": "2" * 64,
+            "trellis_bits": 3,
             "sparkinfer_revision": "5" * 40,
             "native_library": library_identity,
             "device": {
@@ -481,6 +552,54 @@ def native_validations(root: Path) -> list[Path]:
         path.write_bytes(STAGE._canonical_json(bound(body, "report_sha256")) + b"\n")
         paths.append(path)
     return paths
+
+
+def test_native_evidence_rejects_the_wrong_trellis_bitrate(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "projection-checkpoints"
+    checkpoint_root.mkdir()
+    paths = native_validations(tmp_path)
+    report = json.loads(paths[0].read_text(encoding="utf-8"))
+    report.pop("report_sha256")
+    report["trellis_bits"] = 4
+    paths[0].write_bytes(
+        STAGE._canonical_json(bound(report, "report_sha256")) + b"\n"
+    )
+
+    with pytest.raises(TOOL.QualificationError, match="accepted native EXL3"):
+        TOOL.native_validations(
+            paths,
+            expected_sparkinfer_revision="5" * 40,
+            expected_checkpoint_root=checkpoint_root.resolve(),
+            expected_expert_slot_fingerprint="2" * 64,
+        )
+
+    report.pop("report_sha256", None)
+    report["trellis_bits"] = 3
+    report["script_sha256"] = "0" * 64
+    paths[0].write_bytes(
+        STAGE._canonical_json(bound(report, "report_sha256")) + b"\n"
+    )
+    with pytest.raises(TOOL.QualificationError, match="accepted native EXL3"):
+        TOOL.native_validations(
+            paths,
+            expected_sparkinfer_revision="5" * 40,
+            expected_checkpoint_root=checkpoint_root.resolve(),
+            expected_expert_slot_fingerprint="2" * 64,
+        )
+
+    report.pop("report_sha256", None)
+    report["script_sha256"] = NATIVE_VALIDATOR_SHA256
+    report["expert_slot_fingerprint"] = "0" * 64
+    paths[0].write_bytes(
+        STAGE._canonical_json(bound(report, "report_sha256")) + b"\n"
+    )
+    with pytest.raises(TOOL.QualificationError, match="accepted native EXL3"):
+        TOOL.native_validations(
+            paths,
+            expected_sparkinfer_revision="5" * 40,
+            expected_checkpoint_root=checkpoint_root.resolve(),
+            expected_expert_slot_fingerprint="2" * 64,
+        )
 
 
 def inputs(root: Path, *, candidate_decode_tps: float = 48.0) -> dict:
@@ -540,6 +659,7 @@ def test_accepts_exactly_paired_serving_evidence(tmp_path: Path) -> None:
     assert report["results"]["blended"]["decode_ratio"] == 1.5
     assert report["gates"]["native_kernel_parity"] is True
     assert report["results"]["native_kernel"]["tp_ranks"] == [0, 1, 2, 3]
+    assert report["results"]["native_kernel"]["expert_slot_fingerprint"] == "2" * 64
     body = {key: value for key, value in report.items() if key != "report_sha256"}
     assert report["report_sha256"] == hashlib.sha256(TOOL.canonical_json(body)).hexdigest()
 
@@ -655,6 +775,33 @@ def test_rejects_prefill_summary_that_differs_from_measurements(
         TOOL.qualify(**arguments)
 
 
+def test_rejects_prefill_that_did_not_reuse_its_claimed_base_context(
+    tmp_path: Path,
+) -> None:
+    path = prefill(tmp_path, "cached-prefill.jsonl", CANDIDATE, 1_000.0)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    measurement = records[0]
+    measurement["base_context_tokens"] = 32_768
+    measurement["cached_prompt_tokens"] = 16_384
+    measurement["prompt_tokens"] = 17_409
+    records[-1]["cells"][0]["base_context_tokens"] = 32_768
+    prompts = [
+        {
+            "base_context_tokens": 32_768,
+            "suffix_tokens": 1_024,
+            "repeat": 1,
+            "prompt_sha256": PROMPT_SHA256,
+        }
+    ]
+    records[-1]["prompt_contract_sha256"] = hashlib.sha256(
+        TOOL.canonical_json(prompts)
+    ).hexdigest()
+    write_jsonl(path, records)
+
+    with pytest.raises(TOOL.QualificationError, match="runtime correctness"):
+        TOOL.prefill(path, candidate=True)
+
+
 def test_rejects_zero_point_baseline_instead_of_dividing_by_zero(
     tmp_path: Path,
 ) -> None:
@@ -675,6 +822,17 @@ def test_rejects_tool_eval_aggregate_that_differs_from_scenarios(
     report = json.loads(path.read_text(encoding="utf-8"))
     report["scores"]["total_points"] = 3
     report["final_score"] = 75
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(TOOL.QualificationError, match="invalid tool-evaluation totals"):
+        TOOL.qualify(**arguments)
+
+
+def test_rejects_non_greedy_tool_eval(tmp_path: Path) -> None:
+    arguments = inputs(tmp_path)
+    path = arguments["candidate_tool_eval_path"]
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["config"]["temperature"] = 0.7
     path.write_text(json.dumps(report), encoding="utf-8")
 
     with pytest.raises(TOOL.QualificationError, match="invalid tool-evaluation totals"):

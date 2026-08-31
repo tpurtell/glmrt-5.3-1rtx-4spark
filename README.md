@@ -1,35 +1,37 @@
-# GLMRT — GLM-5.2 inference engine
+# GLMRT — GLM-5.3 inference engine
 
-## 4x Spark + 1x RTX 6000 @ 71 tok/s decode + 1,800 tok/s prefill
+## 4x Spark + 1x RTX 6000 @ 52 tok/s decode + 1,600 tok/s prefill
 
-<sub>X-style balanced-profile peaks: low-entropy EXL3 decode and fresh large NVFP4 prefill.</sub>
+<sub>X-style balanced-profile peaks: low-entropy DFlash2 decode and fresh large prefill.</sub>
 
 ## What
 
 GLMRT is a Rust-based Attention–FFN Disaggregation (AFD) inference engine for
-GLM-5.2. One RTX PRO 6000 Blackwell 96 GB coordinator handles attention,
-scheduling, KV cache, sampling, and the OpenAI-compatible API; four NVIDIA DGX
-Sparks execute the routed MoE experts.
+[`wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1).
+One RTX PRO 6000 Blackwell 96 GB coordinator owns attention, scheduling, KV
+cache, sampling, speculative decoding, and the OpenAI-compatible API. Four
+NVIDIA DGX Sparks hold and execute the routed MoE experts.
 
-It supports the `lukealonso/GLM-5.2-NVFP4` and `nvidia/GLM-5.2-NVFP4`
-exports, plus `wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1`. It provides
-continuous batching, long context, tool use, reasoning, vision, and plain,
-native-MTP, or dSpark decoding.
+The production default is adaptive
+[`incoai/GLM-5.3-DFlash2`](https://huggingface.co/incoai/GLM-5.3-DFlash2),
+with native MTP available as an alternate. The engine provides continuous
+batching at concurrency four, 400K context in the balanced profile, strict tool
+and structured-output constraints, reasoning, vision, and radix-prefix reuse.
 
-It is zippy in the balanced profile: about 35 tok/s on real Python coding with
-NVFP4, about 40 tok/s with EXL3 K3, and up to 1,800 tok/s on large prefills.
+It is zippy: about 41 tok/s on the real Python coding workload, 52 tok/s on a
+low-entropy prompt, up to 82 tok/s aggregate at concurrency four, and about
+1,600 tok/s on large fresh prefills.
 
 ## Why
 
-I wanted a high-quality local GLM-5.2 using the hardware I already had, and a
+I wanted a high-quality local GLM-5.3 using the hardware I already had, and a
 custom AFD engine was the best way to make the large GPU and four Sparks work
 together.
 
-I built GLMRT for fun in an agentic process lasting roughly 30 days. One agent
-implemented it; a second was a discussion partner that helped sharpen my
-thinking before I gave instructions to the coding agent. The project started
-with GPT-5.5 + DeepSeek V4 Pro and later switched to GPT-5.6 Sol + Grok 4.5,
-which was a big upgrade.
+I built GLMRT for fun through an agentic process. One agent implemented it; a
+second was a discussion partner that helped sharpen my thinking before I gave
+instructions to the coding agent. The project started with GPT-5.5 + DeepSeek
+V4 Pro and later switched to GPT-5.6 Sol + Grok 4.5, which was a big upgrade.
 
 I am releasing it because it is cool, intelligence should be everywhere, and
 it may be useful to someone customizing an inference engine for their own
@@ -37,16 +39,15 @@ hardware.
 
 ## Architecture
 
-[![GLMRT balanced-path architecture](docs/balanced-path-architecture.svg)](docs/balanced-path-architecture.svg)
+[![GLMRT GLM-5.3 architecture](docs/balanced-path-architecture.svg)](docs/balanced-path-architecture.svg)
 
 ## How to use it
 
 Clone the repository and edit the four Spark host names and network addresses
-in `glmrt.config`. The other defaults can be left alone. Set `MODEL=luke`,
-`MODEL=nvidia`, or `MODEL=exl3` to select a checkpoint already cached on all
-five hosts.
+in `glmrt.config`. The other defaults can be left alone. The default
+`MODEL=glm53-exl3` and `SPECULATION=dflash2` select the measured release path.
 
-Build and run both images:
+Build and run both architecture-specific images:
 
 ```bash
 ./build.sh
@@ -55,24 +56,27 @@ Build and run both images:
 
 `build.sh` builds the coordinator image locally, builds the ARM expert image
 on the first configured Spark, and distributes it to the other Sparks.
-Release maintainers can tag and push both current images as `v6` and `latest`
-with `./push-containers.sh v6`.
-
-To use the v6 images from GitHub Container Registry instead:
+Release maintainers can publish both current images as `v7` and `latest` with:
 
 ```bash
-docker pull ghcr.io/tpurtell/glmrt-coordinator:v6
+./push-containers.sh v7
+```
+
+To use the v7 images from GitHub Container Registry instead:
+
+```bash
+docker pull ghcr.io/tpurtell/glmrt-5.3-coordinator:v7
 
 for host in spark-a spark-b spark-c spark-d; do
-  ssh "$host" docker pull ghcr.io/tpurtell/glmrt-spark-expert:v6
+  ssh "$host" docker pull ghcr.io/tpurtell/glmrt-5.3-spark-expert:v7
 done
 ```
 
 Set the images in `glmrt.config` and run:
 
 ```ini
-COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-coordinator:v6
-SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-spark-expert:v6
+COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-5.3-coordinator:v7
+SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-5.3-spark-expert:v7
 ```
 
 ```bash
@@ -80,197 +84,151 @@ SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-spark-expert:v6
 ```
 
 The server exposes an OpenAI-compatible API at `http://localhost:8000/v1` by
-default. Model weights are not included; the selected checkpoint must already
-exist in the Hugging Face cache on every host.
+default. Model weights are not included. The GLM-5.3 EXL3 K4 target must be in
+the Hugging Face cache on all five hosts; the DFlash2 checkpoint is needed on
+the coordinator. The complete calibrated K4 creation and qualification recipe
+is in [`quantization/README.md`](quantization/README.md).
 
 ## High Level Benchmarks
 
-All results below were measured on 4x DGX Spark + 1x RTX PRO 6000 96 GB with
-dSpark speculation. Except for the profile comparison, every performance
-measurement used the balanced profile.
+All results below were measured on one 400 W RTX PRO 6000 Blackwell 96 GB
+coordinator and four resident DGX Spark expert workers. The target is
+`wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1` at revision
+`dd270970a59e6978ddbe14a527b6060e1073fcd1`; DFlash2 is revision
+`425aa615ce320caac34400208b30808c8f14f76c`. Except for the profile comparison,
+every measurement used the balanced profile.
 
-| Checkpoint | Weighted decode | Python code | Low entropy | Large fresh prefill | Tool eval median | Needles |
-|---|---:|---:|---:|---:|---:|---:|
-| NVFP4 | 26.63 tok/s | 35.43 tok/s | 63.27 tok/s | 1,807 tok/s | 120/138 | 12/12 |
-| EXL3 K3 | 28.49 tok/s | 39.51 tok/s | 70.86 tok/s | 1,710 tok/s | 123/138 | 12/12 |
+| Speculation | Weighted decode | Python code | Low entropy | Acceptance |
+|---|---:|---:|---:|---:|
+| Native MTP | 23.06 tok/s | 23.92 tok/s | 36.55 tok/s | 55.3% |
+| DFlash2 adaptive K1–K7 | 25.96 tok/s | 41.43 tok/s | 51.86 tok/s | 49.8% |
 
-Weighted decode is pooled wall throughput across five repeats of seven mixed
-code, math, prose, short-response, exposition, JSON, and multilingual prompts.
-Python is the zero-context `merge_intervals` workload. Low entropy requested
-100 repetitions of `orchid`; both models over-repeated, so that number is a
-speed-only X-style test.
+Weighted decode pools five complete replays of eight semantic workload types.
+The low-entropy workload requests repeated `orchid` tokens and is a speed-only
+X-style probe, not a counting-quality test.
+
+### DFlash2 policy
+
+| Policy | Weighted decode | C1/C2/C4 geometric mean | Response-performance score |
+|---|---:|---:|---:|
+| Adaptive K1–K7 | 25.96 tok/s | 62.77 tok/s | 32.793 |
+| Fixed K5 | 24.67 tok/s | 62.45 tok/s | 31.923 |
+
+Adaptive verification improves weighted decode by 5.21% over fixed K5.
+
+### Eight-type decode
+
+| Type | Native MTP | MTP acceptance | DFlash2 | DFlash2 acceptance |
+|---|---:|---:|---:|---:|
+| Python code | 23.92 tok/s | 60.2% | 41.43 tok/s | 83.0% |
+| Math reasoning | 26.34 tok/s | 53.5% | 37.05 tok/s | 75.8% |
+| Creative prose | 22.14 tok/s | 37.7% | 20.70 tok/s | 36.2% |
+| Short response | 16.34 tok/s | 21.5% | 23.42 tok/s | 46.7% |
+| Exposition | 22.36 tok/s | 53.0% | 25.99 tok/s | 48.2% |
+| Natural JSON | 28.72 tok/s | 59.7% | 30.50 tok/s | 56.3% |
+| Constrained JSON Schema | 29.04 tok/s | 61.2% | 30.87 tok/s | 62.3% |
+| Multilingual | 23.01 tok/s | 56.5% | 23.34 tok/s | 40.3% |
 
 ### Prefill
 
-Each cell is the median of two requests and reports new suffix tokens per
-second after the row's context was placed in KV cache. Every retained sample
-contained the exact requested number of new rows.
-
-#### NVFP4
+Each cell is median new-suffix throughput after retaining the row's base
+context in KV cache.
 
 | Cached context | +1K | +2K | +4K | +8K | +16K | +32K |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0 | 585 | 972 | 1,495 | 1,736 | 1,807 | 1,772 |
-| 32K | 854 | 964 | 1,496 | 1,733 | 1,722 | 1,692 |
-| 64K | 845 | 962 | 1,493 | 1,659 | 1,658 | 1,623 |
-| 128K | 829 | 945 | 1,389 | 1,510 | 1,510 | 1,492 |
-| 256K | 784 | 916 | 1,221 | 1,311 | 1,315 | 1,298 |
+| 0 | 613 | 883 | 1,254 | 1,516 | 1,573 | 1,599 |
+| 32K | 599 | 871 | 1,249 | 1,525 | 1,571 | 1,588 |
+| 64K | 597 | 874 | 1,231 | 1,513 | 1,561 | 1,561 |
+| 128K | 593 | 868 | 1,197 | 1,467 | 1,490 | 1,479 |
+| 256K | 667 | 857 | 1,092 | 1,270 | 1,298 | 1,287 |
 
-![NVFP4 balanced prefill throughput](benchmarks/prefill-balanced.svg)
+![GLM-5.3 EXL3 K4 balanced prefill throughput](docs/glm53-exl3-k4-v1-prefill.svg)
 
-#### EXL3 K3
+### Decode across retained context
 
-| Cached context | +1K | +2K | +4K | +8K | +16K | +32K |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0 | 698 | 1,028 | 1,392 | 1,614 | 1,691 | 1,710 |
-| 32K | 676 | 1,004 | 1,364 | 1,618 | 1,694 | 1,693 |
-| 64K | 670 | 1,019 | 1,363 | 1,651 | 1,660 | 1,624 |
-| 128K | 704 | 1,012 | 1,301 | 1,508 | 1,516 | 1,491 |
-| 256K | 805 | 971 | 1,178 | 1,306 | 1,316 | 1,301 |
-
-![EXL3 K3 balanced prefill throughput](benchmarks/prefill-exl3-balanced.svg)
-
-### Decode
-
-Each cell is pooled server-side decode throughput from two deterministic
-responses with thinking disabled.
-
-#### NVFP4
+Each cell pools two deterministic DFlash2 responses. Nonzero base contexts are
+primed once and reused by all three workloads.
 
 | Context | Python code | Creative writing | Math |
 |---:|---:|---:|---:|
-| 0 | 35.43 | 22.51 | 32.90 |
-| 32K | 33.07 | 22.04 | 28.32 |
-| 64K | 30.35 | 22.96 | 26.85 |
-| 128K | 32.74 | 19.77 | 30.58 |
-| 256K | 28.86 | 18.84 | 26.78 |
+| 0 | 41.69 | 20.62 | 34.11 |
+| 32K | 37.71 | 18.88 | 28.47 |
+| 64K | 38.79 | 19.19 | 30.16 |
+| 128K | 38.39 | 18.17 | 31.50 |
+| 256K | 35.42 | 16.53 | 26.95 |
 
-![NVFP4 balanced decode throughput](benchmarks/decode-balanced.svg)
-
-#### EXL3 K3
-
-| Context | Python code | Creative writing | Math |
-|---:|---:|---:|---:|
-| 0 | 39.51 | 24.80 | 40.34 |
-| 32K | 35.92 | 23.03 | 31.49 |
-| 64K | 35.85 | 23.15 | 32.60 |
-| 128K | 35.05 | 21.57 | 30.08 |
-| 256K | 32.55 | 18.91 | 27.15 |
-
-![EXL3 K3 balanced decode throughput](benchmarks/decode-exl3-balanced.svg)
+![GLM-5.3 EXL3 K4 balanced decode throughput](docs/glm53-exl3-k4-v1-context-decode.svg)
 
 ### Concurrency
 
-Each median covers three timed batches after two warm-up batches. Unique
-first-token nonces prevented prompt-cache reuse, and every generated Python
-response passed its static contract.
-
-#### NVFP4
-
-| Concurrent requests | Median aggregate | Scaling | Correct |
-|---:|---:|---:|:---:|
-| 1 | 35.01 tok/s | 1.00x | Yes |
-| 2 | 49.53 tok/s | 1.41x | Yes |
-| 4 | 59.48 tok/s | 1.70x | Yes |
-
-#### EXL3 K3
-
-| Concurrent requests | Median aggregate | Scaling | Correct |
-|---:|---:|---:|:---:|
-| 1 | 37.39 tok/s | 1.00x | Yes |
-| 2 | 58.43 tok/s | 1.56x | Yes |
-| 4 | 61.44 tok/s | 1.64x | Yes |
+| Concurrent requests | Median aggregate | Scaling |
+|---:|---:|---:|
+| 1 | 42.11 tok/s | 1.00x |
+| 2 | 71.97 tok/s | 1.71x |
+| 4 | 81.60 tok/s | 1.94x |
 
 ### Tool use
 
-`tool-eval-bench` 2.3.2 ran all 69 scenarios serially with thinking enabled.
-Each quant used three independent seeds. Parentheses show the tool's rounded
-display score.
+`tool-eval-bench` ran all 69 scenarios serially with thinking enabled. Each run
+used a distinct seed.
 
-| Checkpoint | Run 1 | Run 2 | Run 3 | Median |
-|---|---:|---:|---:|---:|
-| NVFP4 | 120/138 (87) | 120/138 (87) | 121/138 (88) | 120/138 (87) |
-| EXL3 K3 | 123/138 (89) | 123/138 (89) | 122/138 (88) | 123/138 (89) |
+| Seed | Points | Displayed score |
+|---:|---:|---:|
+| 2026082901 | 125/138 | 91 |
+| 2026082902 | 125/138 | 91 |
+| 2026082903 | 125/138 | 91 |
+| **Median** | **125/138** | **91** |
 
 ### Pi coding-agent task
 
-Pi 0.82.0 ran in an empty directory with the prompt `make a webgl game of a
-parrot flying around to steal food from people`. Every result was a single-file
-Three.js game whose module JavaScript passed syntax validation.
+| Reasoning | Wall time | Turns | Tool calls | Tool errors | Fresh input | Cache read | Output | Reasoning | Total | File |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Off | 558.72 s | 12 | 11 | 3 | 3,924 | 177,309 | 17,268 | 0 | 198,501 | 38.4 KB |
+| High | 3,281.84 s | 4 | 3 | 0 | 1,631 | 188,114 | 62,118 | 43,547 | 251,863 | 50.1 KB |
 
-#### NVFP4
-
-| Reasoning | Wall time | Turns | Tool calls | Fresh input | Cache read | Output | Reasoning | Total | File |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Off | 285.24 s | 8 | 7 | 2,063 | 55,440 | 8,164 | 0 | 65,667 | 22.7 KB |
-| High | 252.36 s | 2 | 1 | 1,361 | 8,363 | 7,472 | 123 | 17,196 | 21.1 KB |
-
-#### EXL3 K3
-
-| Reasoning | Wall time | Turns | Tool calls | Fresh input | Cache read | Output | Reasoning | Total | File |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Off | 276.35 s | 2 | 1 | 1,326 | 10,164 | 9,327 | 0 | 20,817 | 27.7 KB |
-| High | 231.88 s | 2 | 1 | 1,331 | 8,434 | 7,498 | 110 | 17,263 | 21.1 KB |
-
-`Total` is fresh input + cache read + output. Pi reports reasoning as a subset
-of output, so it is shown but not added again.
+`Total` is fresh input + cache read + output. Reasoning is a subset of output
+and is shown without being added twice.
 
 ### Needle in a haystack
 
-Each exact-length prompt contained three unique secret codes at approximately
-10%, 50%, and 90% depth in quoted repository source. Thinking was disabled;
-both checkpoints returned all codes in order and exact JSON-only format.
+Each exact-length prompt contained unique secret codes at roughly 10%, 50%,
+and 90% depth. All 15 DFlash2 requests returned the exact key.
 
-#### NVFP4
-
-| Context | 10% | 50% | 90% |
-|---:|:---:|:---:|:---:|
-| 32K | Pass | Pass | Pass |
-| 64K | Pass | Pass | Pass |
-| 128K | Pass | Pass | Pass |
-| 256K | Pass | Pass | Pass |
-
-#### EXL3 K3
-
-| Context | 10% | 50% | 90% |
-|---:|:---:|:---:|:---:|
-| 32K | Pass | Pass | Pass |
-| 64K | Pass | Pass | Pass |
-| 128K | Pass | Pass | Pass |
-| 256K | Pass | Pass | Pass |
+| Context | 10% | 50% | 90% | Slowest request |
+|---:|:---:|:---:|:---:|---:|
+| 8K | Pass | Pass | Pass | 5.60 s |
+| 32K | Pass | Pass | Pass | 20.71 s |
+| 128K | Pass | Pass | Pass | 87.21 s |
+| 256K | Pass | Pass | Pass | 191.27 s |
+| 384K | Pass | Pass | Pass | 310.79 s |
 
 ## Micro-timeline Benchmarks
 
-[![GLMRT balanced-path micro-timeline](docs/balanced-path-timeline.svg)](docs/balanced-path-timeline.svg)
+[![GLMRT GLM-5.3 balanced micro-timeline](docs/glm53-balanced-micro-timeline.svg)](docs/glm53-balanced-micro-timeline.svg)
+
+The selected code replay produced 41.31 tok/s over 4,865.54 ms and 39 target
+cycles. The graph also shows the measured physical-M target-cycle curve.
 
 ## Startup Time
 
-The retained cold-launch measurement is shown below. No new startup run was
-performed for this release update.
+| Launch state | Ready wall time |
+|---|---:|
+| Cold — reload four expert slabs | 74.34 s |
+| Warm — retain matched experts | 46.27 s |
 
-[![GLMRT cold startup timeline](docs/startup-timeline.svg)](docs/startup-timeline.svg)
+[![GLMRT GLM-5.3 startup timeline](docs/glm53-startup-timeline.svg)](docs/glm53-startup-timeline.svg)
 
 ## Performance by Profile
 
-Only this section varies the serving profile. Weighted decode is the same
-five-repeat mixed workload used above; prefill is a fresh +8K suffix over a 2K
-cached base.
+Only this section varies the serving profile. Weighted decode uses the same
+five-replay mixed workload; prefill is a fresh +8K suffix over a retained 2K
+base.
 
-### NVFP4
-
-| Profile | Weighted decode | Verify throughput | Acceptance | Fresh +8K prefill |
+| Profile | Weighted decode | Verify throughput | Acceptance | Cached 2K + fresh 8K |
 |---|---:|---:|---:|---:|
-| Balanced | 26.63 tok/s | 28.97 tok/s | 75.2% | 1,604 tok/s |
-| Long | 26.17 tok/s | 28.52 tok/s | 75.0% | 1,579 tok/s |
-| Accurate | 21.67 tok/s | 23.64 tok/s | 83.0% | 1,055 tok/s |
-
-### EXL3 K3
-
-| Profile | Weighted decode | Verify throughput | Acceptance | Fresh +8K prefill |
-|---|---:|---:|---:|---:|
-| Balanced | 28.49 tok/s | 30.86 tok/s | 71.7% | 1,600 tok/s |
-| Long | 28.62 tok/s | 31.01 tok/s | 73.1% | 1,685 tok/s |
-| Accurate | 23.09 tok/s | 25.21 tok/s | 83.0% | 1,058 tok/s |
+| Balanced | 25.96 tok/s | 26.55 tok/s | 49.8% | 1,505.00 tok/s |
+| Long | 24.66 tok/s | 24.89 tok/s | 48.5% | 1,487.98 tok/s |
+| Accuracy | 20.00 tok/s | 21.60 tok/s | 65.1% | 1,044.16 tok/s |
 
 Agents customizing the engine should start with [`DEVELOPER.md`](DEVELOPER.md).
 GLMRT is released under the [MIT License](LICENSE).

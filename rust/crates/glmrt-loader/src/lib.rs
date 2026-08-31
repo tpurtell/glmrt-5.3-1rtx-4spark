@@ -10,11 +10,12 @@ pub use catalog::{
     read_safetensors_metadata, SafetensorsTensorMetadata,
 };
 pub use exl3_format::{
-    glm52_exl3_expert, is_glm52_exl3_recipe, validate_glm52_exl3_expert_catalog,
-    Glm52Exl3CatalogSummary, Glm52Exl3Expert, Glm52Exl3Projection, Glm52Exl3ProjectionKind,
-    Glm52Exl3Tp4ResidentGeometry, GLM52_EXL3_BITS, GLM52_EXL3_CODEBOOK,
-    GLM52_EXL3_EXPERT_TP_WORLD_SIZE, GLM52_EXL3_MCG_MULTIPLIER, GLM52_EXL3_RECIPE_K3_V1,
-    GLM52_EXL3_T12_LUT_BYTES, GLM52_EXL3_TENSOR_FORMAT,
+    exl3_bits_for_recipe, glm52_exl3_expert, is_glm52_exl3_recipe, is_glm_exl3_recipe,
+    validate_glm52_exl3_expert_catalog, Glm52Exl3CatalogSummary, Glm52Exl3Expert,
+    Glm52Exl3Projection, Glm52Exl3ProjectionKind, Glm52Exl3Tp4ResidentGeometry, GLM52_EXL3_BITS,
+    GLM52_EXL3_CODEBOOK, GLM52_EXL3_EXPERT_TP_WORLD_SIZE, GLM52_EXL3_MCG_MULTIPLIER,
+    GLM52_EXL3_RECIPE_K3_V1, GLM52_EXL3_T12_LUT_BYTES, GLM52_EXL3_TENSOR_FORMAT, GLM53_EXL3_BITS,
+    GLM53_EXL3_RECIPE_K4_V1,
 };
 pub use placement::{assignments_by_owner, build_load_plan};
 pub use snapshot::{

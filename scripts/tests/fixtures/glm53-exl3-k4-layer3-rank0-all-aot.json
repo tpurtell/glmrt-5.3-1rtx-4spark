@@ -1,0 +1,419 @@
+{
+  "cases": [
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 1,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 44,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 64,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 1,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 2,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        128,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 44,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 128,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 2,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 4,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 232,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 4,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 8,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        128,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 44,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 472,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 8,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 9,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        128,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 40,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 528,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 9,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 16,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 44,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 808,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 16,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 32,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 1368,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 32,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 64,
+      "cosine": 0.9999999403953552,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 1800,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 64,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 128,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        128,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 2040,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 128,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 144,
+      "blocks_per_sm": 3,
+      "capacity_rows": 256,
+      "cosine": 0.9999998211860657,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        128
+      ],
+      "grid_x": 144,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 4112,
+      "reference": "sparkinfer",
+      "registers_per_thread": 168,
+      "relative_l2": 0.0,
+      "route_block_rows": 16,
+      "rows": 256,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 144,
+      "blocks_per_sm": 3,
+      "capacity_rows": 257,
+      "cosine": 0.9999999403953552,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        128
+      ],
+      "grid_x": 144,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 4112,
+      "reference": "sparkinfer",
+      "registers_per_thread": 168,
+      "relative_l2": 0.0,
+      "route_block_rows": 16,
+      "rows": 257,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 512,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        128,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 44,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 8192,
+      "reference": "sparkinfer",
+      "registers_per_thread": 250,
+      "relative_l2": 0.0,
+      "route_block_rows": 32,
+      "rows": 512,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 96,
+      "blocks_per_sm": 2,
+      "capacity_rows": 1024,
+      "cosine": 1.0000001192092896,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        128
+      ],
+      "grid_x": 96,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 12288,
+      "reference": "sparkinfer",
+      "registers_per_thread": 248,
+      "relative_l2": 0.0,
+      "route_block_rows": 48,
+      "rows": 1024,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 2048,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 23808,
+      "reference": "sparkinfer",
+      "registers_per_thread": 243,
+      "relative_l2": 0.0,
+      "route_block_rows": 64,
+      "rows": 2048,
+      "source_scale": 1.0
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 2064,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 24000,
+      "reference": "sparkinfer",
+      "registers_per_thread": 243,
+      "relative_l2": 0.0,
+      "route_block_rows": 64,
+      "rows": 2064,
+      "source_scale": 1.0
+    }
+  ],
+  "device": {
+    "compute_capability": "12.1",
+    "name": "NVIDIA GB10"
+  },
+  "native_library": {
+    "bytes": 16060056,
+    "path": "/wip/slots/glm53-k4-aot-v4/spark-expert/workspace/.glmrt-wip/libglmrt_native.so",
+    "sha256": "be97fa77c1f4ec963735ed330cdedb436deee669e0d5a7f3f48e1f213adb11f0"
+  },
+  "report_sha256": "61808a43a760738c5772b5c575ce328a39e61b9ab919320699e26696abae2083",
+  "route_fixture": null,
+  "schema": "glmrt-b12x-exl3-native-validation-v1",
+  "sparkinfer_revision": "988246c8b007c9c1c2006eb677f6fa4b26aeb561",
+  "status": "accepted",
+  "trellis_bits": 4,
+  "weight_source": {
+    "inventory_sha256": "d32b86775a744dbeeb3f4d68cfa4c0e7ffc71d6b2ca6e574ac3192b5552a01a5",
+    "kind": "calibrated-projection-checkpoints",
+    "layer_id": 3,
+    "projection_count": 768,
+    "root": "/tmp/glm53-exl3-k4-layer3",
+    "tensor_bytes": 4844633088,
+    "tp_rank": 0,
+    "tp_world_size": 4
+  }
+}

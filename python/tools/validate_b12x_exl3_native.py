@@ -3,7 +3,7 @@
 
 This test deliberately crosses the native boundary used by the Spark daemon:
 
-* construct checkpoint-native K3/MCG Trellis weights at GLM-5.2 TP4 geometry;
+* construct checkpoint-native K3/K4 MCG Trellis weights at GLM TP4 geometry;
 * ask SparkInfer to prepare and pack the routes;
 * quantize BF16 activations with glmrt's NVFP4 wire-payload kernel;
 * execute the exported glmrt EXL3 kernel using Rust-equivalent device buffers;
@@ -16,6 +16,7 @@ The SparkInfer source tree must be importable (normally through PYTHONPATH).
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import ctypes
 import heapq
 import hashlib
@@ -42,10 +43,18 @@ from _b12x_exl3_k3_profile import (  # noqa: E402
     exl3_k3_route_block_rows,
     exl3_k3_tile_config,
 )
+from _b12x_exl3_k4_profile import (  # noqa: E402
+    EXL3_K4_AOT_REGIMES,
+    exl3_k4_capacity_rows,
+    exl3_k4_grid_x,
+    exl3_k4_route_block_rows,
+    exl3_k4_tile_config,
+)
 from b12x.moe import fused_moe  # noqa: E402
 from b12x.moe._shared.kernels.w4a16.host import select_route_block_size_m  # noqa: E402
 from b12x.moe._shared.kernels.w4a16.kernel import (  # noqa: E402
     _w4a16_fused_persistent_grid_x,
+    _w4a16_num_regs,
 )
 
 
@@ -67,9 +76,12 @@ EXPERT_MODULE_RE = re.compile(
 )
 REPORT_SCHEMA = "glmrt-b12x-exl3-native-validation-v1"
 ROUTE_PROFILE_SCHEMA = "glmrt-glm52-exl3-route-profile-v1"
+GLM5_ROUTE_PROFILE_SCHEMA = "glmrt-glm5-exl3-route-profile-v1"
 CHECKPOINT_SCHEMA = "ds4rt.exl3-projection-checkpoint"
 CHECKPOINT_SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+ARTIFACT_MANIFEST_FILENAME = "glmrt-gptqmodel-artifact.json"
+ARTIFACT_MANIFEST_SCHEMA = "glmrt-glm5-gptqmodel-artifact-v2"
 
 
 def _canonical_json(value: object) -> bytes:
@@ -105,7 +117,10 @@ def _file_identity(path: Path) -> dict[str, object]:
 
 
 def _load_route_profile_sample(
-    path: Path, sample_index: int, rows: int
+    path: Path,
+    sample_index: int,
+    rows: int,
+    trellis_bits: int | None = None,
 ) -> tuple[list[int], dict[str, object]]:
     if path.expanduser().is_symlink():
         raise ValueError("--route-profile must not be a symbolic link")
@@ -121,8 +136,26 @@ def _load_route_profile_sample(
     expected_sha256 = hashlib.sha256(_canonical_json(body)).hexdigest()
     if report_sha256 != expected_sha256:
         raise ValueError("route profile report_sha256 does not match its content")
-    if profile.get("schema") != ROUTE_PROFILE_SCHEMA or profile.get("status") != "accepted":
-        raise ValueError("route profile is not an accepted GLM-5.2 EXL3 profile")
+    schema = profile.get("schema")
+    geometry = profile.get("geometry")
+    if (
+        schema not in {ROUTE_PROFILE_SCHEMA, GLM5_ROUTE_PROFILE_SCHEMA}
+        or profile.get("status") != "accepted"
+        or (
+            schema == ROUTE_PROFILE_SCHEMA
+            and trellis_bits not in {None, 3}
+        )
+        or (
+            schema == GLM5_ROUTE_PROFILE_SCHEMA
+            and (
+                not isinstance(geometry, dict)
+                or geometry.get("trellis_bits") not in {3, 4}
+                or trellis_bits is None
+                or geometry["trellis_bits"] != trellis_bits
+            )
+        )
+    ):
+        raise ValueError("route profile is not accepted for this GLM-5 EXL3 bitrate")
     samples = profile.get("samples")
     if not isinstance(samples, list) or not 0 <= sample_index < len(samples):
         raise ValueError(
@@ -201,7 +234,35 @@ class Exl3Buffers(ctypes.Structure):
 
 
 def _capacity(rows: int) -> int:
-    return exl3_k3_capacity_rows(rows)
+    return exl3_k3_capacity_rows(rows) if BITS == 3 else exl3_k4_capacity_rows(rows)
+
+
+def _aot_regimes() -> tuple[int, ...]:
+    return EXL3_K3_AOT_REGIMES if BITS == 3 else EXL3_K4_AOT_REGIMES
+
+
+def _grid_x(capacity_rows: int) -> int:
+    return (
+        exl3_k3_grid_x(capacity_rows)
+        if BITS == 3
+        else exl3_k4_grid_x(capacity_rows)
+    )
+
+
+def _route_block_rows(capacity_rows: int) -> int:
+    return (
+        exl3_k3_route_block_rows(capacity_rows)
+        if BITS == 3
+        else exl3_k4_route_block_rows(capacity_rows)
+    )
+
+
+def _tile_config(capacity_rows: int) -> tuple[int, int, int, int]:
+    return (
+        exl3_k3_tile_config(capacity_rows)
+        if BITS == 3
+        else exl3_k4_tile_config(capacity_rows)
+    )
 
 
 def _device_buffer(tensor: torch.Tensor) -> DeviceBuffer:
@@ -240,26 +301,33 @@ def _load_native(path: Path) -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
     library.glmrt_cuda_b12x_quantize_bf16_nvfp4_row_payload_async.restype = ctypes.c_int
-    library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_async.argtypes = [
-        ctypes.POINTER(Exl3Buffers),
-        DeviceBuffer,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-    ]
-    library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_async.restype = ctypes.c_int
-    library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_bf16_async.argtypes = [
-        ctypes.POINTER(Exl3Buffers),
-        DeviceBuffer,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-    ]
-    library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_bf16_async.restype = (
-        ctypes.c_int
+    launch = getattr(
+        library, f"glmrt_cuda_b12x_spark_exl3_k{BITS}_topk8_nvfp4_async"
     )
-    candidate = (
-        library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_capacity_candidate_async
+    launch.argtypes = [
+        ctypes.POINTER(Exl3Buffers),
+        DeviceBuffer,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    launch.restype = ctypes.c_int
+    library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_async = launch
+    launch_bf16 = getattr(
+        library, f"glmrt_cuda_b12x_spark_exl3_k{BITS}_topk8_nvfp4_bf16_async"
+    )
+    launch_bf16.argtypes = [
+        ctypes.POINTER(Exl3Buffers),
+        DeviceBuffer,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    launch_bf16.restype = ctypes.c_int
+    library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_bf16_async = launch_bf16
+    candidate = getattr(
+        library,
+        f"glmrt_cuda_b12x_spark_exl3_k{BITS}_topk8_nvfp4_capacity_candidate_async",
     )
     candidate.argtypes = [
         ctypes.POINTER(Exl3Buffers),
@@ -270,8 +338,10 @@ def _load_native(path: Path) -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
     candidate.restype = ctypes.c_int
-    grid_candidate = (
-        library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_capacity_grid_candidate_async
+    library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_capacity_candidate_async = candidate
+    grid_candidate = getattr(
+        library,
+        f"glmrt_cuda_b12x_spark_exl3_k{BITS}_topk8_nvfp4_capacity_grid_candidate_async",
     )
     grid_candidate.argtypes = [
         ctypes.POINTER(Exl3Buffers),
@@ -283,6 +353,9 @@ def _load_native(path: Path) -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
     grid_candidate.restype = ctypes.c_int
+    library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_capacity_grid_candidate_async = (
+        grid_candidate
+    )
     return library
 
 
@@ -405,6 +478,7 @@ def _load_checkpoint_weight_tensors(
     layer_id: int,
     tp_rank: int,
     device: torch.device,
+    trellis_bits: int,
 ) -> tuple[tuple[torch.Tensor, ...], dict[str, object]]:
     """Assemble the exact resident TP4 layout from calibrated checkpoints."""
 
@@ -420,6 +494,7 @@ def _load_checkpoint_weight_tensors(
         ) from exc
 
     projection_files, checkpoint_identity = _checkpoint_projection_files(root, layer_id)
+    trellis_words = 16 * trellis_bits
     shard_start = tp_rank * INTERMEDIATE
     shard_end = shard_start + INTERMEDIATE
     gate_trellis: list[torch.Tensor] = []
@@ -431,9 +506,21 @@ def _load_checkpoint_weight_tensors(
     down_svh: list[torch.Tensor] = []
 
     expected_trellis_shapes = {
-        "gate_proj": (HIDDEN // 16, INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16, TRELLIS_WORDS),
-        "up_proj": (HIDDEN // 16, INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16, TRELLIS_WORDS),
-        "down_proj": (INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16, HIDDEN // 16, TRELLIS_WORDS),
+        "gate_proj": (
+            HIDDEN // 16,
+            INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16,
+            trellis_words,
+        ),
+        "up_proj": (
+            HIDDEN // 16,
+            INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16,
+            trellis_words,
+        ),
+        "down_proj": (
+            INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16,
+            HIDDEN // 16,
+            trellis_words,
+        ),
     }
     for expert_id in range(EXPERTS):
         loaded: dict[str, dict[str, torch.Tensor]] = {}
@@ -458,7 +545,7 @@ def _load_checkpoint_weight_tensors(
             ):
                 raise ValueError(
                     f"layer {layer_id} expert {expert_id} {projection} violates "
-                    "the calibrated K3/MCG tensor contract"
+                    f"the calibrated K{trellis_bits}/MCG tensor contract"
                 )
             loaded[projection] = tensors
 
@@ -513,6 +600,246 @@ def _load_checkpoint_weight_tensors(
     )
 
 
+def _load_artifact_weight_tensors(
+    root: Path,
+    layer_id: int,
+    tp_rank: int,
+    device: torch.device,
+    trellis_bits: int,
+) -> tuple[tuple[torch.Tensor, ...], dict[str, object]]:
+    """Assemble one resident TP4 rank directly from a finalized HF artifact."""
+
+    if not 0 <= tp_rank < EXPERT_TP_WORLD_SIZE:
+        raise ValueError(
+            f"TP rank must be in 0..{EXPERT_TP_WORLD_SIZE - 1}, got {tp_rank}"
+        )
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:
+        raise RuntimeError("loading a finalized model requires safetensors") from exc
+
+    def json_object(path: Path) -> dict[str, object]:
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid finalized-model metadata: {path}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"finalized-model metadata is not an object: {path}")
+        return value
+
+    manifest_path = root / ARTIFACT_MANIFEST_FILENAME
+    index_path = root / "model.safetensors.index.json"
+    quantization_path = root / "quantize_config.json"
+    manifest = json_object(manifest_path)
+    manifest_digest = manifest.get("manifest_sha256")
+    manifest_body = {
+        key: value for key, value in manifest.items() if key != "manifest_sha256"
+    }
+    if (
+        manifest.get("schema") != ARTIFACT_MANIFEST_SCHEMA
+        or not isinstance(manifest_digest, str)
+        or SHA256_RE.fullmatch(manifest_digest) is None
+        or hashlib.sha256(_canonical_json(manifest_body)).hexdigest()
+        != manifest_digest
+    ):
+        raise ValueError("finalized-model artifact manifest is invalid")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("finalized-model artifact manifest has no file inventory")
+
+    index = json_object(index_path)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError("finalized-model tensor index has no weight_map")
+    quantization = json_object(quantization_path)
+    tensor_storage = quantization.get("tensor_storage")
+    if (
+        quantization.get("method") != "exl3"
+        or quantization.get("bits") != trellis_bits
+        or not isinstance(tensor_storage, dict)
+    ):
+        raise ValueError(
+            f"finalized model does not satisfy the EXL3 K{trellis_bits} contract"
+        )
+
+    module_names = [
+        f"model.layers.{layer_id}.mlp.experts.{expert_id}.{projection}"
+        for expert_id in range(EXPERTS)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+    tensor_names: list[str] = []
+    for module in module_names:
+        storage = tensor_storage.get(module)
+        expected_names = {
+            f"{module}.trellis",
+            f"{module}.suh",
+            f"{module}.svh",
+            f"{module}.mcg",
+        }
+        if (
+            not isinstance(storage, dict)
+            or storage.get("quant_format") != "exl3"
+            or storage.get("bits_per_weight") != trellis_bits
+            or set(storage.get("stored_tensors", ())) != expected_names
+        ):
+            raise ValueError(f"invalid EXL3 tensor-storage record: {module}")
+        tensor_names.extend(sorted(expected_names))
+
+    selected_shards: set[str] = set()
+    for tensor_name in tensor_names:
+        shard = weight_map.get(tensor_name)
+        if not isinstance(shard, str) or not shard.endswith(".safetensors"):
+            raise ValueError(f"missing finalized tensor index entry: {tensor_name}")
+        selected_shards.add(shard)
+
+    selected_files = {
+        "model.safetensors.index.json",
+        "quantize_config.json",
+        *selected_shards,
+    }
+    file_identities: list[dict[str, object]] = []
+    for name in sorted(selected_files):
+        record = files.get(name)
+        path = root / name
+        if (
+            not isinstance(record, dict)
+            or isinstance(record.get("bytes"), bool)
+            or not isinstance(record.get("bytes"), int)
+            or not isinstance(record.get("sha256"), str)
+            or SHA256_RE.fullmatch(record["sha256"]) is None
+            or not path.is_file()
+            or path.stat().st_size != record["bytes"]
+            or _sha256_file(path) != record["sha256"]
+        ):
+            raise ValueError(f"finalized-model file failed authentication: {name}")
+        file_identities.append({"name": name, **record})
+
+    trellis_words = 16 * trellis_bits
+    shard_start = tp_rank * INTERMEDIATE
+    shard_end = shard_start + INTERMEDIATE
+    gate_trellis: list[torch.Tensor] = []
+    up_trellis: list[torch.Tensor] = []
+    down_trellis: list[torch.Tensor] = []
+    gate_suh: list[torch.Tensor] = []
+    up_suh: list[torch.Tensor] = []
+    intermediate_rotations: list[torch.Tensor] = []
+    down_svh: list[torch.Tensor] = []
+    expected_trellis_shapes = {
+        "gate_proj": (
+            HIDDEN // 16,
+            INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16,
+            trellis_words,
+        ),
+        "up_proj": (
+            HIDDEN // 16,
+            INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16,
+            trellis_words,
+        ),
+        "down_proj": (
+            INTERMEDIATE * EXPERT_TP_WORLD_SIZE // 16,
+            HIDDEN // 16,
+            trellis_words,
+        ),
+    }
+
+    with ExitStack() as stack:
+        readers = {
+            name: stack.enter_context(
+                safe_open(root / name, framework="pt", device="cpu")
+            )
+            for name in selected_shards
+        }
+
+        def load_tensor(name: str) -> torch.Tensor:
+            shard = weight_map[name]
+            assert isinstance(shard, str)
+            return readers[shard].get_tensor(name)
+
+        for expert_id in range(EXPERTS):
+            loaded: dict[str, dict[str, torch.Tensor]] = {}
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                module = (
+                    f"model.layers.{layer_id}.mlp.experts.{expert_id}.{projection}"
+                )
+                tensors = {
+                    suffix: load_tensor(f"{module}.{suffix}")
+                    for suffix in ("trellis", "suh", "svh", "mcg")
+                }
+                if (
+                    tensors["trellis"].dtype != torch.int16
+                    or tuple(tensors["trellis"].shape)
+                    != expected_trellis_shapes[projection]
+                    or tensors["suh"].dtype != torch.float16
+                    or tensors["svh"].dtype != torch.float16
+                    or tensors["mcg"].dtype != torch.int32
+                    or tensors["mcg"].shape != torch.Size([])
+                    or int(tensors["mcg"].item()) & 0xFFFFFFFF != 0xCBAC1FED
+                ):
+                    raise ValueError(
+                        f"layer {layer_id} expert {expert_id} {projection} violates "
+                        f"the finalized K{trellis_bits}/MCG tensor contract"
+                    )
+                loaded[projection] = tensors
+
+            gate = loaded["gate_proj"]
+            up = loaded["up_proj"]
+            down = loaded["down_proj"]
+            if (
+                tuple(gate["suh"].shape) != (HIDDEN,)
+                or tuple(up["suh"].shape) != (HIDDEN,)
+                or tuple(gate["svh"].shape)
+                != (INTERMEDIATE * EXPERT_TP_WORLD_SIZE,)
+                or tuple(up["svh"].shape)
+                != (INTERMEDIATE * EXPERT_TP_WORLD_SIZE,)
+                or tuple(down["suh"].shape)
+                != (INTERMEDIATE * EXPERT_TP_WORLD_SIZE,)
+                or tuple(down["svh"].shape) != (HIDDEN,)
+            ):
+                raise ValueError(
+                    f"layer {layer_id} expert {expert_id} has invalid EXL3 rotations"
+                )
+            gate_trellis.append(
+                gate["trellis"][
+                    :, shard_start // 16 : shard_end // 16, :
+                ].contiguous()
+            )
+            up_trellis.append(
+                up["trellis"][:, shard_start // 16 : shard_end // 16, :].contiguous()
+            )
+            down_trellis.append(
+                down["trellis"][shard_start // 16 : shard_end // 16, :, :].contiguous()
+            )
+            gate_suh.append(gate["suh"])
+            up_suh.append(up["suh"])
+            intermediate_rotations.append(
+                torch.cat(
+                    (
+                        gate["svh"][shard_start:shard_end],
+                        up["svh"][shard_start:shard_end],
+                        down["suh"][shard_start:shard_end],
+                    )
+                )
+            )
+            down_svh.append(down["svh"])
+
+    cpu_tensors = (
+        torch.stack((torch.stack(gate_trellis), torch.stack(up_trellis))),
+        torch.stack(down_trellis),
+        torch.stack(gate_suh),
+        torch.stack(up_suh),
+        torch.stack(intermediate_rotations),
+        torch.stack(down_svh),
+    )
+    identity = {
+        "artifact_manifest_sha256": manifest_digest,
+        "plan_sha256": manifest.get("plan_sha256"),
+        "authenticated_files": file_identities,
+        "projection_count": len(module_names),
+        "tensor_count": len(tensor_names),
+    }
+    return tuple(tensor.contiguous().to(device) for tensor in cpu_tensors), identity
+
+
 def _prepare_weights(
     tensors: tuple[torch.Tensor, ...],
     tile_config: tuple[int, int, int, int],
@@ -521,7 +848,7 @@ def _prepare_weights(
 
     weight_plan = fused_moe.plan_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="b12x_trellis",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=EXPERTS,
@@ -529,6 +856,7 @@ def _prepare_weights(
         intermediate_size=INTERMEDIATE,
         w13_layout="w13",
         trellis_bits=BITS,
+        trellis_codebook="mcg",
         trellis_tile_config=tile_config,
     )
     return fused_moe.prepare_weights(
@@ -604,6 +932,7 @@ def _run_case(
     benchmark_warmup: int,
     compare_capacity_rows: int | None,
     compare_grid_x: int | None,
+    force_grid_x: int | None,
     expert_route_counts: list[int] | None,
     bf16_output: bool,
 ) -> dict[str, object]:
@@ -613,7 +942,7 @@ def _run_case(
     candidate_capacity = compare_capacity_rows or capacity
     allocation_capacity = max(capacity, candidate_capacity)
     block_size = select_route_block_size_m(capacity, TOP_K, EXPERTS)
-    if block_size != exl3_k3_route_block_rows(capacity):
+    if block_size != _route_block_rows(capacity):
         raise ValueError(
             f"SparkInfer EXL3 M={capacity} route-block ABI no longer matches "
             "the exported glmrt profile"
@@ -650,7 +979,7 @@ def _run_case(
         direct_topk_routes=False,
         sms=48,
     )
-    production_grid_x = exl3_k3_grid_x(capacity)
+    production_grid_x = _grid_x(capacity)
     if production_grid_x > automatic_grid_x:
         raise ValueError(
             f"profile grid {production_grid_x} exceeds compiled M={capacity} "
@@ -775,30 +1104,26 @@ def _run_case(
         ),
         "quantizing the BF16 input to an NVFP4 row payload",
     )
-    # The BF16-output epilogue intentionally reuses input_bf16 after the MoE
-    # has consumed it. Preserve the decoded input for the independent oracle.
-    reference_input = input_bf16[:rows].clone()
-    fp32_epilogue_reference = None
-    if bf16_output:
-        _check_status(
-            library,
-            library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_async(
-                ctypes.byref(buffers),
-                _device_buffer(payload),
-                NVFP4_ROW_STRIDE,
-                rows,
-                stream,
-            ),
-            "launching the native EXL3 K3 FP32 reference epilogue",
-        )
-        torch.cuda.synchronize(device)
-        fp32_epilogue_reference = native_output[:rows].clone()
-
     def launch_native() -> None:
+        if force_grid_x is not None:
+            _check_status(
+                library,
+                library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_capacity_grid_candidate_async(
+                    ctypes.byref(buffers),
+                    _device_buffer(payload),
+                    NVFP4_ROW_STRIDE,
+                    rows,
+                    capacity,
+                    force_grid_x,
+                    stream,
+                ),
+                f"launching the native EXL3 K{BITS} MoE at grid {force_grid_x}",
+            )
+            return
         launch = (
-            library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_bf16_async
+            library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_bf16_async
             if bf16_output
-            else library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_async
+            else library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_async
         )
         _check_status(
             library,
@@ -809,13 +1134,13 @@ def _run_case(
                 rows,
                 stream,
             ),
-            "launching the native EXL3 K3 MoE",
+            f"launching the native EXL3 K{BITS} MoE",
         )
 
     def launch_capacity_candidate() -> None:
         if compare_grid_x is None:
             assert compare_capacity_rows is not None
-            status = library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_capacity_candidate_async(
+            status = library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_capacity_candidate_async(
                 ctypes.byref(buffers),
                 _device_buffer(payload),
                 NVFP4_ROW_STRIDE,
@@ -825,7 +1150,7 @@ def _run_case(
             )
         else:
             grid_candidate = (
-                library.glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_capacity_grid_candidate_async
+                library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_capacity_grid_candidate_async
             )
             status = grid_candidate(
                 ctypes.byref(buffers),
@@ -839,8 +1164,34 @@ def _run_case(
         _check_status(
             library,
             status,
-            "launching the native EXL3 K3 capacity/grid candidate",
+            f"launching the native EXL3 K{BITS} capacity/grid candidate",
         )
+
+    # The fused native launch owns the NVFP4 decoder that materializes
+    # input_bf16.  Preserve the decoder output only after that launch has run;
+    # cloning it immediately after the payload quantizer would copy
+    # uninitialized allocator memory.  The BF16-output epilogue reuses
+    # input_bf16 for its result, so run the FP32-output form first in that case.
+    fp32_epilogue_reference = None
+    if bf16_output:
+        _check_status(
+            library,
+            library.glmrt_cuda_b12x_spark_exl3_topk8_nvfp4_async(
+                ctypes.byref(buffers),
+                _device_buffer(payload),
+                NVFP4_ROW_STRIDE,
+                rows,
+                stream,
+            ),
+            f"launching the native EXL3 K{BITS} FP32 reference epilogue",
+        )
+        torch.cuda.synchronize(device)
+        reference_input = input_bf16[:rows].clone()
+        fp32_epilogue_reference = native_output[:rows].clone()
+    else:
+        launch_native()
+        torch.cuda.synchronize(device)
+        reference_input = input_bf16[:rows].clone()
 
     launch_native()
     torch.cuda.synchronize(device)
@@ -928,6 +1279,8 @@ def _run_case(
             f"w2_global_head={prepared.w2_global_scale[:4].tolist()}, "
             f"w13_scale_bytes={prepared.w13_scale.tolist()}, "
             f"w2_scale_bytes={prepared.w2_scale.tolist()}"
+            f", capacity={capacity}, production_grid={production_grid_x}, "
+            f"automatic_grid={automatic_grid_x}, forced_grid={force_grid_x}"
         )
     reference_norm = reference.norm()
     if float(reference_norm) <= 1.0e-9:
@@ -945,6 +1298,28 @@ def _run_case(
             f"EXL3 native mismatch at rows={rows}: relative_l2={relative_l2:.6g}, "
             f"cosine={cosine:.9f}, max_abs={maximum_absolute:.6g}"
         )
+    registers_per_thread = getattr(fused_launch, "registers_per_thread", None)
+    local_memory_bytes = getattr(fused_launch, "local_memory_bytes", None)
+    if registers_per_thread is None:
+        # Newer SparkInfer compile results keep only launch-relevant fields.
+        # Reconstruct the same pinned SM121 resource value used by its
+        # occupancy planner; every catalogued specialization is spill-free.
+        cta_m_blocks = (int(fused_launch.moe_block_size) + 15) // 16
+        registers_per_thread = max(
+            _w4a16_num_regs(
+                cta_threads=fused_launch.cta_threads,
+                cta_m_blocks=cta_m_blocks,
+                cta_n_blocks=tile_n // 16,
+                cta_k_blocks=tile_k // 16,
+                uses_m_block_8=fused_launch.moe_block_size == 8,
+                weight_layout=fused_launch.weight_layout,
+            )
+            for tile_n, tile_k in (
+                (fused_launch.fc1_tile_n, fused_launch.fc1_tile_k),
+                (fused_launch.fc2_tile_n, fused_launch.fc2_tile_k),
+            )
+        )
+        local_memory_bytes = 0
     result: dict[str, object] = {
         "rows": rows,
         "capacity_rows": capacity,
@@ -955,8 +1330,8 @@ def _run_case(
         "fc1_tile": [fused_launch.fc1_tile_k, fused_launch.fc1_tile_n],
         "fc2_tile": [fused_launch.fc2_tile_k, fused_launch.fc2_tile_n],
         "blocks_per_sm": fused_launch.blocks_per_sm,
-        "registers_per_thread": fused_launch.registers_per_thread,
-        "local_memory_bytes": fused_launch.local_memory_bytes,
+        "registers_per_thread": registers_per_thread,
+        "local_memory_bytes": local_memory_bytes,
         "source_scale": source_scale,
         "expert_route_counts": expert_route_counts,
         "relative_l2": relative_l2,
@@ -1005,14 +1380,23 @@ def _atomic_json(path: Path, value: dict[str, object]) -> None:
 
 
 def main() -> None:
+    global BITS, TRELLIS_WORDS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-library", type=Path, required=True)
+    parser.add_argument(
+        "--trellis-bits",
+        type=int,
+        choices=(3, 4),
+        default=3,
+        help="checkpoint and AOT Trellis bitrate (default: K3)",
+    )
     parser.add_argument(
         "--rows",
         default="1,3,129",
         help="comma-separated live row counts (each is bucketed to an AOT capacity)",
     )
-    parser.add_argument(
+    weight_source_group = parser.add_mutually_exclusive_group()
+    weight_source_group.add_argument(
         "--projection-checkpoint-dir",
         type=Path,
         help=(
@@ -1020,11 +1404,19 @@ def main() -> None:
             "checkpoint tensors instead of deterministic synthetic tensors"
         ),
     )
+    weight_source_group.add_argument(
+        "--model-snapshot",
+        type=Path,
+        help=(
+            "optional finalized EXL3 Hugging Face artifact; assemble the exact "
+            "resident TP4 rank directly from its indexed safetensors"
+        ),
+    )
     parser.add_argument(
         "--layer-id",
         type=int,
         default=3,
-        help="calibrated decoder layer to load with --projection-checkpoint-dir",
+        help="calibrated decoder layer to load from the selected real weight source",
     )
     parser.add_argument(
         "--tp-rank",
@@ -1033,6 +1425,11 @@ def main() -> None:
         help="TP4 intermediate rank to assemble from calibrated checkpoints",
     )
     parser.add_argument("--seed", type=int, default=20260823)
+    parser.add_argument(
+        "--synthetic-source-scale",
+        type=float,
+        help="override the deterministic synthetic activation scale",
+    )
     parser.add_argument(
         "--benchmark-iterations",
         type=int,
@@ -1065,6 +1462,11 @@ def main() -> None:
             "--compare-capacity-rows bucket; requires one --rows case"
         ),
     )
+    parser.add_argument(
+        "--force-grid-x",
+        type=int,
+        help="validate using this positive grid candidate instead of production dispatch",
+    )
     route_source = parser.add_mutually_exclusive_group()
     route_source.add_argument(
         "--expert-route-counts-json",
@@ -1089,10 +1491,39 @@ def main() -> None:
         type=Path,
         help="optional content-bound JSON evidence destination",
     )
+    parser.add_argument(
+        "--expert-slot-fingerprint",
+        help=(
+            "lowercase SHA-256 fingerprint of the expert WIP slot containing "
+            "--native-library; required for checkpoint-backed output evidence"
+        ),
+    )
     args = parser.parse_args()
+    BITS = args.trellis_bits
+    TRELLIS_WORDS = 16 * BITS
     rows = [int(value) for value in args.rows.split(",") if value.strip()]
     if not rows or any(value <= 0 for value in rows):
         raise SystemExit("--rows must contain positive integers")
+    if (
+        args.output is not None
+        and (
+            args.projection_checkpoint_dir is not None
+            or args.model_snapshot is not None
+        )
+        and (
+            not isinstance(args.expert_slot_fingerprint, str)
+            or SHA256_RE.fullmatch(args.expert_slot_fingerprint) is None
+        )
+    ):
+        raise SystemExit(
+            "real-weight --output evidence requires "
+            "--expert-slot-fingerprint"
+        )
+    if args.synthetic_source_scale is not None and (
+        not math.isfinite(args.synthetic_source_scale)
+        or args.synthetic_source_scale <= 0.0
+    ):
+        raise SystemExit("--synthetic-source-scale must be positive and finite")
     if (
         args.benchmark_iterations < 0
         or args.benchmark_rounds < 1
@@ -1105,7 +1536,7 @@ def main() -> None:
         args.benchmark_iterations <= 0
         or len(rows) != 1
         or args.compare_capacity_rows < rows[0]
-        or args.compare_capacity_rows not in EXL3_K3_AOT_REGIMES
+        or args.compare_capacity_rows not in _aot_regimes()
     ):
         raise SystemExit(
             "--compare-capacity-rows requires one row case, positive benchmark "
@@ -1119,6 +1550,12 @@ def main() -> None:
         raise SystemExit(
             "--compare-grid-x requires one row case, positive benchmark "
             "iterations, and a positive grid size"
+        )
+    if args.force_grid_x is not None and (
+        len(rows) != 1 or args.force_grid_x <= 0 or args.bf16_output
+    ):
+        raise SystemExit(
+            "--force-grid-x requires one row case, a positive grid, and FP32 output"
         )
     if args.bf16_output and (
         args.compare_capacity_rows is not None or args.compare_grid_x is not None
@@ -1153,7 +1590,10 @@ def main() -> None:
             raise SystemExit("--route-profile requires exactly one row case")
         try:
             expert_route_counts, route_fixture = _load_route_profile_sample(
-                args.route_profile, args.route_profile_sample, rows[0]
+                args.route_profile,
+                args.route_profile_sample,
+                rows[0],
+                BITS,
             )
             expert_route_counts = _validate_route_counts(
                 expert_route_counts, rows[0]
@@ -1175,14 +1615,21 @@ def main() -> None:
         raise SystemExit("--native-library must not be a symbolic link")
     native_library = args.native_library.expanduser().resolve(strict=True)
     library = _load_native(native_library)
-    if args.projection_checkpoint_dir is None:
+    if args.projection_checkpoint_dir is None and args.model_snapshot is None:
         weight_tensors = _make_weight_tensors(device)
-        source_scale = 0.002
+        # Arbitrary random MCG streams include extreme decoded values that are
+        # unlike calibrated model weights. Keep a bounded non-vacuous stimulus
+        # for both K3 and K4; _run_case independently rejects an all-zero oracle.
+        source_scale = (
+            args.synthetic_source_scale
+            if args.synthetic_source_scale is not None
+            else 0.002
+        )
         weight_source: dict[str, object] = {
             "kind": "deterministic-synthetic",
             "seed": args.seed,
         }
-    else:
+    elif args.projection_checkpoint_dir is not None:
         if args.projection_checkpoint_dir.expanduser().is_symlink():
             raise SystemExit("--projection-checkpoint-dir must not be a symbolic link")
         checkpoint_root = args.projection_checkpoint_dir.expanduser().resolve(
@@ -1197,6 +1644,7 @@ def main() -> None:
             args.layer_id,
             args.tp_rank,
             device,
+            BITS,
         )
         source_scale = 1.0
         weight_source = {
@@ -1207,7 +1655,30 @@ def main() -> None:
             "tp_world_size": EXPERT_TP_WORLD_SIZE,
             **checkpoint_identity,
         }
-    tile_configs = {exl3_k3_tile_config(_capacity(value)) for value in rows}
+    else:
+        model_root = args.model_snapshot.expanduser().resolve(strict=True)
+        if not model_root.is_dir():
+            raise SystemExit(f"model snapshot does not exist: {model_root}")
+        try:
+            weight_tensors, artifact_identity = _load_artifact_weight_tensors(
+                model_root,
+                args.layer_id,
+                args.tp_rank,
+                device,
+                BITS,
+            )
+        except (OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+        source_scale = 1.0
+        weight_source = {
+            "kind": "finalized-exl3-artifact",
+            "root": str(model_root),
+            "layer_id": args.layer_id,
+            "tp_rank": args.tp_rank,
+            "tp_world_size": EXPERT_TP_WORLD_SIZE,
+            **artifact_identity,
+        }
+    tile_configs = {_tile_config(_capacity(value)) for value in rows}
     experts_by_tile = {
         tile_config: _prepare_weights(weight_tensors, tile_config)
         for tile_config in tile_configs
@@ -1215,7 +1686,7 @@ def main() -> None:
     results = [
         _run_case(
             library,
-            experts_by_tile[exl3_k3_tile_config(_capacity(value))],
+            experts_by_tile[_tile_config(_capacity(value))],
             value,
             device,
             source_scale,
@@ -1224,6 +1695,7 @@ def main() -> None:
             args.benchmark_warmup,
             args.compare_capacity_rows,
             args.compare_grid_x,
+            args.force_grid_x,
             expert_route_counts,
             args.bf16_output,
         )
@@ -1232,6 +1704,9 @@ def main() -> None:
     body: dict[str, object] = {
         "schema": REPORT_SCHEMA,
         "status": "accepted",
+        "script_sha256": _sha256_file(Path(__file__).resolve()),
+        "expert_slot_fingerprint": args.expert_slot_fingerprint,
+        "trellis_bits": BITS,
         "sparkinfer_revision": _pinned_sparkinfer.REVISION,
         "native_library": _file_identity(native_library),
         "device": {

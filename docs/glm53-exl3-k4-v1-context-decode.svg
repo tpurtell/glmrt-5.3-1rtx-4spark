@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+<title id="title">EXL3 K4 · DFlash2 adaptive K1-K7 decode</title>
+<desc id="desc">Pooled deterministic decode throughput across retained context</desc>
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="#0d1117"/>
+<stop offset="1" stop-color="#111b2a"/>
+</linearGradient>
+<filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+<feGaussianBlur stdDeviation="2.5" result="blur"/>
+<feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+</filter>
+</defs>
+<rect width="1200" height="680" rx="18" fill="url(#bg)"/>
+<rect x="28" y="25" width="144" height="27" rx="13.5" fill="#1f6feb"/>
+<text x="100" y="44" text-anchor="middle" fill="#ffffff" font-family="system-ui,sans-serif" font-size="12" font-weight="700" letter-spacing="1.4">GLM-5.3 · K4</text>
+<text x="28" y="87" fill="#f0f6fc" font-family="system-ui,sans-serif" font-size="25" font-weight="700">EXL3 K4 · DFlash2 adaptive K1-K7 decode</text>
+<text x="28" y="112" fill="#8b949e" font-family="system-ui,sans-serif" font-size="13">Pooled deterministic decode throughput across retained context</text>
+<line x1="110.0" y1="525.0" x2="1100.0" y2="525.0" stroke="#30363d" stroke-width="1"/>
+<text x="94.0" y="529.0" text-anchor="end" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">0</text>
+<line x1="110.0" y1="447.0" x2="1100.0" y2="447.0" stroke="#30363d" stroke-width="1"/>
+<text x="94.0" y="451.0" text-anchor="end" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">10</text>
+<line x1="110.0" y1="369.0" x2="1100.0" y2="369.0" stroke="#30363d" stroke-width="1"/>
+<text x="94.0" y="373.0" text-anchor="end" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">20</text>
+<line x1="110.0" y1="291.0" x2="1100.0" y2="291.0" stroke="#30363d" stroke-width="1"/>
+<text x="94.0" y="295.0" text-anchor="end" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">30</text>
+<line x1="110.0" y1="213.0" x2="1100.0" y2="213.0" stroke="#30363d" stroke-width="1"/>
+<text x="94.0" y="217.0" text-anchor="end" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">40</text>
+<line x1="110.0" y1="135.0" x2="1100.0" y2="135.0" stroke="#30363d" stroke-width="1"/>
+<text x="94.0" y="139.0" text-anchor="end" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">50</text>
+<line x1="110.0" y1="135.0" x2="110.0" y2="525.0" stroke="#21262d" stroke-width="1"/>
+<text x="110.0" y="550.0" text-anchor="middle" fill="#b1bac4" font-family="system-ui,sans-serif" font-size="12">0</text>
+<line x1="357.5" y1="135.0" x2="357.5" y2="525.0" stroke="#21262d" stroke-width="1"/>
+<text x="357.5" y="550.0" text-anchor="middle" fill="#b1bac4" font-family="system-ui,sans-serif" font-size="12">32K</text>
+<line x1="605.0" y1="135.0" x2="605.0" y2="525.0" stroke="#21262d" stroke-width="1"/>
+<text x="605.0" y="550.0" text-anchor="middle" fill="#b1bac4" font-family="system-ui,sans-serif" font-size="12">64K</text>
+<line x1="852.5" y1="135.0" x2="852.5" y2="525.0" stroke="#21262d" stroke-width="1"/>
+<text x="852.5" y="550.0" text-anchor="middle" fill="#b1bac4" font-family="system-ui,sans-serif" font-size="12">128K</text>
+<line x1="1100.0" y1="135.0" x2="1100.0" y2="525.0" stroke="#21262d" stroke-width="1"/>
+<text x="1100.0" y="550.0" text-anchor="middle" fill="#b1bac4" font-family="system-ui,sans-serif" font-size="12">256K</text>
+<polyline points="110.0,199.8 357.5,230.9 605.0,222.5 852.5,225.6 1100.0,248.7" fill="none" stroke="#58a6ff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" filter="url(#glow)"/>
+<circle cx="110.0" cy="199.8" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="2"/>
+<circle cx="357.5" cy="230.9" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="2"/>
+<circle cx="605.0" cy="222.5" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="2"/>
+<circle cx="852.5" cy="225.6" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="2"/>
+<circle cx="1100.0" cy="248.7" r="4" fill="#58a6ff" stroke="#0d1117" stroke-width="2"/>
+<polyline points="110.0,364.1 357.5,377.7 605.0,375.3 852.5,383.3 1100.0,396.1" fill="none" stroke="#3fb950" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" filter="url(#glow)"/>
+<circle cx="110.0" cy="364.1" r="4" fill="#3fb950" stroke="#0d1117" stroke-width="2"/>
+<circle cx="357.5" cy="377.7" r="4" fill="#3fb950" stroke="#0d1117" stroke-width="2"/>
+<circle cx="605.0" cy="375.3" r="4" fill="#3fb950" stroke="#0d1117" stroke-width="2"/>
+<circle cx="852.5" cy="383.3" r="4" fill="#3fb950" stroke="#0d1117" stroke-width="2"/>
+<circle cx="1100.0" cy="396.1" r="4" fill="#3fb950" stroke="#0d1117" stroke-width="2"/>
+<polyline points="110.0,258.9 357.5,302.9 605.0,289.8 852.5,279.3 1100.0,314.8" fill="none" stroke="#d29922" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" filter="url(#glow)"/>
+<circle cx="110.0" cy="258.9" r="4" fill="#d29922" stroke="#0d1117" stroke-width="2"/>
+<circle cx="357.5" cy="302.9" r="4" fill="#d29922" stroke="#0d1117" stroke-width="2"/>
+<circle cx="605.0" cy="289.8" r="4" fill="#d29922" stroke="#0d1117" stroke-width="2"/>
+<circle cx="852.5" cy="279.3" r="4" fill="#d29922" stroke="#0d1117" stroke-width="2"/>
+<circle cx="1100.0" cy="314.8" r="4" fill="#d29922" stroke="#0d1117" stroke-width="2"/>
+<line x1="135.0" y1="604" x2="163.0" y2="604" stroke="#58a6ff" stroke-width="4" stroke-linecap="round"/>
+<text x="173.0" y="608" fill="#e6edf3" font-family="system-ui,sans-serif" font-size="12">Python code</text>
+<line x1="445.0" y1="604" x2="473.0" y2="604" stroke="#3fb950" stroke-width="4" stroke-linecap="round"/>
+<text x="483.0" y="608" fill="#e6edf3" font-family="system-ui,sans-serif" font-size="12">Creative writing</text>
+<line x1="755.0" y1="604" x2="783.0" y2="604" stroke="#d29922" stroke-width="4" stroke-linecap="round"/>
+<text x="793.0" y="608" fill="#e6edf3" font-family="system-ui,sans-serif" font-size="12">Math</text>
+<text x="605.0" y="587.0" text-anchor="middle" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">retained context tokens</text>
+<text x="25" y="330.0" text-anchor="middle" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12" transform="rotate(-90 25 330.0)">tokens / second</text>
+<text x="1170" y="650" text-anchor="end" fill="#484f58" font-family="ui-monospace,monospace" font-size="10">source-validated release evidence</text>
+</svg>

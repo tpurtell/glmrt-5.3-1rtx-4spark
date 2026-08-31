@@ -74,7 +74,17 @@ release_need rsync
 release_need python3
 release_need sha256sum
 release_need install
+release_need nvidia-smi
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
+
+# WIP containers survive reboots.  Bind the coordinator by stable UUID so a
+# driver/device enumeration change cannot silently reconnect GPU 0's container
+# cgroup to the other physical card on the next start.
+coordinator_gpu_uuid="$(
+  nvidia-smi --id=0 --query-gpu=uuid --format=csv,noheader | tr -d '[:space:]'
+)"
+[[ "$coordinator_gpu_uuid" =~ ^GPU-[0-9a-fA-F-]+$ ]] ||
+  release_die "could not resolve coordinator GPU 0 to a stable UUID"
 
 coordinator_container=glrmt-coordinator-wip
 spark_container=glrmt-spark-expert-wip
@@ -172,6 +182,9 @@ preflight_existing_container_images() {
     actual="$(docker inspect -f '{{.Image}}' "$coordinator_container")"
     [[ "$actual" == "$expected" ]] ||
       release_die "$coordinator_container uses an old development image; rerun ./wip.sh --recreate"
+    actual="$(docker inspect -f '{{range .HostConfig.DeviceRequests}}{{range .DeviceIDs}}{{.}}{{end}}{{end}}' "$coordinator_container")"
+    [[ "$actual" == "$coordinator_gpu_uuid" ]] ||
+      release_die "$coordinator_container uses stale GPU binding $actual; recreate it with stable coordinator UUID $coordinator_gpu_uuid"
   fi
   expected="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
   for host in "$SPARK_0_HOST" "$SPARK_1_HOST" "$SPARK_2_HOST" "$SPARK_3_HOST"; do
@@ -198,7 +211,7 @@ ensure_local_container() {
   fi
   local -a args=(
     run -d --name "$coordinator_container" --restart no
-    --gpus device=0 --net=host --ipc=host --security-opt seccomp=unconfined
+    --gpus "device=$coordinator_gpu_uuid" --net=host --ipc=host --security-opt seccomp=unconfined
     --ulimit memlock=-1:-1 --cap-add IPC_LOCK
     -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
     -e HF_HOME="$hf_home"

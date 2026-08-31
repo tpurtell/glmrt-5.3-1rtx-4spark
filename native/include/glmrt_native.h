@@ -171,6 +171,11 @@ typedef struct glmrt_b12x_spark_exl3_k3_moe_buffers_t {
   glmrt_device_buffer_t down_svh;
 } glmrt_b12x_spark_exl3_k3_moe_buffers_t;
 
+/* K3 and K4 use the same workspace ABI; only the resident Trellis payload
+ * width and selected AOT kernel differ. */
+typedef glmrt_b12x_spark_exl3_k3_moe_buffers_t
+    glmrt_b12x_spark_exl3_k4_moe_buffers_t;
+
 typedef struct glmrt_b12x_coordinator_w4a16_buffers_t {
   glmrt_device_buffer_t input;
   glmrt_device_buffer_t weight;
@@ -711,6 +716,25 @@ glmrt_cuda_b12x_spark_exl3_k3_topk8_nvfp4_capacity_grid_candidate_async(
     const glmrt_b12x_spark_exl3_k3_moe_buffers_t* buffers,
     glmrt_device_buffer_t input_payload, size_t input_payload_stride_bytes,
     size_t rows, size_t capacity_rows, int grid_x, void* cuda_stream);
+glmrt_status_t glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_async(
+    const glmrt_b12x_spark_exl3_k4_moe_buffers_t* buffers,
+    glmrt_device_buffer_t input_payload, size_t input_payload_stride_bytes,
+    size_t rows, void* cuda_stream);
+glmrt_status_t glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_bf16_async(
+    const glmrt_b12x_spark_exl3_k4_moe_buffers_t* buffers,
+    glmrt_device_buffer_t input_payload, size_t input_payload_stride_bytes,
+    size_t rows, void* cuda_stream);
+glmrt_status_t
+glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_capacity_candidate_async(
+    const glmrt_b12x_spark_exl3_k4_moe_buffers_t* buffers,
+    glmrt_device_buffer_t input_payload, size_t input_payload_stride_bytes,
+    size_t rows, size_t capacity_rows, void* cuda_stream);
+/* Benchmark-only EXL3 K4 capacity/grid sweep; serving does not reference this symbol. */
+glmrt_status_t
+glmrt_cuda_b12x_spark_exl3_k4_topk8_nvfp4_capacity_grid_candidate_async(
+    const glmrt_b12x_spark_exl3_k4_moe_buffers_t* buffers,
+    glmrt_device_buffer_t input_payload, size_t input_payload_stride_bytes,
+    size_t rows, size_t capacity_rows, int grid_x, void* cuda_stream);
 /* Benchmark-only packed-prefill grid sweep; serving does not reference this symbol. */
 glmrt_status_t
 glmrt_cuda_b12x_spark_w4a16_prefill_topk8_nvfp4_grid_candidate_async(
@@ -1120,6 +1144,12 @@ glmrt_status_t glmrt_cuda_quantize_bf16_w8a16_group256_async(
 glmrt_status_t glmrt_cuda_quantize_bf16_w8a16_group256_packed_async(
     const uint16_t* source, int8_t* weight, float* scales, size_t input_dim,
     size_t output_dim, void* cuda_stream);
+// Expands a row-major E4M3 matrix with [ceil(N/128),ceil(K/128)] FP32
+// inverse scales into row-major BF16. This is a startup-only conversion for
+// official GLM-5.3 block-FP8 coordinator tensors.
+glmrt_status_t glmrt_cuda_dequantize_block_fp8_e4m3_bf16_async(
+    const uint8_t* source, const float* scales, uint16_t* output,
+    size_t input_dim, size_t output_dim, void* cuda_stream);
 // Expands K-major W8/group-major scales into a row-major BF16 matrix. The
 // caller owns one projection-sized scratch allocation; no per-layer BF16
 // duplicate is required.

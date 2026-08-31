@@ -4,6 +4,8 @@ from pathlib import Path
 import hashlib
 import json
 
+import pytest
+
 from glmrt_reference.nvfp4_independent_status import build_independent_reference_status
 from glmrt_reference.quant_ref import NVFP4_E2M1_VALUES
 
@@ -12,6 +14,15 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+_NVFP4_FIXTURES_AVAILABLE = (
+    _repo_root() / "tests/fixtures/nvfp4/real_tensor_decode.json"
+).is_file() and (_repo_root() / "tests/fixtures/nvfp4/modelopt_reference.json").is_file()
+
+
+@pytest.mark.skipif(
+    not _NVFP4_FIXTURES_AVAILABLE,
+    reason="private NVFP4 oracle fixtures are not part of the public release",
+)
 def test_nvfp4_independent_reference_status_keeps_recipe_provisional_until_oracle_runs():
     status = build_independent_reference_status(_repo_root())
 
@@ -41,6 +52,10 @@ def test_nvfp4_independent_reference_status_keeps_recipe_provisional_until_oracl
         assert status["status"] == "blocked_independent_oracle_adapter_not_implemented"
 
 
+@pytest.mark.skipif(
+    not _NVFP4_FIXTURES_AVAILABLE,
+    reason="private NVFP4 oracle fixtures are not part of the public release",
+)
 def test_nvfp4_modelopt_artifact_matches_current_fixture_and_codebook():
     root = _repo_root()
     fixture_path = root / "tests/fixtures/nvfp4/real_tensor_decode.json"

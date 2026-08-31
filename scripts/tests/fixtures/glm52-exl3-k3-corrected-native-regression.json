@@ -1,0 +1,127 @@
+{
+  "cases": [
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 1,
+      "cosine": 1.0,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 44,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 64,
+      "reference": "sparkinfer",
+      "registers_per_thread": 255,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 1,
+      "source_scale": 0.002
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 9,
+      "cosine": 1.0000001192092896,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        128,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 40,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 496,
+      "reference": "sparkinfer",
+      "registers_per_thread": 254,
+      "relative_l2": 0.0,
+      "route_block_rows": 8,
+      "rows": 9,
+      "source_scale": 0.002
+    },
+    {
+      "automatic_grid_x": 144,
+      "blocks_per_sm": 3,
+      "capacity_rows": 257,
+      "cosine": 0.9999998807907104,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        128
+      ],
+      "fc2_tile": [
+        64,
+        128
+      ],
+      "grid_x": 144,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 4112,
+      "reference": "sparkinfer",
+      "registers_per_thread": 168,
+      "relative_l2": 0.0,
+      "route_block_rows": 16,
+      "rows": 257,
+      "source_scale": 0.002
+    },
+    {
+      "automatic_grid_x": 48,
+      "blocks_per_sm": 1,
+      "capacity_rows": 2064,
+      "cosine": 0.9999999403953552,
+      "expert_route_counts": null,
+      "fc1_tile": [
+        64,
+        256
+      ],
+      "fc2_tile": [
+        64,
+        256
+      ],
+      "grid_x": 48,
+      "local_memory_bytes": 0,
+      "max_abs": 0.0,
+      "output_dtype": "fp32",
+      "packed_route_count": 24576,
+      "reference": "sparkinfer",
+      "registers_per_thread": 244,
+      "relative_l2": 0.0,
+      "route_block_rows": 64,
+      "rows": 2064,
+      "source_scale": 0.002
+    }
+  ],
+  "device": {
+    "compute_capability": "12.1",
+    "name": "NVIDIA GB10"
+  },
+  "native_library": {
+    "bytes": 16060056,
+    "path": "/wip/slots/glm53-k4-aot-v4/spark-expert/workspace/.glmrt-wip/libglmrt_native.so",
+    "sha256": "be97fa77c1f4ec963735ed330cdedb436deee669e0d5a7f3f48e1f213adb11f0"
+  },
+  "report_sha256": "6169780d0cdf789f3ffeee4ddbe241d9548f9f24a9045f0598ec5cb97ce72c42",
+  "route_fixture": null,
+  "schema": "glmrt-b12x-exl3-native-validation-v1",
+  "sparkinfer_revision": "988246c8b007c9c1c2006eb677f6fa4b26aeb561",
+  "status": "accepted",
+  "trellis_bits": 3,
+  "weight_source": {
+    "kind": "deterministic-synthetic",
+    "seed": 20260823
+  }
+}

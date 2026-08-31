@@ -148,6 +148,44 @@ def test_fixed_dspark_depth_rejects_non_dspark_profile(tmp_path: Path) -> None:
     assert "DSPARK_FIXED_DRAFTS requires SPECULATION=dspark" in result.stderr
 
 
+def test_fixed_dflash2_depth_is_bounded_and_scoped(tmp_path: Path) -> None:
+    accepted = load_config(
+        tmp_path,
+        "SPECULATION=dflash2\nMODEL=glm53-exl3\nDFLASH2_FIXED_DRAFTS=4\n",
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    wrong_mode = load_config(tmp_path, "DFLASH2_FIXED_DRAFTS=4\n")
+    assert wrong_mode.returncode == 2
+    assert "DFLASH2_FIXED_DRAFTS requires SPECULATION=dflash2" in wrong_mode.stderr
+
+    invalid = load_config(
+        tmp_path,
+        "SPECULATION=dflash2\nMODEL=glm53-exl3\nDFLASH2_FIXED_DRAFTS=8\n",
+    )
+    assert invalid.returncode == 2
+    assert "DFLASH2_FIXED_DRAFTS must be empty or in 1..7" in invalid.stderr
+
+    target_only = load_config(
+        tmp_path,
+        "SPECULATION=dflash2\nMODEL=glm53-exl3\nDFLASH2_FIXED_DRAFTS=0\n",
+    )
+    assert target_only.returncode == 2
+    assert "use SPECULATION=plain for target-only" in target_only.stderr
+
+
+def test_dflash2_topk_backend_is_explicitly_bounded(tmp_path: Path) -> None:
+    accepted = load_config(
+        tmp_path,
+        "SPECULATION=dflash2\nMODEL=glm53-exl3\nDFLASH2_TOPK_BACKEND=flashinfer-dsa\n",
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    invalid = load_config(tmp_path, "DFLASH2_TOPK_BACKEND=radix\n")
+    assert invalid.returncode == 2
+    assert "DFLASH2_TOPK_BACKEND must be torch, flashinfer, or flashinfer-dsa" in invalid.stderr
+
+
 def test_release_ab_controls_reject_invalid_values(tmp_path: Path) -> None:
     invalid_h64 = load_config(
         tmp_path,
@@ -175,6 +213,7 @@ def test_run_fingerprints_and_explicitly_sets_both_ab_controls() -> None:
 
     assert '"$SPARKINFER_GLM_H64_QUERY_PROJECTION"' in fingerprint
     assert '"$DSPARK_FIXED_DRAFTS"' in fingerprint
+    assert '"$DFLASH2_FIXED_DRAFTS"' in fingerprint
     assert (
         "GLMRT_SPARKINFER_GLM_H64_BF16_QUERY_PROJECTION="
         "$SPARKINFER_GLM_H64_QUERY_PROJECTION"
@@ -183,6 +222,10 @@ def test_run_fingerprints_and_explicitly_sets_both_ab_controls() -> None:
         "GLMRT_REAL_FULL_DSPARK_FIXED_DRAFTS=$DSPARK_FIXED_DRAFTS"
         in env_file
     )
+    wip_launcher = (ROOT / "scripts" / "run-wip.sh").read_text(encoding="utf-8")
+    assert '--dflash2-fixed-drafts "$DFLASH2_FIXED_DRAFTS"' in wip_launcher
+    assert '--dflash2-topk-backend "$DFLASH2_TOPK_BACKEND"' in wip_launcher
+    assert "GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS" in wip_launcher
     assert "GLMRT_SPARKINFER_COMMIT=$coordinator_sparkinfer_commit" in env_file
     assert (
         "GLMRT_COORDINATOR_POWER_LIMIT_WATTS=$coordinator_power_limit_watts"
@@ -196,6 +239,10 @@ def test_route_profile_capture_identity_is_launcher_scoped() -> None:
         assert (
             "GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS="
             "$GLMRT_PROTOCOL_V2_EXPERT_QUEUE_STATS"
+        ) in launcher
+        assert (
+            "GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES="
+            "$GLMRT_PROTOCOL_V2_EXPERT_QUEUE_ROW_ROUTES"
         ) in launcher
         assert (
             "GLMRT_PROTOCOL_V2_EXPERT_QUEUE_CAPTURE_ID="

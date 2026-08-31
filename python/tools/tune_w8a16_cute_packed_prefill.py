@@ -623,7 +623,6 @@ class W8A16PackedGemmKernel(W4A16GemmKernel):
                 c_sh_rd,
                 c_sh_rd_delta,
                 block_valid_rows,
-                Int32(0),
                 store_iters,
             )
         else:
@@ -636,7 +635,6 @@ class W8A16PackedGemmKernel(W4A16GemmKernel):
                 c_sh_rd,
                 c_sh_rd_delta,
                 block_valid_rows,
-                Int32(0),
                 store_iters,
             )
 
@@ -1939,7 +1937,6 @@ class W8A16GroupedMWarpKernel(W8A16PackedGemmKernel):
             c_sh_rd,
             c_sh_rd_delta,
             block_valid_rows,
-            Int32(0),
             store_iters,
         )
 

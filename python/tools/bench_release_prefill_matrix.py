@@ -8,7 +8,6 @@ import datetime as dt
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import re
 import statistics
@@ -19,9 +18,13 @@ import urllib.request
 
 from tokenizers import Tokenizer
 
+from real_full_matrix import MODEL_ID, default_tokenizer_path
 
-DEFAULT_MODEL = "lukealonso/GLM-5.2-NVFP4-full"
+
+DEFAULT_MODEL = MODEL_ID
 DEFAULT_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
+DEFAULT_BASE_CONTEXTS = (0, 32_768, 65_536, 131_072, 262_144)
+DEFAULT_SUFFIX_ROWS = (1_024, 2_048, 4_096, 8_192, 16_384, 32_768)
 GLM_PREFIX = "[gMASK]<sop>"
 ASSISTANT_SUFFIX = "<|assistant|><think></think>"
 TEXT_SUFFIXES = {
@@ -73,23 +76,6 @@ def hash_file(path: Path) -> str:
         while block := source.read(8 * 1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
-
-
-def tokenizer_path() -> Path:
-    cache_root = Path(
-        os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")
-    )
-    candidates = sorted(
-        (
-            cache_root
-            / "hub"
-            / "models--lukealonso--GLM-5.2-NVFP4"
-            / "snapshots"
-        ).glob("*/tokenizer.json")
-    )
-    if not candidates:
-        raise FileNotFoundError("GLM-5.2 tokenizer.json was not found")
-    return candidates[-1]
 
 
 def render(messages: list[dict[str, str]]) -> str:
@@ -299,13 +285,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    bases = args.base or [0, 32_768, 65_536, 131_072, 262_144]
-    suffixes = args.suffix or [1_024, 2_048, 4_096, 8_192, 16_384, 32_768]
+    benchmark_started_ns = time.time_ns()
+    # This is the public cache-aware curve: cold-prefix prefill plus the same
+    # suffix shapes branched from 32K through 256K retained contexts.
+    bases = args.base or list(DEFAULT_BASE_CONTEXTS)
+    suffixes = args.suffix or list(DEFAULT_SUFFIX_ROWS)
     if any(value < 0 for value in bases) or any(value <= 0 for value in suffixes):
         raise SystemExit("base sizes must be nonnegative and suffix sizes positive")
 
     root = Path(__file__).resolve().parents[2]
-    tokenizer_source = (args.tokenizer or tokenizer_path()).expanduser().resolve(
+    tokenizer_source = (args.tokenizer or default_tokenizer_path(args.model)).expanduser().resolve(
         strict=True
     )
     corpus_root = (args.corpus_root or root).expanduser().resolve(strict=True)
@@ -418,25 +407,32 @@ def main() -> int:
                         model=args.model,
                     )
                     actual = int(metrics.get("layerwave_prefill_rows") or 0)
+                    cached = int(metrics.get("cached_prompt_tokens") or 0)
+                    prompt_tokens = int(metrics.get("prompt_tokens") or 0)
+                    cache_shape_exact = (
+                        prompt_tokens - cached - 1 == suffix
+                        and (base == 0 or cached >= base)
+                    )
                     print(
                         "measure"
                         f" base={base} suffix={suffix} repeat={repeat}"
                         f" attempt={attempt} planned={planned}"
-                        f" cached={metrics.get('cached_prompt_tokens')}"
+                        f" cached={cached}"
                         f" rows={actual}"
                         f" ms={float(metrics.get('prefill_ms') or 0):.3f}"
                         f" tps={float(metrics.get('prefill_tokens_per_sec') or 0):.2f}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    if actual == suffix:
+                    if actual == suffix and cache_shape_exact:
                         final = (metrics, content, planned, marker)
                         target_adjustment = desired_total - (base + suffix + 1)
                         break
                     desired_total += suffix - actual
                 if final is None:
                     raise RuntimeError(
-                        f"failed exact suffix base={base} suffix={suffix}"
+                        "failed exact cache-controlled suffix "
+                        f"base={base} suffix={suffix}"
                     )
                 metrics, content, planned, marker = final
                 real_full = metrics.get("real_full") or {}
@@ -524,6 +520,9 @@ def main() -> int:
     emit(
         {
                 "schema": "glmrt-release-prefill-summary-v3",
+                "benchmark_started_ns": benchmark_started_ns,
+                "benchmark_completed_ns": time.time_ns(),
+                "timestamp_utc": dt.datetime.now(dt.UTC).isoformat(),
                 "run_id": run_id,
                 "profile": args.profile,
                 "model": args.model,

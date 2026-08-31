@@ -51,6 +51,7 @@ def test_balanced_reproduces_qualified_pool_geometry(tmp_path):
     assert profile.max_output_tokens == 100_000
     assert "GLMRT_REAL_FULL_SERVE_MAX_INPUT_TOKENS" not in profile.environment
     assert profile.environment["GLMRT_REAL_FULL_SERVE_MAX_OUTPUT_TOKENS"] == "100000"
+    assert profile.environment["GLMRT_REAL_FULL_ENABLE_THINKING"] == "1"
     assert profile.environment["GLMRT_COORDINATOR_W8A16_Q_A"] == "1"
     assert profile.environment["GLMRT_REAL_FULL_DSPARK"] == "1"
     assert profile.environment["GLMRT_DSPARK_MODEL_ID"] == (
@@ -186,6 +187,86 @@ def test_dspark_checkpoint_can_be_selected_for_controlled_evaluation(
         "siro1/glm-5.2-dspark-preview"
     )
     assert profile.environment["GLMRT_REAL_FULL_DSPARK_SNAPSHOT"] == str(preview)
+
+
+def test_glm53_k4_selects_the_pinned_qualified_dflash2_default(tmp_path):
+    snapshot, inherited = install_hf_snapshot(
+        tmp_path,
+        "incoai/GLM-5.3-DFlash2",
+        "425aa615ce320caac34400208b30808c8f14f76c",
+        ("config.json", "model.safetensors"),
+    )
+    profile = resolve(
+        tmp_path,
+        model="glm53-exl3",
+        speculation="dflash2",
+        inherited_environment=inherited,
+    )
+    assert profile.model_id == "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"
+    assert profile.qualification == "qualified"
+    assert profile.environment["GLMRT_REAL_FULL_DFLASH2"] == "1"
+    assert profile.environment["GLMRT_REAL_FULL_DSPARK"] == "0"
+    assert profile.environment["GLMRT_REAL_FULL_MTP"] == "0"
+    assert profile.environment["GLMRT_SPARK_INCLUDE_MTP_LAYER"] == "0"
+    assert profile.environment["GLMRT_COORDINATOR_INCLUDE_MTP_LAYER"] == "0"
+    assert profile.environment["GLMRT_REAL_FULL_DFLASH2_SNAPSHOT"] == str(snapshot)
+    assert profile.environment["GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS"] == "adaptive"
+    assert profile.environment["GLMRT_REAL_FULL_DFLASH2_TOPK_BACKEND"] == "torch"
+    assert not profile.blockers
+
+    tuned = resolve(
+        tmp_path,
+        model="glm53-exl3",
+        speculation="dflash2",
+        dflash2_fixed_drafts=3,
+        dflash2_topk_backend="flashinfer-dsa",
+        inherited_environment=inherited,
+    )
+    assert tuned.environment["GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS"] == "3"
+    assert tuned.environment["GLMRT_REAL_FULL_DFLASH2_TOPK_BACKEND"] == "flashinfer-dsa"
+
+
+def test_glm53_native_mtp_alone_loads_the_retained_layer_78(tmp_path) -> None:
+    profile = resolve(tmp_path, model="glm53-exl3", speculation="mtp")
+
+    assert profile.environment["GLMRT_REAL_FULL_MTP"] == "1"
+    assert profile.environment["GLMRT_REAL_FULL_DFLASH2"] == "0"
+    assert profile.environment["GLMRT_SPARK_INCLUDE_MTP_LAYER"] == "1"
+    assert profile.environment["GLMRT_COORDINATOR_INCLUDE_MTP_LAYER"] == "1"
+    assert profile.environment["GLMRT_MTP_BF16_EXPERTS"] == "0"
+
+
+def test_dflash2_fixed_width_is_scoped_and_bounded(tmp_path):
+    with pytest.raises(ValueError, match="requires speculation=dflash2"):
+        resolve(tmp_path, speculation="plain", dflash2_fixed_drafts=3)
+    with pytest.raises(ValueError, match="must be in 1..7"):
+        resolve(tmp_path, speculation="dflash2", dflash2_fixed_drafts=8)
+    with pytest.raises(ValueError, match="must be in 1..7"):
+        resolve(tmp_path, speculation="dflash2", dflash2_fixed_drafts=0)
+    with pytest.raises(ValueError, match="must be torch, flashinfer"):
+        resolve(tmp_path, speculation="dflash2", dflash2_topk_backend="other")
+
+
+def test_dflash2_rejects_a_glm52_target(tmp_path, monkeypatch):
+    snapshot = tmp_path / "dflash2"
+    snapshot.mkdir()
+    monkeypatch.setattr(
+        "glmrt_reference.serve_profiles.find_hf_snapshot",
+        lambda model_id, **kwargs: snapshot,
+    )
+    profile = resolve(tmp_path, model="exl3", speculation="dflash2")
+    assert any("GLM-5.3 EXL3 K4" in blocker for blocker in profile.blockers)
+
+
+def test_glm52_dspark_rejects_a_glm53_target(tmp_path, monkeypatch):
+    snapshot = tmp_path / "dspark"
+    snapshot.mkdir()
+    monkeypatch.setattr(
+        "glmrt_reference.serve_profiles.find_hf_snapshot",
+        lambda model_id, **kwargs: snapshot,
+    )
+    profile = resolve(tmp_path, model="glm53-exl3", speculation="dspark")
+    assert any("cannot draft for the GLM-5.3 target" in blocker for blocker in profile.blockers)
 
 
 def test_native_mtp_alone_reserves_layer_78_kv(tmp_path):

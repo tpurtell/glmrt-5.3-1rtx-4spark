@@ -1,4 +1,4 @@
-"""Resolved production launch profiles for the real GLM-5.2 server.
+"""Resolved production launch profiles for the real GLM-5 serving stack.
 
 The profile layer deliberately contains no CUDA or Hugging Face imports.  It
 is used by the launch CLI, unit tests, and future container entrypoints, so
@@ -37,10 +37,14 @@ MODEL_ALIASES = {
     "luke": "lukealonso/GLM-5.2-NVFP4",
     "nvidia": "nvidia/GLM-5.2-NVFP4",
     "exl3": "wrldsuksgo2mars/GLM-5.2-EXL3-K3-calibrated-v1",
+    "glm53-exl3": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
 }
 
 DEFAULT_DSPARK_MODEL_ID = "RedHatAI/GLM-5.2-speculator.dspark"
 DEFAULT_DSPARK_REVISION = "8bc9ac46fbf507f3ee3ad82304116a1f63e9edb4"
+DEFAULT_DFLASH2_MODEL_ID = "incoai/GLM-5.3-DFlash2"
+DEFAULT_DFLASH2_REVISION = "425aa615ce320caac34400208b30808c8f14f76c"
+DEFAULT_DFLASH2_DRAFT_POLICY = "adaptive"
 DEFAULT_VISION_MODEL_ID = "baseten/GLM-5.2-Vision-NVFP4"
 DEFAULT_VISION_REVISION = "f6eab6117386a0c69152fdf272dc65bfd0254f9f"
 
@@ -142,7 +146,7 @@ def normalize_model_id(model: str) -> str:
         return MODEL_ALIASES[model.lower()]
     except KeyError as error:
         raise ValueError(
-            f"unknown text checkpoint {model!r}; choose luke, nvidia, or exl3"
+            f"unknown text checkpoint {model!r}; choose luke, nvidia, exl3, or glm53-exl3"
         ) from error
 
 
@@ -200,16 +204,28 @@ def resolve_serve_profile(
     max_output_tokens: int | None = None,
     kv_pool_tokens: int | None = None,
     concurrency: int = 4,
+    dflash2_fixed_drafts: int | None = None,
+    dflash2_topk_backend: str = "torch",
     inherited_environment: Mapping[str, str] | None = None,
 ) -> ResolvedServeProfile:
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}")
-    if speculation not in {"plain", "mtp", "dspark"}:
+    if speculation not in {"plain", "mtp", "dspark", "dflash2"}:
         raise ValueError(f"unknown speculation mode {speculation!r}")
     if headroom_gib < 0:
         raise ValueError("headroom_gib must be non-negative")
     if concurrency < 1 or concurrency > 8:
         raise ValueError("concurrency must be in 1..8")
+    if dflash2_fixed_drafts is not None and not 1 <= dflash2_fixed_drafts <= 7:
+        raise ValueError(
+            "dflash2_fixed_drafts must be in 1..7; use speculation=plain for target-only"
+        )
+    if dflash2_fixed_drafts is not None and speculation != "dflash2":
+        raise ValueError("dflash2_fixed_drafts requires speculation=dflash2")
+    if dflash2_topk_backend not in {"torch", "flashinfer", "flashinfer-dsa"}:
+        raise ValueError(
+            "dflash2_topk_backend must be torch, flashinfer, or flashinfer-dsa"
+        )
 
     definition = PROFILES[profile]
     total_mib = gpu_total_mib if gpu_total_mib is not None else query_gpu_total_mib()
@@ -283,6 +299,7 @@ def resolve_serve_profile(
         # gates can be run, but it cannot inherit the NVFP4 profile's live
         # qualification merely because its coordinator/KV geometry matches.
         qualification = "candidate"
+    glm53_exl3 = model_id == MODEL_ALIASES["glm53-exl3"]
     inherited = inherited_environment or {}
     hf_cache_root = hf_hub_cache_root(inherited)
     environment = {
@@ -291,6 +308,7 @@ def resolve_serve_profile(
         "GLMRT_VISION": "1" if vision else "0",
         "GLMRT_VISION_ENABLED": "1" if vision else "0",
         "GLMRT_MODEL_ID": model_id,
+        "GLMRT_REAL_FULL_ENABLE_THINKING": "1",
         "GLMRT_REAL_FULL_SERVE_TRANSPORT": "verbs-host",
         "GLMRT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": str(concurrency),
         "GLMRT_REAL_FULL_MAX_EXECUTION_LANES": str(concurrency),
@@ -344,12 +362,12 @@ def resolve_serve_profile(
         warnings.append(
             "the calibrated EXL3 checkpoint has not passed its paired live serving gates"
         )
-
     if speculation == "plain":
         environment.update(
             {
                 "GLMRT_REAL_FULL_MTP": "0",
                 "GLMRT_REAL_FULL_DSPARK": "0",
+                "GLMRT_REAL_FULL_DFLASH2": "0",
                 "GLMRT_SPARK_INCLUDE_MTP_LAYER": "0",
                 "GLMRT_COORDINATOR_INCLUDE_MTP_LAYER": "0",
             }
@@ -359,6 +377,7 @@ def resolve_serve_profile(
             {
                 "GLMRT_REAL_FULL_MTP": "1",
                 "GLMRT_REAL_FULL_DSPARK": "0",
+                "GLMRT_REAL_FULL_DFLASH2": "0",
                 "GLMRT_SPARK_INCLUDE_MTP_LAYER": "1",
                 "GLMRT_COORDINATOR_INCLUDE_MTP_LAYER": "1",
             }
@@ -369,16 +388,21 @@ def resolve_serve_profile(
             # long-context draft acceptance but lost end-to-end throughput and
             # costs roughly 3.5 GiB on every Spark.
             environment["GLMRT_MTP_BF16_EXPERTS"] = "1" if profile == "accuracy" else "0"
-    else:
+    elif speculation == "dspark":
         environment.update(
             {
                 "GLMRT_REAL_FULL_MTP": "0",
                 "GLMRT_REAL_FULL_DSPARK": "1",
+                "GLMRT_REAL_FULL_DFLASH2": "0",
                 "GLMRT_REAL_FULL_DSPARK_CACHE_MODE": "prompt-swa",
                 "GLMRT_SPARK_INCLUDE_MTP_LAYER": "0",
                 "GLMRT_COORDINATOR_INCLUDE_MTP_LAYER": "0",
             }
         )
+        if glm53_exl3:
+            blockers.append(
+                "the GLM-5.2 dSpark checkpoint cannot draft for the GLM-5.3 target"
+            )
         dspark_model_id = (
             inherited.get("GLMRT_DSPARK_MODEL_ID", DEFAULT_DSPARK_MODEL_ID).strip()
             or DEFAULT_DSPARK_MODEL_ID
@@ -404,6 +428,39 @@ def resolve_serve_profile(
             blockers.append(f"dSpark snapshot is not installed: {dspark_model_id}")
         else:
             environment["GLMRT_REAL_FULL_DSPARK_SNAPSHOT"] = str(dspark_snapshot)
+    else:
+        environment.update(
+            {
+                "GLMRT_REAL_FULL_MTP": "0",
+                "GLMRT_REAL_FULL_DSPARK": "0",
+                "GLMRT_REAL_FULL_DFLASH2": "1",
+                "GLMRT_DFLASH2_MODEL_ID": DEFAULT_DFLASH2_MODEL_ID,
+                "GLMRT_DFLASH2_REVISION": DEFAULT_DFLASH2_REVISION,
+                "GLMRT_REAL_FULL_DFLASH2_FIXED_DRAFTS": str(
+                    DEFAULT_DFLASH2_DRAFT_POLICY
+                    if dflash2_fixed_drafts is None
+                    else dflash2_fixed_drafts
+                ),
+                "GLMRT_REAL_FULL_DFLASH2_TOPK_BACKEND": dflash2_topk_backend,
+                "GLMRT_SPARK_INCLUDE_MTP_LAYER": "0",
+                "GLMRT_COORDINATOR_INCLUDE_MTP_LAYER": "0",
+            }
+        )
+        if model_id != MODEL_ALIASES["glm53-exl3"]:
+            blockers.append(
+                "DFlash2 requires the GLM-5.3 EXL3 K4 target checkpoint"
+            )
+        dflash2_snapshot = find_hf_snapshot(
+            DEFAULT_DFLASH2_MODEL_ID,
+            cache_root=hf_cache_root,
+            revision=DEFAULT_DFLASH2_REVISION,
+        )
+        if dflash2_snapshot is None:
+            blockers.append(
+                f"DFlash2 snapshot is not installed: {DEFAULT_DFLASH2_MODEL_ID}@{DEFAULT_DFLASH2_REVISION}"
+            )
+        else:
+            environment["GLMRT_REAL_FULL_DFLASH2_SNAPSHOT"] = str(dflash2_snapshot)
 
     if vision:
         vision_snapshot = find_hf_snapshot(

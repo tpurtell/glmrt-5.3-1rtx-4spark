@@ -35,13 +35,18 @@ def _trace(
     )
 
 
-def _run(tmp_path: Path, log_text: str, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    tmp_path: Path,
+    log_text: str,
+    *extra: str,
+    model_id: str = "test/exl3",
+) -> subprocess.CompletedProcess[str]:
     log = tmp_path / "coordinator.log"
     deployment = tmp_path / "deployment.json"
     output = tmp_path / "profile.json"
     log.write_text(log_text, encoding="utf-8")
     deployment.write_text(
-        json.dumps({"schema": "test-deployment", "model_id": "test/exl3"}),
+        json.dumps({"schema": "test-deployment", "model_id": model_id}),
         encoding="utf-8",
     )
     return subprocess.run(
@@ -158,3 +163,33 @@ def test_route_profile_rejects_duplicate_expert_within_a_row(tmp_path: Path) -> 
     )
     assert result.returncode != 0
     assert "routed more than once per row" in result.stderr
+
+
+def test_glm53_k4_route_profile_is_model_and_bitrate_bound(tmp_path: Path) -> None:
+    log_text = "".join(
+        _trace(1030, 3, host_index) for host_index in range(4)
+    )
+    result = _run(
+        tmp_path,
+        log_text,
+        "--expected-layer-last",
+        "3",
+        "--trellis-bits",
+        "4",
+        model_id="wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads((tmp_path / "profile.json").read_text(encoding="utf-8"))
+    assert report["schema"] == "glmrt-glm5-exl3-route-profile-v1"
+    assert report["geometry"]["trellis_bits"] == 4
+
+    wrong = _run(
+        tmp_path,
+        log_text,
+        "--expected-layer-last",
+        "3",
+        "--trellis-bits",
+        "4",
+    )
+    assert wrong.returncode != 0
+    assert "K4 route profile requires deployment model_id" in wrong.stderr

@@ -742,6 +742,24 @@ __global__ __launch_bounds__(256) void quantize_bf16_w8a16_group256_kernel(
   }
 }
 
+__global__ __launch_bounds__(256) void dequantize_block_fp8_e4m3_bf16_kernel(
+    const uint8_t* source, const float* scales, uint16_t* output,
+    size_t input_dim, size_t output_dim) {
+  constexpr size_t kBlockRows = 128;
+  constexpr size_t kBlockColumns = 128;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t values = input_dim * output_dim;
+  if (index >= values) {
+    return;
+  }
+  const size_t row = index / input_dim;
+  const size_t column = index - row * input_dim;
+  const size_t scale_columns = (input_dim + kBlockColumns - 1) / kBlockColumns;
+  const float scale =
+      scales[(row / kBlockRows) * scale_columns + column / kBlockColumns];
+  output[index] = f32_to_bf16(f8e4m3_to_f32(source[index]) * scale);
+}
+
 // Transpose while dequantizing so both the K-major W8 input reads and the
 // row-major BF16 output writes are coalesced.  This is the bounded-scratch
 // fallback for projection row counts where direct W8A16 loses to cuBLAS.
@@ -1754,6 +1772,30 @@ glmrt_cuda_quantize_bf16_w8a16_group256_packed_async(
   quantize_bf16_w8a16_group256_kernel<2>
       <<<static_cast<unsigned int>(flat_groups), 256, 0, stream>>>(
           source, weight, scales, input_dim, output_dim);
+  return status_from_cuda(cudaGetLastError());
+}
+
+extern "C" glmrt_status_t
+glmrt_cuda_dequantize_block_fp8_e4m3_bf16_async(
+    const uint8_t* source, const float* scales, uint16_t* output,
+    size_t input_dim, size_t output_dim, void* cuda_stream) {
+  if (source == nullptr || scales == nullptr || output == nullptr || input_dim == 0 ||
+      output_dim == 0) {
+    return GLMRT_STATUS_INVALID_ARGUMENT;
+  }
+  size_t values = 0;
+  if (!checked_mul(input_dim, output_dim, &values)) {
+    return GLMRT_STATUS_INVALID_ARGUMENT;
+  }
+  constexpr size_t kThreads = 256;
+  const size_t blocks = (values + kThreads - 1) / kThreads;
+  if (blocks > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
+    return GLMRT_STATUS_INVALID_ARGUMENT;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  dequantize_block_fp8_e4m3_bf16_kernel
+      <<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(
+          source, scales, output, input_dim, output_dim);
   return status_from_cuda(cudaGetLastError());
 }
 

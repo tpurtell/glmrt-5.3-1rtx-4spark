@@ -13,8 +13,8 @@ import time
 import urllib.request
 from typing import Any
 
-from bench_real_full_concurrency import default_tokenizer_path, token_zero_nonces
-from real_full_matrix import MODEL_ID, git_commit, repo_root
+from bench_real_full_concurrency import token_zero_nonces
+from real_full_matrix import MODEL_ID, default_tokenizer_path, git_commit, repo_root
 
 
 def hash_file(path: Path) -> str:
@@ -55,6 +55,7 @@ def prompt_contract(
         "repeats": repeats,
         "nonce_seed": nonce_seed,
         "temperature": 0,
+        "enable_thinking": False,
         "tokenizer_sha256": tokenizer_sha256,
     }
 
@@ -98,6 +99,7 @@ def request_completion(
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
+            "enable_thinking": False,
             "max_tokens": max_tokens,
         }
     ).encode()
@@ -169,7 +171,7 @@ def summarize(
 
 def main() -> None:
     args = parse_args()
-    tokenizer_path = (args.tokenizer or default_tokenizer_path()).resolve()
+    tokenizer_path = (args.tokenizer or default_tokenizer_path(args.model)).resolve()
     tokenizer_sha256 = hash_file(tokenizer_path)
     nonces = token_zero_nonces(
         count=args.warmups + args.repeats,

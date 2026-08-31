@@ -28,7 +28,7 @@ RUN python3 -m pip install --no-cache-dir uv && \
       safetensors \
       huggingface-hub && \
     uv pip install --system --break-system-packages --no-cache \
-      "nvidia-cutlass-dsl[cu13]==4.6.1" \
+      "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
       "cuda-tile==1.5.0" \
       "nvidia-cudnn-frontend==1.26.0" \

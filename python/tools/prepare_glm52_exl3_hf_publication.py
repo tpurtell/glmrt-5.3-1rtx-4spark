@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a compact, standard-only GLM-5.2 EXL3 Hub publication tree."""
+"""Prepare a compact, standard-only GLM-5 EXL3 Hub publication tree."""
 
 from __future__ import annotations
 
@@ -18,16 +18,32 @@ from stage_glm52_exl3_hf_snapshot import (
     _quant_evidence,
     _validation_evidence,
 )
-from validate_glm52_exl3_artifact import ARTIFACT_SCHEMA, SHA256_RE, _json_object
+from validate_glm52_exl3_artifact import (
+    ARTIFACT_SCHEMA,
+    ArtifactContract,
+    SHA256_RE,
+    _artifact_contract,
+    _compact_exl3_declaration,
+    _json_object,
+    _module_contract,
+    _validate_quantization_config,
+)
 from validate_glm52_exl3_serving_qualification import (
     QualificationError,
     REQUIRED_GATES as REQUIRED_SERVING_GATES,
     revalidate_native_evidence,
 )
-
+from validate_glm53_exl3_serving_qualification import (
+    REQUIRED_GATES as GLM53_REQUIRED_SERVING_GATES,
+    revalidate_dflash2_fusion_evidence,
+    revalidate_dflash2_topk_evidence,
+    revalidate_dflash2_width_evidence,
+    revalidate_native_evidence as revalidate_glm53_native_evidence,
+)
 
 SCHEMA = "glmrt-hf-standard-publication-v3"
 SERVING_QUALIFICATION_SCHEMA = "glmrt-glm52-exl3-serving-qualification-v1"
+GLM53_SERVING_QUALIFICATION_SCHEMA = "glmrt-glm5-exl3-serving-qualification-v1"
 SHARD_RE = re.compile(r"model-[0-9]{5}-of-[0-9]{5}\.safetensors\Z")
 REVISION_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 PUBLIC_METADATA = (
@@ -48,6 +64,7 @@ HUB_LFS_ATTRIBUTE_PATHS = (
     "quantize_config.json",
     "tokenizer.json",
 )
+MAX_PUBLIC_CONFIG_BYTES = 128 * 1024
 PRIVATE_EXECUTION_META = {
     "offload_to_disk",
     "offload_to_disk_path",
@@ -76,7 +93,18 @@ def _serving_qualification(
     validation_sha256: str,
     quant_evidence_sha256: str,
     projection_checkpoint_root: Path,
+    contract: ArtifactContract | None = None,
 ) -> dict[str, Any]:
+    expected_model_id = MODEL_ID if contract is None else contract.model_id
+    expected_schema = (
+        SERVING_QUALIFICATION_SCHEMA
+        if contract is None or contract.exl3_bits == 3
+        else GLM53_SERVING_QUALIFICATION_SCHEMA
+    )
+    is_glm53 = contract is not None and contract.exl3_bits == 4
+    expected_gates = (
+        GLM53_REQUIRED_SERVING_GATES if is_glm53 else REQUIRED_SERVING_GATES
+    )
     resolved = report_path.expanduser().resolve(strict=True)
     if report_path.expanduser().is_symlink() or not resolved.is_file():
         raise PublicationError("serving-qualification report is not one regular file")
@@ -85,12 +113,21 @@ def _serving_qualification(
     body = {key: value for key, value in report.items() if key != "report_sha256"}
     runtime = report.get("runtime")
     gates = report.get("gates")
+    valid_speculation = isinstance(runtime, dict) and (
+        runtime.get("speculation") == "dspark"
+        if not is_glm53
+        else (
+            runtime.get("speculation") in {"mtp", "dflash2"}
+            and runtime.get("default_speculation") == runtime.get("speculation")
+            and runtime.get("qualified_speculation") == ["mtp", "dflash2"]
+        )
+    )
     artifact_validation = report.get("artifact_validation")
     quant_evidence = report.get("quant_evidence")
     if (
-        report.get("schema") != SERVING_QUALIFICATION_SCHEMA
+        report.get("schema") != expected_schema
         or report.get("status") != "accepted"
-        or report.get("model_id") != MODEL_ID
+        or report.get("model_id") != expected_model_id
         or Path(str(report.get("artifact", ""))).expanduser().resolve() != artifact
         or report.get("artifact_manifest_sha256") != artifact_manifest_sha256
         or report.get("plan_sha256") != plan_sha256
@@ -113,19 +150,16 @@ def _serving_qualification(
         or not isinstance(runtime.get("engine_identity"), str)
         or not runtime["engine_identity"]
         or REVISION_RE.fullmatch(str(runtime.get("sparkinfer_revision", ""))) is None
-        or SHA256_RE.fullmatch(
-            str(runtime.get("coordinator_slot_fingerprint", ""))
-        )
+        or SHA256_RE.fullmatch(str(runtime.get("coordinator_slot_fingerprint", "")))
         is None
-        or SHA256_RE.fullmatch(str(runtime.get("expert_slot_fingerprint", "")))
-        is None
+        or SHA256_RE.fullmatch(str(runtime.get("expert_slot_fingerprint", ""))) is None
         or runtime.get("profile") not in {"balanced", "long", "accuracy"}
-        or runtime.get("speculation") != "dspark"
+        or not valid_speculation
         or isinstance(runtime.get("power_limit_w"), bool)
         or not isinstance(runtime.get("power_limit_w"), int)
         or runtime["power_limit_w"] <= 0
         or not isinstance(gates, dict)
-        or set(gates) != REQUIRED_SERVING_GATES
+        or set(gates) != expected_gates
         or any(value is not True for value in gates.values())
         or report.get("failed_gates") != []
     ):
@@ -133,20 +167,32 @@ def _serving_qualification(
             "serving-qualification report does not accept this exact artifact"
         )
     try:
-        revalidate_native_evidence(
+        revalidator = (
+            revalidate_glm53_native_evidence if is_glm53 else revalidate_native_evidence
+        )
+        revalidator(
             report,
             expected_sparkinfer_revision=runtime["sparkinfer_revision"],
-            expected_checkpoint_root=projection_checkpoint_root,
+            expected_checkpoint_root=(
+                artifact if is_glm53 else projection_checkpoint_root
+            ),
+            expected_expert_slot_fingerprint=runtime[
+                "expert_slot_fingerprint"
+            ],
         )
+        if is_glm53:
+            revalidate_dflash2_fusion_evidence(report)
+            revalidate_dflash2_topk_evidence(report)
+            revalidate_dflash2_width_evidence(report)
     except QualificationError as error:
         raise PublicationError(
-            "serving-qualification report has unverifiable native EXL3 evidence"
+            "serving-qualification report has unverifiable native EXL3 or DFlash2 fusion/top-k/width evidence"
         ) from error
     return {
         "path": os.fspath(resolved),
         "bytes": resolved.stat().st_size,
         "sha256": _hash_file(resolved),
-        "schema": SERVING_QUALIFICATION_SCHEMA,
+        "schema": expected_schema,
         "report_sha256": report_digest,
     }
 
@@ -194,6 +240,39 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _verify_artifact_metadata_hashes(
+    artifact: Path,
+    artifact_records: dict[str, Any],
+) -> None:
+    """Rebind mutable publication metadata to the accepted artifact manifest."""
+
+    for name in (
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "quantize_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ):
+        path = artifact / name
+        record = artifact_records.get(name)
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not isinstance(record, dict)
+            or set(record) != {"bytes", "sha256"}
+            or isinstance(record.get("bytes"), bool)
+            or not isinstance(record.get("bytes"), int)
+            or record["bytes"] <= 0
+            or SHA256_RE.fullmatch(str(record.get("sha256", ""))) is None
+            or path.stat().st_size != record["bytes"]
+            or _hash_file(path) != record["sha256"]
+        ):
+            raise PublicationError(
+                f"publication metadata differs from the accepted artifact manifest: {name}"
+            )
+
+
 def _referenced_shards(artifact: Path) -> tuple[str, ...]:
     index = _json_object(artifact / "model.safetensors.index.json")
     weight_map = index.get("weight_map")
@@ -205,16 +284,26 @@ def _referenced_shards(artifact: Path) -> tuple[str, ...]:
             raise PublicationError("model index contains an invalid tensor mapping")
         path = PurePosixPath(raw)
         if path.name != raw or SHARD_RE.fullmatch(raw) is None:
-            raise PublicationError(f"model index uses a nonstandard shard path: {raw!r}")
+            raise PublicationError(
+                f"model index uses a nonstandard shard path: {raw!r}"
+            )
         shards.add(raw)
     metadata = index.get("metadata")
     total_size = metadata.get("total_size") if isinstance(metadata, dict) else None
-    if isinstance(total_size, bool) or not isinstance(total_size, int) or total_size <= 0:
+    if (
+        isinstance(total_size, bool)
+        or not isinstance(total_size, int)
+        or total_size <= 0
+    ):
         raise PublicationError("model index has no positive metadata.total_size")
     return tuple(sorted(shards))
 
 
-def _public_configs(artifact: Path) -> tuple[bytes, bytes]:
+def _public_configs(
+    artifact: Path, contract: ArtifactContract | None = None
+) -> tuple[bytes, bytes]:
+    if contract is not None:
+        _validate_quantization_config(artifact, _module_contract(), contract)
     config = _json_object(artifact / "config.json")
     embedded = config.get("quantization_config")
     external = _json_object(artifact / "quantize_config.json")
@@ -225,26 +314,42 @@ def _public_configs(artifact: Path) -> tuple[bytes, bytes]:
         raise PublicationError("external EXL3 config has no tensor_storage")
     external_declaration = dict(external)
     external_declaration.pop("tensor_storage")
-    if embedded not in (external, external_declaration):
+    minimal_declaration = _compact_exl3_declaration(external)
+    is_glm53 = (
+        contract is not None and contract.exl3_bits == 4
+    ) or external.get("bits") == 4.0
+    accepted_embedded = (
+        (minimal_declaration,)
+        if is_glm53
+        else (minimal_declaration, external_declaration)
+    )
+    if embedded not in accepted_embedded:
         raise PublicationError("embedded and external EXL3 configurations conflict")
 
     public_external = dict(external)
     meta = dict(public_external.get("meta", {}))
-    meta.pop("ds4rt_error_ledger", None)
     for field in PRIVATE_EXECUTION_META:
         meta.pop(field, None)
     public_external["meta"] = meta
     public_declaration = dict(public_external)
     public_declaration.pop("tensor_storage")
-    config["quantization_config"] = public_declaration
+    config["quantization_config"] = (
+        _compact_exl3_declaration(public_external)
+        if is_glm53 or embedded == minimal_declaration
+        else public_declaration
+    )
     rendered_config = (
         json.dumps(config, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     ).encode()
     rendered_external = (
         json.dumps(public_external, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     ).encode()
-    if len(rendered_config) > 1024 * 1024:
-        raise PublicationError("compact public config.json exceeds 1 MiB")
+    if public_external.get("tensor_storage") != storage:
+        raise PublicationError(
+            "public standalone EXL3 tensor_storage differs from the artifact"
+        )
+    if len(rendered_config) > MAX_PUBLIC_CONFIG_BYTES:
+        raise PublicationError("compact public config.json exceeds 128 KiB")
     return rendered_config, rendered_external
 
 
@@ -289,7 +394,9 @@ def _source_files(
     ):
         raise PublicationError("README is not a completed Hugging Face model card")
     if f"Qualification evidence SHA-256: `{serving_report_sha256}`" not in readme_text:
-        raise PublicationError("README is not bound to the serving qualification report")
+        raise PublicationError(
+            "README is not bound to the serving qualification report"
+        )
     return sources, shards
 
 
@@ -311,27 +418,36 @@ def prepare(
     if output.exists() or output.is_symlink():
         raise PublicationError(f"publication output already exists: {output}")
     artifact_manifest = _json_object(artifact / "glmrt-gptqmodel-artifact.json")
-    if artifact_manifest.get("schema") != ARTIFACT_SCHEMA:
+    artifact_records = artifact_manifest.get("files")
+    if not isinstance(artifact_records, dict):
+        raise PublicationError("artifact manifest has no file inventory")
+    contract = _artifact_contract(_json_object(artifact / "glmrt-gptqmodel-plan.json"))
+    if artifact_manifest.get("schema") != contract.artifact_schema:
         raise PublicationError("source is not a completed GLMRT artifact")
     qualification, validation = _validation_evidence(
         validation_report_path,
         artifact=artifact,
         artifact_manifest_sha256=artifact_manifest["manifest_sha256"],
+        contract=contract,
     )
     _validated_source_snapshot(validation, source_snapshot)
     if SHA256_RE.fullmatch(str(validation.get("plan_sha256", ""))) is None:
-        raise PublicationError("validation report has no valid quantization plan identity")
+        raise PublicationError(
+            "validation report has no valid quantization plan identity"
+        )
     quant_qualification, quant_report = _quant_evidence(
         quant_evidence_report_path,
         plan_sha256=validation["plan_sha256"],
+        contract=contract,
     )
-    if (
-        validation["projection_checkpoint"]["checkpoint_inventory_sha256"]
-        != quant_report["integrity"]["checkpoint_inventory_sha256"]
-        or validation.get("execution_upgrade_sha256")
-        != (quant_report.get("execution_upgrade") or {}).get(
-            "active_upgrade_sha256"
-        )
+    if validation["projection_checkpoint"][
+        "checkpoint_inventory_sha256"
+    ] != quant_report["integrity"]["checkpoint_inventory_sha256"] or validation.get(
+        "execution_upgrade_sha256"
+    ) != (
+        quant_report.get("execution_upgrade") or {}
+    ).get(
+        "active_upgrade_sha256"
     ):
         raise PublicationError(
             "artifact and quant evidence bind different projection or execution identities"
@@ -343,21 +459,20 @@ def prepare(
         plan_sha256=validation["plan_sha256"],
         validation_sha256=qualification["sha256"],
         quant_evidence_sha256=quant_qualification["sha256"],
-        projection_checkpoint_root=Path(
-            validation["projection_checkpoint"]["root"]
-        ).expanduser().resolve(),
+        projection_checkpoint_root=Path(validation["projection_checkpoint"]["root"])
+        .expanduser()
+        .resolve(),
+        contract=contract,
     )
+    _verify_artifact_metadata_hashes(artifact, artifact_records)
     sources, shards = _source_files(
         artifact,
         source_snapshot,
         readme,
         serving_qualification["report_sha256"],
     )
-    compact_config, external_config = _public_configs(artifact)
+    compact_config, external_config = _public_configs(artifact, contract)
     gitattributes = _public_gitattributes(source_snapshot)
-    artifact_records = artifact_manifest.get("files")
-    if not isinstance(artifact_records, dict):
-        raise PublicationError("artifact manifest has no file inventory")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
@@ -367,7 +482,9 @@ def prepare(
             if name.endswith(".safetensors") and link_mode == "hardlink":
                 os.link(source.resolve(strict=True), destination, follow_symlinks=False)
             elif link_mode in {"hardlink", "copy"}:
-                shutil.copy2(source.resolve(strict=True), destination, follow_symlinks=False)
+                shutil.copy2(
+                    source.resolve(strict=True), destination, follow_symlinks=False
+                )
             else:
                 raise PublicationError(f"unsupported link mode: {link_mode}")
             _fsync_file(destination)
@@ -400,14 +517,16 @@ def prepare(
                 or path.stat().st_size != record.get("bytes")
                 or path.stat().st_ino != (artifact / name).stat().st_ino
             ):
-                raise PublicationError(f"public shard does not match the artifact: {name}")
+                raise PublicationError(
+                    f"public shard does not match the artifact: {name}"
+                )
             digest = record["sha256"]
         else:
             digest = _hash_file(path)
         entries.append({"path": name, "bytes": path.stat().st_size, "sha256": digest})
     body = {
         "schema": SCHEMA,
-        "model_id": MODEL_ID,
+        "model_id": contract.model_id,
         "source_artifact_manifest_sha256": artifact_manifest["manifest_sha256"],
         "source_validation_sha256": qualification["sha256"],
         "source_quant_evidence_sha256": quant_qualification["sha256"],

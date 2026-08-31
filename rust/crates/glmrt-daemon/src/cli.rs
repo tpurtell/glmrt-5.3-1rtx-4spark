@@ -3,6 +3,7 @@ use glmrt_core::DEFAULT_MODEL_ID;
 use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
+const DEFAULT_DFLASH2_KV_CAPACITY_TOKENS: usize = 2_176;
 
 #[derive(Debug, Parser)]
 #[command(name = "glmrt", about = "GLMRT phase0 runtime CLI")]
@@ -19,6 +20,7 @@ pub(crate) enum Commands {
     LoadTensors(LoadTensorsArgs),
     Tokenize(TokenizeArgs),
     DsparkPreflight(DsparkPreflightArgs),
+    DflashPreflight(DflashPreflightArgs),
     Coordinator(CoordinatorArgs),
     Expertd(ExpertDaemonArgs),
     BenchRdma(BenchRdmaArgs),
@@ -29,6 +31,38 @@ pub(crate) enum Commands {
     TransportCapabilities(TransportCapabilitiesArgs),
     SchedulerSmoke(SchedulerSmokeArgs),
     SchedulerRowAudit(SchedulerRowAuditArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DflashPreflightArgs {
+    #[arg(long)]
+    pub(crate) snapshot: PathBuf,
+    #[arg(long)]
+    pub(crate) target_catalog: PathBuf,
+    #[arg(long, default_value_t = DEFAULT_DFLASH2_KV_CAPACITY_TOKENS)]
+    pub(crate) kv_capacity_tokens: usize,
+    #[arg(long, default_value_t = 4)]
+    pub(crate) max_concurrency: usize,
+    #[arg(long, default_value = "bf16")]
+    pub(crate) kv_storage: String,
+    #[arg(long, default_value_t = 64)]
+    pub(crate) kv_page_size: usize,
+    #[arg(long, default_value_t = 1_024)]
+    pub(crate) context_tokens: usize,
+    #[arg(long, default_value_t = 4)]
+    pub(crate) accepted_rows_per_request: usize,
+    #[arg(long, default_value_t = 7)]
+    pub(crate) proposal_tokens_per_request: usize,
+    #[arg(long, default_value_t = false)]
+    pub(crate) preload: bool,
+    #[arg(long, default_value_t = false)]
+    pub(crate) capture_static: bool,
+    #[arg(long, default_value_t = 2)]
+    pub(crate) static_warmup: usize,
+    #[arg(long, default_value_t = 10)]
+    pub(crate) static_iterations: usize,
+    #[arg(long, default_value_t = 3)]
+    pub(crate) static_repeats: usize,
 }
 
 #[derive(Debug, Args)]

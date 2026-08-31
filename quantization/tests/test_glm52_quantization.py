@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +52,14 @@ def _glm_weight_map() -> dict[str, str]:
     return names
 
 
+def _glm_fp8_weight_map() -> dict[str, str]:
+    names = _glm_weight_map()
+    for name, shard in tuple(names.items()):
+        if ".mlp.experts." in name and name.endswith(".weight"):
+            names[f"{name[:-len('.weight')]}.weight_scale_inv"] = shard
+    return names
+
+
 def test_glm_namespace_audit_separates_base_and_checkpoint_only_mtp():
     report = quant.glm52_namespace_audit(_glm_config(), _glm_weight_map())
     assert report["base_routed_layers"] == 75
@@ -67,6 +76,270 @@ def test_glm_namespace_audit_rejects_one_missing_projection():
     weights.pop("model.layers.78.mlp.experts.255.down_proj.weight")
     with pytest.raises(quant.LaunchError, match="inventory differs"):
         quant.glm52_namespace_audit(_glm_config(), weights)
+
+
+def test_glm53_fp8_namespace_audit_binds_expert_scales():
+    report = quant.glm52_namespace_audit(
+        _glm_config(),
+        _glm_fp8_weight_map(),
+        source_format="fp8-e4m3-block128x128-dynamic",
+    )
+
+    assert report["base_routed_projection_scale_tensors"] == 57_600
+    assert report["mtp_routed_projection_scale_tensors"] == 768
+
+
+def test_source_variant_separates_full_glm52_and_glm53():
+    assert quant.source_variant(_glm_config()) == {
+        "release": "glm-5.2",
+        "format": "bf16",
+        "quantization_config_sha256": None,
+    }
+    config = _glm_config() | {
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["lm_head"],
+        }
+    }
+    variant = quant.source_variant(config)
+    assert variant["release"] == "glm-5.3"
+    assert variant["format"] == "fp8-e4m3-block128x128-dynamic"
+    assert len(variant["quantization_config_sha256"]) == 64
+
+
+def _write_safetensors_fixture(
+    root: Path,
+    tensors: dict[str, tuple[str, tuple[int, ...]]],
+) -> None:
+    dtype_bytes = {"I16": 2, "F16": 2, "I32": 4, "BF16": 2}
+    offset = 0
+    header = {}
+    for name, (dtype, shape) in tensors.items():
+        length = 1
+        for dimension in shape:
+            length *= dimension
+        length *= dtype_bytes[dtype]
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + length],
+        }
+        offset += length
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    shard = "model.safetensors"
+    (root / shard).write_bytes(struct.pack("<Q", len(encoded)) + encoded + bytes(offset))
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard for name in tensors}})
+    )
+
+
+def _tiny_exl3_export_contract(tmp_path: Path):
+    source = tmp_path / "source"
+    export = tmp_path / "export"
+    source.mkdir()
+    export.mkdir()
+    source_config = {
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 4,
+        "first_k_dense_replace": 3,
+        "n_routed_experts": 1,
+        "num_experts_per_tok": 1,
+        "hidden_size": 16,
+        "moe_intermediate_size": 16,
+        "num_nextn_predict_layers": 1,
+        "dtype": "bfloat16",
+        "transformers_version": "source-version",
+        "quantization_config": {"quant_method": "fp8"},
+    }
+    (source / "config.json").write_text(json.dumps(source_config))
+    for name in quant.EXACT_SOURCE_METADATA_FILES:
+        payload = json.dumps({"name": name, "source": True})
+        (source / name).write_text(payload)
+        (export / name).write_text(payload)
+    modules = [
+        "model.layers.3.mlp.experts.0.gate_proj",
+        "model.layers.3.mlp.experts.0.up_proj",
+        "model.layers.3.mlp.experts.0.down_proj",
+    ]
+    retained = "model.embed_tokens.weight"
+    source_names = [retained]
+    for module in modules:
+        source_names.extend([f"{module}.weight", f"{module}.weight_scale_inv"])
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "source.safetensors" for name in source_names}})
+    )
+
+    storage = {}
+    artifact_tensors = {retained: ("BF16", (16, 16))}
+    for module in modules:
+        stored = {
+            f"{module}.trellis": {"shape": [1, 1, 64], "torch_dtype": "int16"},
+            f"{module}.suh": {"shape": [16], "torch_dtype": "float16"},
+            f"{module}.svh": {"shape": [16], "torch_dtype": "float16"},
+            f"{module}.mcg": {"shape": [], "torch_dtype": "int32"},
+        }
+        storage[module] = {
+            "stored_tensors": stored,
+            "quant_format": "exl3",
+            "bits_per_weight": 4,
+            "mcg_multiplier": quant.EXL3_MCG_MULTIPLIER,
+        }
+        artifact_tensors.update(
+            {
+                f"{module}.trellis": ("I16", (1, 1, 64)),
+                f"{module}.suh": ("F16", (16,)),
+                f"{module}.svh": ("F16", (16,)),
+                f"{module}.mcg": ("I32", ()),
+            }
+        )
+    compact = {
+        "method": "exl3",
+        "quant_method": "exl3",
+        "format": "exl3",
+        "checkpoint_format": "exl3",
+        "bits": 4.0,
+        "codebook": "mcg",
+        "out_scales": "auto",
+        "group_size": -1,
+        "desc_act": False,
+        "module_include": [quant.BASE_EXPERT_PATTERN],
+        "lm_head": False,
+        "pack_dtype": "int32",
+        "meta": {"producer": "fixture"},
+    }
+    artifact_config = dict(source_config)
+    artifact_config["quantization_config"] = quant.compact_exl3_declaration(compact)
+    (export / "config.json").write_text(json.dumps(artifact_config))
+    (export / "quantize_config.json").write_text(
+        json.dumps(compact | {"tensor_storage": storage})
+    )
+    _write_safetensors_fixture(export, artifact_tensors)
+    plan = {
+        "source": {
+            "path": os.fspath(source),
+            "format": "fp8-e4m3-block128x128-dynamic",
+            "geometry": {
+                "first_target_layer": 3,
+                "last_target_layer": 3,
+                "hidden_size": 16,
+                "moe_intermediate_size": 16,
+                "n_routed_experts": 1,
+            },
+        },
+        "exl3": {
+            "bits": 4.0,
+            "codebook": "mcg",
+            "out_scales": "auto",
+            "module_include": [quant.BASE_EXPERT_PATTERN],
+        },
+    }
+    return export, plan
+
+
+def test_export_quantization_contract_binds_full_storage_and_compact_config(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    quant.validate_export_quantization_contract(export, plan)
+
+    external = json.loads((export / "quantize_config.json").read_text())
+    external["tensor_storage"].pop(next(iter(external["tensor_storage"])))
+    (export / "quantize_config.json").write_text(json.dumps(external))
+    with pytest.raises(quant.LaunchError, match="tensor_storage module inventory"):
+        quant.validate_export_quantization_contract(export, plan)
+
+
+def test_export_config_normalization_restores_exact_source_fields(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    config = json.loads((export / "config.json").read_text())
+    config["head_dim"] = 64
+    config["transformers_version"] = "export-version"
+    config["bos_token_id"] = 1
+    (export / "config.json").write_text(json.dumps(config))
+
+    normalized = quant.normalize_export_model_config(export, plan)
+    source = json.loads(
+        (Path(plan["source"]["path"]) / "config.json").read_text()
+    )
+    compact = quant.compact_exl3_declaration(
+        json.loads((export / "quantize_config.json").read_text())
+    )
+    assert normalized == source | {"quantization_config": compact}
+    assert json.loads((export / "config.json").read_text()) == normalized
+    quant.validate_export_quantization_contract(export, plan)
+
+
+def test_export_config_normalization_accepts_exact_full_embedded_storage(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    external = json.loads((export / "quantize_config.json").read_text())
+    config = json.loads((export / "config.json").read_text())
+    config["quantization_config"] = external
+    (export / "config.json").write_text(json.dumps(config))
+
+    normalized = quant.normalize_export_model_config(export, plan)
+
+    compact = quant.compact_exl3_declaration(external)
+    assert normalized["quantization_config"] == compact
+    assert "meta" not in normalized["quantization_config"]
+    assert json.loads((export / "quantize_config.json").read_text()) == external
+    quant.validate_export_quantization_contract(export, plan)
+
+
+def test_export_config_normalization_rejects_mismatched_full_embedded_storage(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    external = json.loads((export / "quantize_config.json").read_text())
+    config = json.loads((export / "config.json").read_text())
+    config["quantization_config"] = external
+    module = next(iter(config["quantization_config"]["tensor_storage"]))
+    config["quantization_config"]["tensor_storage"].pop(module)
+    (export / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(quant.LaunchError, match="embedded and standalone"):
+        quant.normalize_export_model_config(export, plan)
+
+
+def test_export_quantization_contract_rejects_corrupt_storage_metadata(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    external = json.loads((export / "quantize_config.json").read_text())
+    module = next(iter(external["tensor_storage"]))
+    tensor = next(iter(external["tensor_storage"][module]["stored_tensors"]))
+    external["tensor_storage"][module]["stored_tensors"][tensor]["shape"] = [7]
+    (export / "quantize_config.json").write_text(json.dumps(external))
+
+    with pytest.raises(quant.LaunchError, match="tensor_storage metadata"):
+        quant.validate_export_quantization_contract(export, plan)
+
+
+def test_export_quantization_contract_rejects_noncompact_embedded_config(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    config = json.loads((export / "config.json").read_text())
+    config["quantization_config"]["meta"] = {"producer": "different-export"}
+    (export / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(quant.LaunchError, match="exact minimal EXL3 declaration"):
+        quant.validate_export_quantization_contract(export, plan)
+
+
+def test_export_quantization_contract_rejects_source_config_drift(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    config = json.loads((export / "config.json").read_text())
+    config["model_type"] = "wrong_architecture"
+    (export / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(quant.LaunchError, match="changed source field model_type"):
+        quant.validate_export_quantization_contract(export, plan)
+
+
+def test_export_quantization_contract_rejects_added_model_config_field(tmp_path):
+    export, plan = _tiny_exl3_export_contract(tmp_path)
+    config = json.loads((export / "config.json").read_text())
+    config["unreviewed_runtime_override"] = True
+    (export / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(quant.LaunchError, match="added fields absent from the source"):
+        quant.validate_export_quantization_contract(export, plan)
 
 
 def test_source_metadata_identity_binds_hf_blob_and_content(tmp_path):
@@ -114,6 +387,28 @@ def test_k3_storage_contract_accounts_for_compact_export_and_bounded_state():
     assert contract["retention"]["projection_checkpoints"] == (
         "all-completed-projections"
     )
+
+
+def test_k4_storage_contract_replaces_fp8_weights_and_block_scales():
+    source = {
+        "total_shard_bytes": 755_632_050_320,
+        "format": "fp8-e4m3-block128x128-dynamic",
+        "geometry": {
+            "first_target_layer": 3,
+            "last_target_layer": 77,
+            "n_routed_experts": 256,
+            "hidden_size": 6144,
+            "moe_intermediate_size": 2048,
+        },
+    }
+
+    contract = quant.storage_contract(source, bits=4)
+
+    assert contract["native_replaced_payload_bytes"] == 724_952_678_400
+    assert contract["native_replaced_scale_payload_bytes"] == 176_947_200
+    assert contract["exl3_projection_payload_bytes"] == 363_331_814_400
+    assert contract["artifact_payload_estimate_bytes"] == 394_011_186_320
+    assert contract["trellis_bits"] == 4
 
 
 def test_storage_tree_excludes_externalized_projection_payload(tmp_path):
@@ -383,7 +678,7 @@ def test_exllamav3_jit_cache_scope_is_durable_and_restores_environment(
     root = tmp_path / "run-state" / quant.EXLLAMAV3_JIT_DIRNAME
     monkeypatch.delenv(variable, raising=False)
     with quant.exllamav3_jit_cache_scope(root):
-        assert root.is_dir()
+        assert not root.exists()
         assert os.environ[variable] == os.fspath(root)
     assert variable not in os.environ
 
@@ -618,7 +913,17 @@ def test_execution_upgrade_rejects_gpu_identity_change(tmp_path, monkeypatch):
 
 
 def _staged_artifact(tmp_path: Path, monkeypatch):
-    plan = {"plan_sha256": "a" * 64}
+    plan = {
+        "schema": quant.PLAN_SCHEMA,
+        "plan_sha256": "a" * 64,
+        "source": {
+            "geometry": {
+                "first_target_layer": 3,
+                "last_target_layer": 77,
+                "mtp_layer_index": 78,
+            }
+        },
+    }
     run_state = tmp_path / "run-state"
     stage = run_state / quant.EXPORT_STAGE_DIRNAME
     output = tmp_path / "model"

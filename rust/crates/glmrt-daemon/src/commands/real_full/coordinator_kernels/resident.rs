@@ -1052,6 +1052,114 @@ pub(in crate::commands::real_full) fn preload_resident_weight_from_pinned_host_p
     Ok(timings)
 }
 
+pub(in crate::commands::real_full) fn replace_preloaded_block_fp8_weight_with_bf16(
+    weight_name: &str,
+    scale_bytes: &[u8],
+    size_k: usize,
+    size_n: usize,
+) -> Result<()> {
+    validate_resident_weight_name(weight_name)?;
+    anyhow::ensure!(
+        size_k > 0 && size_n > 0,
+        "block-FP8 coordinator weight {weight_name} requires positive dimensions"
+    );
+    let source_bytes = size_n
+        .checked_mul(size_k)
+        .context("block-FP8 coordinator source bytes overflow")?;
+    let output_bytes = source_bytes
+        .checked_mul(std::mem::size_of::<u16>())
+        .context("block-FP8 coordinator BF16 bytes overflow")?;
+    let expected_scale_bytes = size_n
+        .div_ceil(128)
+        .checked_mul(size_k.div_ceil(128))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .context("block-FP8 coordinator scale bytes overflow")?;
+    anyhow::ensure!(
+        scale_bytes.len() == expected_scale_bytes,
+        "block-FP8 coordinator weight {weight_name} has {} scale bytes, expected {expected_scale_bytes}",
+        scale_bytes.len()
+    );
+
+    let library = cuda_native_library()?;
+    let mut scales = library
+        .alloc_device_buffer(expected_scale_bytes)
+        .with_context(|| format!("allocating block-FP8 scales for {weight_name}"))?;
+    let mut output = library
+        .alloc_device_buffer(output_bytes)
+        .with_context(|| format!("allocating block-FP8 BF16 output for {weight_name}"))?;
+    let conversion = (|| -> Result<()> {
+        library
+            .copy_h2d(scales, scale_bytes)
+            .with_context(|| format!("uploading block-FP8 scales for {weight_name}"))?;
+        let mut resident_weights = lock_coordinator_cuda_resident_weights()?;
+        let source =
+            resident_weights.preloaded_resident_weight_buffer(weight_name, source_bytes)?;
+        unsafe {
+            library
+                .cuda_dequantize_block_fp8_e4m3_bf16_async(
+                    source,
+                    scales,
+                    output,
+                    size_k,
+                    size_n,
+                    std::ptr::null_mut(),
+                )
+                .with_context(|| {
+                    format!("dequantizing block-FP8 coordinator weight {weight_name}")
+                })?;
+            library
+                .cuda_stream_synchronize(std::ptr::null_mut())
+                .with_context(|| {
+                    format!("synchronizing block-FP8 coordinator weight {weight_name}")
+                })?;
+        }
+
+        let source_key = resident_weight_registry_key(weight_name, source_bytes);
+        let mut source_resident = resident_weights
+            .resident_weights
+            .remove(&source_key)
+            .with_context(|| format!("block-FP8 coordinator weight {weight_name} disappeared"))?;
+        anyhow::ensure!(
+            source_resident.bytes == source_bytes,
+            "block-FP8 coordinator weight {weight_name} has {} resident bytes, expected {source_bytes}",
+            source_resident.bytes
+        );
+        library
+            .free_device_buffer(&mut source_resident.buffer)
+            .with_context(|| format!("freeing superseded block-FP8 weight {weight_name}"))?;
+        let output_key = resident_weight_registry_key(weight_name, output_bytes);
+        let previous = resident_weights.resident_weights.insert(
+            output_key,
+            ResidentDeviceBuffer {
+                buffer: output,
+                bytes: output_bytes,
+                uploaded: true,
+                upload_count: 1,
+                label: "coordinator block-FP8 expanded BF16 weight",
+            },
+        );
+        anyhow::ensure!(
+            previous.is_none(),
+            "block-FP8 coordinator weight {weight_name} replacement collided"
+        );
+        output = GlmrtDeviceBuffer::default();
+        PRELOADED_RESIDENT_WEIGHT_CACHE.with(|cache| {
+            cache.borrow_mut().remove(weight_name);
+        });
+        Ok(())
+    })();
+    let scale_cleanup = library.free_device_buffer(&mut scales);
+    let output_cleanup = if output.ptr.is_null() {
+        Ok(())
+    } else {
+        library.free_device_buffer(&mut output)
+    };
+    conversion?;
+    scale_cleanup.with_context(|| format!("freeing block-FP8 scales for {weight_name}"))?;
+    output_cleanup.with_context(|| format!("freeing block-FP8 output for {weight_name}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

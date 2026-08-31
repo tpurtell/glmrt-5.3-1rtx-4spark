@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrently distribute a staged GLM-5.2 EXL3 snapshot over RDMA."""
+"""Concurrently distribute a staged GLM-5 EXL3 snapshot over RDMA."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from stage_glm52_exl3_hf_snapshot import MODEL_ID, SCHEMA, _model_cache_root
+from stage_glm52_exl3_hf_snapshot import SCHEMA, _model_cache_root
 
 
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -370,7 +370,11 @@ def sync(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-id", default=MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        required=True,
+        help="exact staged Hugging Face repository ID",
+    )
     parser.add_argument(
         "--hf-home",
         type=Path,

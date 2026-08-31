@@ -290,3 +290,64 @@ def test_calibrator_can_performance_gate_a_concurrency_to_baseline(
     assert profile["curves"]["1"][0]["candidate_latency_ms"] == 10.0
     assert profile["curves"]["1"][0]["source"] == "performance-gated-baseline"
     assert profile["qualification"]["retained_baseline_concurrencies"] == [1]
+
+
+def test_calibrator_can_render_a_separate_dflash_profile_prefix(
+    tmp_path: Path,
+) -> None:
+    startup = tmp_path / "startup.log"
+    corpus = tmp_path / "corpus.log"
+    output_json = tmp_path / "profile.json"
+    output_rust = tmp_path / "profile.rs"
+    startup.write_text(
+        "real_full_dspark_sps_profile requests=1 target_rows=1 "
+        "latency_ms=10.000 samples=4 source=startup-opt-in\n"
+        "real_full_dspark_sps_profile requests=1 target_rows=2 "
+        "latency_ms=20.000 samples=4 source=startup-opt-in\n"
+    )
+    corpus.write_text("")
+    subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--startup-log",
+            str(startup),
+            "--corpus-log",
+            str(corpus),
+            "--output-json",
+            str(output_json),
+            "--output-rust",
+            str(output_rust),
+            "--rust-constant-prefix",
+            "GLM53_EXL3_K4_DFLASH2_COST_PROFILE",
+            "--profile-id",
+            "glm53-dflash-test",
+            "--target-model",
+            "target/model",
+            "--target-revision",
+            "target-revision",
+            "--dspark-model",
+            "draft/model",
+            "--dspark-revision",
+            "draft-revision",
+            "--sparkinfer-revision",
+            "spark-revision",
+            "--engine-commit",
+            "engine-commit",
+            "--topology",
+            "test-topology",
+            "--power-limit-watts",
+            "400",
+            "--max-concurrency",
+            "1",
+            "--max-drafts",
+            "1",
+            "--startup-samples",
+            "4",
+        ],
+        check=True,
+    )
+    rendered = output_rust.read_text()
+    assert "GLM53_EXL3_K4_DFLASH2_COST_PROFILE_ID" in rendered
+    assert "GLM53_EXL3_K4_DFLASH2_COST_PROFILE_MS" in rendered
+    assert "GLM52_REDHAT_DSPARK_COST_PROFILE" not in rendered

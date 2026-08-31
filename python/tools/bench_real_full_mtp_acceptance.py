@@ -5,15 +5,21 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime as dt
 import hashlib
 import json
+import math
 import re
 import statistics
+import time
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from bench_real_full_concurrency import token_zero_nonces
+from real_full_matrix import default_tokenizer_path
 
 
 @dataclass(frozen=True)
@@ -21,6 +27,33 @@ class PromptCase:
     category: str
     prompt: str
     max_tokens: int
+    weight: float = 1.0
+    json_schema: bool = False
+
+
+STRUCTURED_EDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "operation": {"type": "string"},
+        "line_start": {"type": "integer"},
+        "line_end": {"type": "integer"},
+        "rationale": {"type": "string"},
+    },
+    "required": ["path", "operation", "line_start", "line_end", "rationale"],
+    "additionalProperties": False,
+}
+
+
+def structured_edit_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "file_edit",
+            "strict": True,
+            "schema": STRUCTURED_EDIT_SCHEMA,
+        },
+    }
 
 
 CASES = {
@@ -50,8 +83,10 @@ CASES = {
     ),
     "fable": PromptCase(
         "creative-prose",
-        "Write a self-contained fable of 140 to 170 words about two parrots who disagree "
-        "about sharing credit. End with a one-sentence moral.",
+        "Write a self-contained fable of exactly 150 words about two parrots who disagree "
+        "about sharing credit. Output no title or preamble. Include the final one-sentence "
+        "moral in the 150-word total. Before responding, silently revise the draft until the "
+        "entire response is between 140 and 170 words.",
         256,
     ),
     "hello": PromptCase("short-response", "hi", 32),
@@ -62,11 +97,21 @@ CASES = {
         384,
     ),
     "structured-json": PromptCase(
-        "structured-output",
+        "structured-output-natural",
         "Return only a JSON object describing a file edit with keys path, operation, "
         "line_start, line_end, and rationale. Use path src/cache.rs, operation replace, "
         "lines 41 through 47, and a one-sentence rationale about removing a redundant copy.",
         128,
+        weight=0.5,
+    ),
+    "structured-json-schema": PromptCase(
+        "structured-output-constrained",
+        "Return only a JSON object describing a file edit with keys path, operation, "
+        "line_start, line_end, and rationale. Use path src/cache.rs, operation replace, "
+        "lines 41 through 47, and a one-sentence rationale about removing a redundant copy.",
+        128,
+        weight=0.5,
+        json_schema=True,
     ),
     "multilingual": PromptCase(
         "multilingual",
@@ -100,7 +145,17 @@ CASES.update(
     }
 )
 REACHABILITY_CASE_IDS = ("count", "repeat", "syntax-rust", "syntax-python")
-QUALITY_CONTRACT_VERSION = "glmrt-semantic-decode-contract-v2"
+QUALITY_CONTRACT_VERSION = "glmrt-semantic-decode-contract-v3"
+REQUEST_BINDING_VERSION = "glmrt-semantic-decode-request-v2"
+RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while block := source.read(8 * 1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _python_block(content: str) -> tuple[str | None, list[str]]:
@@ -112,6 +167,18 @@ def _python_block(content: str) -> tuple[str | None, list[str]]:
     if match is None:
         return None, ["response is not exactly one Python code block"]
     return match.group("code"), []
+
+
+def _structured_json_content(content: str, *, allow_fence: bool) -> str:
+    stripped = content.strip()
+    if not allow_fence:
+        return stripped
+    match = re.fullmatch(
+        r"```(?:json)?\s*\n(?P<json>.*)\n```",
+        stripped,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return match.group("json").strip() if match is not None else stripped
 
 
 def validate_case_content(case_id: str, content: str) -> dict[str, Any]:
@@ -172,8 +239,12 @@ def validate_case_content(case_id: str, content: str) -> dict[str, Any]:
         words = re.findall(r"\b[\w'-]+\b", stripped, flags=re.UNICODE)
         if not 140 <= len(words) <= 170:
             issues.append(f"fable has {len(words)} words, outside 140..170")
-        sentence_matches = list(re.finditer(r"(?:^|(?<=[.!?]))\s*([^.!?]+[.!?])", stripped))
-        final_sentence = sentence_matches[-1].group(1).strip() if sentence_matches else ""
+        sentence_matches = list(
+            re.finditer(r"(?:^|(?<=[.!?]))\s*([^.!?]+[.!?])", stripped)
+        )
+        final_sentence = (
+            sentence_matches[-1].group(1).strip() if sentence_matches else ""
+        )
         moral_words = re.findall(r"\b[\w'-]+\b", final_sentence, flags=re.UNICODE)
         moral_terms = (
             "credit",
@@ -211,11 +282,19 @@ def validate_case_content(case_id: str, content: str) -> dict[str, Any]:
         for term in ("paging", "page fault", "tlb"):
             if term not in lowered:
                 issues.append(f"response omits {term}")
-    elif case_id == "structured-json":
+    elif case_id in {"structured-json", "structured-json-schema"}:
+        encoded = _structured_json_content(
+            content,
+            allow_fence=case_id == "structured-json",
+        )
         try:
-            value = json.loads(stripped)
+            value = json.loads(encoded)
         except json.JSONDecodeError:
-            issues.append("response is not bare valid JSON")
+            issues.append(
+                "response is not valid bare-or-fenced JSON"
+                if case_id == "structured-json"
+                else "constrained response is not bare valid JSON"
+            )
         else:
             expected_keys = {"path", "operation", "line_start", "line_end", "rationale"}
             if not isinstance(value, dict) or set(value) != expected_keys:
@@ -268,7 +347,9 @@ def validate_case_content(case_id: str, content: str) -> dict[str, Any]:
                         for target in node.targets
                     )
                 ]
-                if len(assignments) != 1 or not isinstance(assignments[0].value, ast.Tuple):
+                if len(assignments) != 1 or not isinstance(
+                    assignments[0].value, ast.Tuple
+                ):
                     issues.append("POWERS_OF_TWO tuple assignment is missing")
                 else:
                     exponents = []
@@ -296,11 +377,12 @@ def validate_case_content(case_id: str, content: str) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--url", default="http://127.0.0.1:8000/v1/chat/completions"
-    )
+    parser.add_argument("--url", default="http://127.0.0.1:8000/v1/chat/completions")
     parser.add_argument("--reference-url")
-    parser.add_argument("--model", default="lukealonso/GLM-5.2-NVFP4")
+    parser.add_argument("--model", default="wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1")
+    parser.add_argument(
+        "--profile", choices=("balanced", "long", "accuracy"), default="balanced"
+    )
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -336,6 +418,15 @@ def parse_args() -> argparse.Namespace:
             "prompt-cache reuse in paired performance qualification."
         ),
     )
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="tokenizer.json used to construct token-zero nonces",
+    )
+    parser.add_argument(
+        "--run-id",
+        help="immutable run identity used to bind release evidence to a deployment",
+    )
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--output",
@@ -345,6 +436,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.output is not None and args.output.exists():
         parser.error(f"refusing to overwrite output: {args.output}")
+    if args.run_id is not None and RUN_ID_RE.fullmatch(args.run_id) is None:
+        parser.error("run ID contains unsafe characters")
     return args
 
 
@@ -354,14 +447,16 @@ def completion_payload(
     max_tokens: int | None = None,
     prompt_prefix: str = "",
 ) -> bytes:
-    return json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt_prefix + case.prompt}],
-            "temperature": 0,
-            "max_tokens": case.max_tokens if max_tokens is None else max_tokens,
-        }
-    ).encode()
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_prefix + case.prompt}],
+        "temperature": 0,
+        "enable_thinking": False,
+        "max_tokens": case.max_tokens if max_tokens is None else max_tokens,
+    }
+    if case.json_schema:
+        payload["response_format"] = structured_edit_response_format()
+    return json.dumps(payload).encode()
 
 
 def prompt_contract(
@@ -370,6 +465,7 @@ def prompt_contract(
     suite: str,
     repeats: int,
     nonce_seed: int | None,
+    tokenizer_sha256: str | None,
     max_tokens: int | None,
 ) -> dict[str, Any]:
     """Return the model-independent identity for a matched decode replay."""
@@ -382,17 +478,25 @@ def prompt_contract(
                 "category": CASES[case_id].category,
                 "prompt": CASES[case_id].prompt,
                 "max_tokens": (
-                    CASES[case_id].max_tokens
-                    if max_tokens is None
-                    else max_tokens
+                    CASES[case_id].max_tokens if max_tokens is None else max_tokens
+                ),
+                "weight": CASES[case_id].weight,
+                "response_format": (
+                    structured_edit_response_format()
+                    if CASES[case_id].json_schema
+                    else None
                 ),
             }
             for case_id in selected
         ],
         "repeats": repeats,
         "nonce_seed": nonce_seed,
+        "nonce_policy": "token-zero" if nonce_seed is not None else "none",
+        "tokenizer_sha256": tokenizer_sha256,
         "temperature": 0,
+        "enable_thinking": False,
         "quality_contract_version": QUALITY_CONTRACT_VERSION,
+        "request_binding_version": REQUEST_BINDING_VERSION,
     }
 
 
@@ -412,6 +516,8 @@ def summarize_case(case_id: str, result: dict[str, Any]) -> dict[str, Any]:
     draft_lengths = list(mtp.get("mtp_draft_lengths", []))
     accepted = list(mtp["mtp_accepted_draft_lengths"])
     cycle_ms = list(mtp["mtp_verify_cycle_ms"])
+    target_cycle_physical_m = list(mtp["target_cycle_physical_m"])
+    target_cycle_ms = list(mtp["target_cycle_ms"])
     verify_cycles = int(mtp["mtp_verify_cycles"])
     drafts = int(mtp["mtp_draft_tokens"])
     accepted_total = int(mtp["mtp_accepted_draft_tokens"])
@@ -420,6 +526,17 @@ def summarize_case(case_id: str, result: dict[str, Any]) -> dict[str, Any]:
     decode_ms = float(metrics["decode_ms"])
     completion_tokens = int(usage["completion_tokens"])
     content = result["choices"][0]["message"]["content"]
+    if not (len(draft_lengths) == len(accepted) == len(cycle_ms) == verify_cycles):
+        raise RuntimeError("server returned unaligned MTP cycle diagnostics")
+    if len(target_cycle_physical_m) != len(target_cycle_ms):
+        raise RuntimeError("server returned unaligned target-cycle diagnostics")
+    if not math.isclose(
+        sum(float(value) for value in target_cycle_ms),
+        decode_ms,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-6,
+    ):
+        raise RuntimeError("post-TTFT target-cycle diagnostics do not sum to decode_ms")
     return {
         "case": case_id,
         "category": case.category,
@@ -440,15 +557,16 @@ def summarize_case(case_id: str, result: dict[str, Any]) -> dict[str, Any]:
         "mean_accepted_draft_length": statistics.mean(accepted) if accepted else 0.0,
         "accepted_draft_lengths": accepted,
         "verify_cycle_ms": cycle_ms,
+        "target_cycle_physical_m": target_cycle_physical_m,
+        "target_cycle_ms": target_cycle_ms,
         "full_match_cycles": int(mtp["mtp_full_match_cycles"]),
         "emitted_tokens_from_verify": emitted,
-        "emitted_tokens_per_verify_cycle": emitted / verify_cycles
-        if verify_cycles
-        else 0.0,
-        "emitted_tokens_per_verify_cycle_second": emitted
-        / (total_cycle_ms / 1_000.0)
-        if total_cycle_ms > 0.0
-        else 0.0,
+        "emitted_tokens_per_verify_cycle": (
+            emitted / verify_cycles if verify_cycles else 0.0
+        ),
+        "emitted_tokens_per_verify_cycle_second": (
+            emitted / (total_cycle_ms / 1_000.0) if total_cycle_ms > 0.0 else 0.0
+        ),
         "runtime_captures": int(mtp["request_coordinator_graph_captures"]),
         "content_chars": len(content),
         "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
@@ -459,6 +577,8 @@ def summarize_case(case_id: str, result: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    benchmark_started_ns = time.time_ns()
+    run_id = args.run_id or dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     if args.max_tokens is not None and args.max_tokens < 1:
         raise SystemExit("--max-tokens must be positive")
     if args.repeats < 1:
@@ -477,6 +597,20 @@ def main() -> None:
         selected_suite = "all"
     summaries = []
     repeat_summaries = []
+    tokenizer_sha256 = None
+    nonces: list[dict[str, Any]] = []
+    if args.nonce_seed is not None:
+        tokenizer_path = (
+            (args.tokenizer or default_tokenizer_path(args.model))
+            .expanduser()
+            .resolve(strict=True)
+        )
+        tokenizer_sha256 = hash_file(tokenizer_path)
+        nonces = token_zero_nonces(
+            count=args.repeats * len(selected),
+            seed=args.nonce_seed,
+            tokenizer_path=tokenizer_path,
+        )
     destination = None
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -492,10 +626,11 @@ def main() -> None:
     for repeat_index in range(args.repeats):
         repeat_cases = []
         for case_id in selected:
+            request_index = repeat_index * len(selected) + len(repeat_cases)
+            nonce = nonces[request_index] if nonces else None
             prompt_prefix = (
-                f"Qualification nonce {args.nonce_seed}-{repeat_index}-{case_id}. "
-                "Treat this identifier as irrelevant.\n"
-                if args.nonce_seed is not None
+                nonce["prefix"] + "Treat the preceding request nonce as irrelevant.\n"
+                if nonce is not None
                 else ""
             )
             payload = completion_payload(
@@ -506,20 +641,33 @@ def main() -> None:
             )
             result = request_completion(args.url, payload, args.timeout)
             summary = summarize_case(case_id, result)
+            summary["run_id"] = run_id
+            summary["timestamp_utc"] = dt.datetime.now(dt.UTC).isoformat()
+            summary["profile"] = args.profile
             summary["repeat"] = repeat_index + 1
+            summary["prompt"] = prompt_prefix + CASES[case_id].prompt
             summary["request_sha256"] = hashlib.sha256(payload).hexdigest()
             summary["prompt_sha256"] = hashlib.sha256(
                 (prompt_prefix + CASES[case_id].prompt).encode()
             ).hexdigest()
+            summary["nonce"] = (
+                {
+                    "marker": nonce["marker"],
+                    "first_content_token_id": nonce["first_content_token_id"],
+                }
+                if nonce is not None
+                else None
+            )
             if args.reference_url:
-                reference = request_completion(args.reference_url, payload, args.timeout)
+                reference = request_completion(
+                    args.reference_url, payload, args.timeout
+                )
                 summary["reference_content_match"] = (
                     reference["choices"][0]["message"]["content"]
                     == result["choices"][0]["message"]["content"]
                 )
                 summary["reference_finish_reason_match"] = (
-                    reference["choices"][0]["finish_reason"]
-                    == summary["finish_reason"]
+                    reference["choices"][0]["finish_reason"] == summary["finish_reason"]
                 )
                 summary["reference_completion_tokens_match"] = (
                     int(reference["usage"]["completion_tokens"])
@@ -530,9 +678,13 @@ def main() -> None:
             emit(summary)
 
         repeat_timed_tokens = sum(
-            summary["completion_tokens"] - 1 for summary in repeat_cases
+            CASES[summary["case"]].weight * (summary["completion_tokens"] - 1)
+            for summary in repeat_cases
         )
-        repeat_decode_ms = sum(summary["decode_ms"] for summary in repeat_cases)
+        repeat_decode_ms = sum(
+            CASES[summary["case"]].weight * summary["decode_ms"]
+            for summary in repeat_cases
+        )
         repeat_emitted = sum(
             summary["emitted_tokens_from_verify"] for summary in repeat_cases
         )
@@ -571,11 +723,11 @@ def main() -> None:
     )
     accepted_by_physical_m: dict[int, Counter[int]] = {}
     full_matches_by_physical_m = Counter()
+    target_cycle_ms_by_physical_m: dict[int, list[float]] = {}
     scalar_cycles = sum(
         max(
             0,
-            summary["completion_tokens"]
-            - summary["emitted_tokens_from_verify"],
+            summary["completion_tokens"] - summary["emitted_tokens_from_verify"],
         )
         for summary in summaries
     )
@@ -583,20 +735,35 @@ def main() -> None:
     emitted_length_histogram[1] += scalar_cycles
     accepted_by_physical_m[1] = Counter({0: scalar_cycles})
     for summary in summaries:
-        for drafts, accepted in zip(
-            summary["draft_lengths"], summary["accepted_draft_lengths"], strict=True
+        for drafts, accepted, cycle_ms in zip(
+            summary["draft_lengths"],
+            summary["accepted_draft_lengths"],
+            summary["verify_cycle_ms"],
+            strict=True,
         ):
             physical_m = drafts + 1
             accepted_by_physical_m.setdefault(physical_m, Counter())[accepted] += 1
             if accepted == drafts:
                 full_matches_by_physical_m[physical_m] += 1
+        for physical_m, cycle_ms in zip(
+            summary["target_cycle_physical_m"],
+            summary["target_cycle_ms"],
+            strict=True,
+        ):
+            target_cycle_ms_by_physical_m.setdefault(physical_m, []).append(cycle_ms)
     total_drafts = sum(summary["draft_tokens"] for summary in summaries)
     total_accepted = sum(summary["accepted_draft_tokens"] for summary in summaries)
     total_emitted = sum(summary["emitted_tokens_from_verify"] for summary in summaries)
     total_cycles = sum(summary["verify_cycles"] for summary in summaries)
     total_cycle_ms = sum(sum(summary["verify_cycle_ms"]) for summary in summaries)
-    total_timed_tokens = sum(summary["completion_tokens"] - 1 for summary in summaries)
-    total_decode_ms = sum(summary["decode_ms"] for summary in summaries)
+    total_timed_tokens = sum(
+        CASES[summary["case"]].weight * (summary["completion_tokens"] - 1)
+        for summary in summaries
+    )
+    total_decode_ms = sum(
+        CASES[summary["case"]].weight * summary["decode_ms"]
+        for summary in summaries
+    )
     wall_samples = [summary["wall_decode_tps"] for summary in repeat_summaries]
     verifier_samples = [
         summary["emitted_tokens_per_verify_cycle_second"]
@@ -607,13 +774,20 @@ def main() -> None:
         suite=selected_suite,
         repeats=args.repeats,
         nonce_seed=args.nonce_seed,
+        tokenizer_sha256=tokenizer_sha256,
         max_tokens=args.max_tokens,
     )
     aggregate = {
-        "schema": "glmrt-mtp-acceptance-aggregate-v3",
+        "schema": "glmrt-mtp-acceptance-aggregate-v4",
+        "run_id": run_id,
+        "benchmark_started_ns": benchmark_started_ns,
+        "benchmark_completed_ns": time.time_ns(),
+        "timestamp_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "profile": args.profile,
         "model": args.model,
         "endpoint": args.url,
         "nonce_seed": args.nonce_seed,
+        "tokenizer_sha256": tokenizer_sha256,
         "prompt_contract": replay_contract,
         "prompt_contract_sha256": hashlib.sha256(
             json.dumps(
@@ -625,6 +799,7 @@ def main() -> None:
         ).hexdigest(),
         "suite": selected_suite,
         "selected_case_ids": selected,
+        "case_weights": {case_id: CASES[case_id].weight for case_id in selected},
         "cases": len(summaries),
         "cases_per_repeat": len(selected),
         "corpus_repeats": args.repeats,
@@ -643,6 +818,9 @@ def main() -> None:
         "verify_cycles": total_cycles,
         "scalar_cycles": scalar_cycles,
         "target_cycles": scalar_cycles + total_cycles,
+        "measured_post_ttft_target_cycles": sum(
+            len(values) for values in target_cycle_ms_by_physical_m.values()
+        ),
         "draft_tokens": total_drafts,
         "accepted_draft_tokens": total_accepted,
         "accepted_draft_rate": total_accepted / total_drafts if total_drafts else 0.0,
@@ -654,28 +832,38 @@ def main() -> None:
             physical_m: dict(sorted(histogram.items()))
             for physical_m, histogram in sorted(accepted_by_physical_m.items())
         },
-        "full_matches_by_physical_m": dict(
-            sorted(full_matches_by_physical_m.items())
-        ),
+        "full_matches_by_physical_m": dict(sorted(full_matches_by_physical_m.items())),
+        "target_cycle_physical_m_histogram": {
+            physical_m: len(values)
+            for physical_m, values in sorted(target_cycle_ms_by_physical_m.items())
+        },
+        "target_cycle_ms_by_physical_m": {
+            physical_m: {
+                "samples": len(values),
+                "total_ms": sum(values),
+                "mean_ms": statistics.mean(values),
+                "median_ms": statistics.median(values),
+                "min_ms": min(values),
+                "max_ms": max(values),
+            }
+            for physical_m, values in sorted(target_cycle_ms_by_physical_m.items())
+        },
         "max_selected_physical_m": max(physical_m_histogram, default=1),
         "max_emitted_tokens_in_cycle": max(emitted_length_histogram, default=1),
         "emitted_tokens_from_verify": total_emitted,
-        "emitted_tokens_per_verify_cycle": total_emitted / total_cycles
-        if total_cycles
-        else 0.0,
-        "emitted_tokens_per_verify_cycle_second": total_emitted
-        / (total_cycle_ms / 1_000.0)
-        if total_cycle_ms > 0.0
-        else 0.0,
+        "emitted_tokens_per_verify_cycle": (
+            total_emitted / total_cycles if total_cycles else 0.0
+        ),
+        "emitted_tokens_per_verify_cycle_second": (
+            total_emitted / (total_cycle_ms / 1_000.0) if total_cycle_ms > 0.0 else 0.0
+        ),
         "median_repeat_emitted_tokens_per_verify_cycle_second": statistics.median(
             verifier_samples
         ),
         "min_repeat_emitted_tokens_per_verify_cycle_second": min(verifier_samples),
         "max_repeat_emitted_tokens_per_verify_cycle_second": max(verifier_samples),
         "stdev_repeat_emitted_tokens_per_verify_cycle_second": (
-            statistics.stdev(verifier_samples)
-            if len(verifier_samples) > 1
-            else 0.0
+            statistics.stdev(verifier_samples) if len(verifier_samples) > 1 else 0.0
         ),
         "all_zero_runtime_captures": all(
             summary["runtime_captures"] == 0 for summary in summaries

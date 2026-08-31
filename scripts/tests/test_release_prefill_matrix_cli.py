@@ -8,11 +8,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 TOOL_PATH = ROOT / "python" / "tools" / "bench_release_prefill_matrix.py"
+sys.path.insert(0, str(TOOL_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("_glmrt_release_prefill", TOOL_PATH)
 assert SPEC is not None and SPEC.loader is not None
 TOOL = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = TOOL
 SPEC.loader.exec_module(TOOL)
+
+
+def test_release_curve_covers_cached_context_to_256k_and_suffix_to_32k() -> None:
+    assert TOOL.DEFAULT_BASE_CONTEXTS == (0, 32_768, 65_536, 131_072, 262_144)
+    assert TOOL.DEFAULT_SUFFIX_ROWS == (
+        1_024,
+        2_048,
+        4_096,
+        8_192,
+        16_384,
+        32_768,
+    )
 
 
 def test_cli_accepts_explicit_candidate_identity_and_frozen_corpus(tmp_path: Path) -> None:

@@ -4,6 +4,12 @@ mod constraint;
 mod coordinator_kernels;
 mod coverage;
 mod dense;
+mod dflash;
+mod dflash_body;
+mod dflash_head;
+mod dflash_preflight;
+mod dflash_static;
+mod dflash_update;
 mod dspark;
 mod dspark_attention;
 mod dspark_body;
@@ -34,6 +40,7 @@ mod sparse_mlp;
 mod tensor_parallel;
 mod types;
 
+pub(crate) use dflash_preflight::run_dflash_preflight;
 pub(crate) use dspark::run_dspark_preflight;
 pub(crate) use entry::{load_real_full_serving, run_real_glm_full_preflight};
 #[cfg(test)]

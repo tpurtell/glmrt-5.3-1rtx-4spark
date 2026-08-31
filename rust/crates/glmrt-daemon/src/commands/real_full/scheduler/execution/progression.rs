@@ -1,3 +1,6 @@
+use crate::commands::real_full::dflash::{
+    dflash2_serving_requested, GLM53_DFLASH2_TARGET_CAPTURE_TAPS,
+};
 use crate::commands::real_full::dspark::dspark_target_hidden_tap_layer_ids;
 use anyhow::{Context, Result};
 use glmrt_core::{
@@ -41,7 +44,7 @@ use crate::commands::real_full::coordinator_kernels::{
     device_bf16_output_from_f32_values, device_bf16_output_from_owned_device_buffer,
     device_buffer_byte_view, finish_quantize_device_bf16_to_nvfp4_row_payload,
     nvfp4_e2m1_fp8_e4m3_row_bytes, preload_resident_weight_from_host_staging,
-    residual_add_bf16_device_input_delta_view_device_output,
+    resident_weight_is_preloaded, residual_add_bf16_device_input_delta_view_device_output,
     residual_add_bf16_device_inputs_device_output, residual_add_prefix_bf16_bytes_into,
     rmsnorm_hidden_bf16_preloaded_resident_weight_device_input_output,
     rmsnorm_hidden_bf16_preloaded_resident_weight_device_input_output_async,
@@ -137,7 +140,8 @@ pub(super) struct RealFullSchedulerNumericProgression {
     retain_final_target_device_hidden: bool,
     retain_full_target_device_hidden: bool,
     target_device_hidden_tap_rows: usize,
-    target_device_hidden_taps: [Option<DeviceBf16Output>; 5],
+    target_device_hidden_tap_layer_ids: Vec<usize>,
+    target_device_hidden_taps: Vec<Option<DeviceBf16Output>>,
     residual_bf16: Vec<u8>,
     initial_prefill_embedding_rows: usize,
     initial_prefill_embedding_bytes_read: u64,
@@ -276,10 +280,10 @@ pub(super) struct RealFullSchedulerNumericProgressionFinish {
 }
 
 pub(in crate::commands::real_full) struct RealFullSchedulerTargetHiddenTaps {
-    pub(in crate::commands::real_full) layer_ids: [usize; 5],
+    pub(in crate::commands::real_full) layer_ids: Vec<usize>,
     pub(in crate::commands::real_full) row_start: usize,
     pub(in crate::commands::real_full) rows: usize,
-    pub(in crate::commands::real_full) values: [DeviceBf16Output; 5],
+    pub(in crate::commands::real_full) values: Vec<DeviceBf16Output>,
 }
 
 pub(in crate::commands::real_full) struct RealFullSchedulerSparseTcpDispatchWorker {
@@ -3968,7 +3972,8 @@ impl RealFullSchedulerNumericProgression {
             retain_final_target_device_hidden: false,
             retain_full_target_device_hidden: false,
             target_device_hidden_tap_rows: 0,
-            target_device_hidden_taps: std::array::from_fn(|_| None),
+            target_device_hidden_tap_layer_ids: Vec::new(),
+            target_device_hidden_taps: Vec::new(),
             residual_bf16: vec![
                 0;
                 shape.unique_rows()
@@ -4091,7 +4096,22 @@ impl RealFullSchedulerNumericProgression {
     }
 
     pub(super) fn with_target_device_hidden_taps(mut self, rows: usize) -> Self {
+        let layer_ids = if dflash2_serving_requested() {
+            GLM53_DFLASH2_TARGET_CAPTURE_TAPS.to_vec()
+        } else {
+            dspark_target_hidden_tap_layer_ids().to_vec()
+        };
+        self.with_target_device_hidden_taps_for(rows, &layer_ids)
+    }
+
+    pub(super) fn with_target_device_hidden_taps_for(
+        mut self,
+        rows: usize,
+        layer_ids: &[usize],
+    ) -> Self {
         self.target_device_hidden_tap_rows = rows;
+        self.target_device_hidden_tap_layer_ids = layer_ids.to_vec();
+        self.target_device_hidden_taps = (0..layer_ids.len()).map(|_| None).collect();
         self
     }
 
@@ -4102,8 +4122,8 @@ impl RealFullSchedulerNumericProgression {
         if self.target_device_hidden_tap_rows == 0 {
             return Ok(());
         }
-        let tap_layer_ids = dspark_target_hidden_tap_layer_ids();
-        let Some(tap_index) = tap_layer_ids
+        let Some(tap_index) = self
+            .target_device_hidden_tap_layer_ids
             .iter()
             .position(|layer_id| *layer_id == checkpoint_layer_id)
         else {
@@ -7798,22 +7818,27 @@ impl RealFullSchedulerNumericProgression {
         if self.target_device_hidden_tap_rows == 0 {
             return Ok(None);
         }
-        let tap_layer_ids = dspark_target_hidden_tap_layer_ids();
         let missing = self
             .target_device_hidden_taps
             .iter()
             .enumerate()
-            .filter_map(|(index, tap)| tap.is_none().then_some(tap_layer_ids[index]))
+            .filter_map(|(index, tap)| {
+                tap.is_none()
+                    .then_some(self.target_device_hidden_tap_layer_ids[index])
+            })
             .collect::<Vec<_>>();
         anyhow::ensure!(
             missing.is_empty(),
             "scheduler dSpark target hidden taps are missing layer boundaries {missing:?}"
         );
-        let values = std::array::from_fn(|index| {
-            self.target_device_hidden_taps[index]
-                .take()
-                .expect("scheduler dSpark taps were checked above")
-        });
+        let values = self
+            .target_device_hidden_taps
+            .iter_mut()
+            .map(|tap| {
+                tap.take()
+                    .expect("scheduler dSpark taps were checked above")
+            })
+            .collect::<Vec<_>>();
         let rows = values[0].rows;
         let total_rows = self
             .shape
@@ -7830,7 +7855,7 @@ impl RealFullSchedulerNumericProgression {
             "scheduler dSpark target hidden tap geometry changed"
         );
         Ok(Some(RealFullSchedulerTargetHiddenTaps {
-            layer_ids: tap_layer_ids,
+            layer_ids: self.target_device_hidden_tap_layer_ids.clone(),
             row_start: total_rows - expected_rows,
             rows,
             values,
@@ -10783,9 +10808,9 @@ fn validate_scheduler_dense_bf16_tensor(
     tensor: &TensorInfo,
     expected_shape: &[usize],
 ) -> Result<()> {
-    if tensor.dtype != DType::Bf16 {
+    if !matches!(tensor.dtype, DType::Bf16 | DType::F8E4M3) {
         anyhow::bail!(
-            "scheduler dense tensor {} expects BF16, got {:?}",
+            "scheduler dense tensor {} expects BF16 or startup-expanded block-FP8, got {:?}",
             tensor.name,
             tensor.dtype
         );
@@ -10799,11 +10824,23 @@ fn validate_scheduler_dense_bf16_tensor(
         );
     }
     let expected_bytes = scheduler_dense_shape_bytes(expected_shape)?;
-    if tensor.byte_length as usize != expected_bytes {
+    let expected_source_bytes = match tensor.dtype {
+        DType::Bf16 => expected_bytes,
+        DType::F8E4M3 => {
+            anyhow::ensure!(
+                resident_weight_is_preloaded(&tensor.name, expected_bytes),
+                "scheduler dense block-FP8 tensor {} has no startup-expanded BF16 resident weight",
+                tensor.name
+            );
+            expected_bytes / std::mem::size_of::<u16>()
+        }
+        _ => unreachable!(),
+    };
+    if tensor.byte_length as usize != expected_source_bytes {
         anyhow::bail!(
-            "scheduler dense tensor {} byte length mismatch: expected {} got {}",
+            "scheduler dense tensor {} source byte length mismatch: expected {} got {}",
             tensor.name,
-            expected_bytes,
+            expected_source_bytes,
             tensor.byte_length
         );
     }

@@ -56,7 +56,7 @@ ENV GLMRT_QUANT_BUILD_REQUIREMENTS_SHA256=${GLMRT_QUANT_BUILD_REQUIREMENTS_SHA25
 ENV GLMRT_QUANT_REQUIREMENTS_LOCK=/opt/glmrt/quantization/requirements.amd64.lock
 ENV PYTHONPATH=/opt/glmrt/third_party/gptqmodel:/opt/glmrt/python
 
-LABEL org.opencontainers.image.title="GLMRT GLM-5.2 EXL3 quantization"
+LABEL org.opencontainers.image.title="GLMRT GLM-5 EXL3 quantization"
 LABEL io.glmrt.quantization.base_image=${BASE_IMAGE}
 LABEL io.glmrt.quantization.role="coordinator"
 LABEL io.glmrt.quantization.target_platform="linux/amd64"

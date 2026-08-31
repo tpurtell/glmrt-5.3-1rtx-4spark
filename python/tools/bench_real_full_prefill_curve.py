@@ -201,7 +201,7 @@ def main() -> None:
     global _TOKENIZER
     args = parse_args()
     root = repo_root()
-    tokenizer_path = (args.tokenizer or default_tokenizer_path()).resolve()
+    tokenizer_path = (args.tokenizer or default_tokenizer_path(args.model)).resolve()
     _TOKENIZER = Tokenizer.from_file(str(tokenizer_path))
     corpus, corpus_sha256, source_manifest = load_corpus(args.source)
     minimum_corpus_tokens = max(args.prefix_tokens) + max(args.suffix_rows) + 8_192
