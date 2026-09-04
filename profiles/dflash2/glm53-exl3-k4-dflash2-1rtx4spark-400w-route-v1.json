@@ -9251,7 +9251,7 @@
     "power_limit_watts": 400,
     "sparkinfer_revision": "4f2a7841cd931cba4f591fdf385e01c267518f9a",
     "target_model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
-    "target_revision": "dd270970a59e6978ddbe14a527b6060e1073fcd1",
+    "target_revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
     "topology": "1x-rtx-pro-6000-sm120+4x-gb10-sm121-tp4-exl3-k4-fp8-rdma"
   },
   "profile_id": "glm53-exl3-k4-dflash2-1rtx4spark-400w-route-v1",
@@ -9313,5 +9313,5 @@
     "startup_samples_per_cell_filter": 32
   },
   "schema": "glmrt-dspark-cost-profile-v1",
-  "source_sha256": "5f8fc6aceca6f030a51b3c6b61feb6123b85ddbc3f81b260b5eb273776bab479"
+  "source_sha256": "661e07768189ceaa84776026443433c3d248752b8b59526e23e26048323e8e94"
 }

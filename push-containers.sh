@@ -13,7 +13,7 @@ The supplied release tag and latest are published for both images. The
 coordinator image is local; the Spark image is published from SPARK_0_HOST.
 
 Example:
-  ./push-containers.sh v7
+  ./push-containers.sh v8
 EOF
 }
 

@@ -151,5 +151,5 @@
 <text x="1492" y="1200" class="small" text-anchor="start">small rows: direct BF16 response</text>
 <text x="1492" y="1218" class="small" text-anchor="start">≥16 rows: FP8 Spark-RDMA → BF16 owner</text>
 <text x="64" y="1364" class="subtitle" text-anchor="start">Measured balanced-profile values; the production micro-timeline contains the source-bound target-cycle evidence.</text>
-<text x="1856" y="1364" class="mono" text-anchor="end">v7 public release</text>
+<text x="1856" y="1364" class="mono" text-anchor="end">v8 public release</text>
 </svg>

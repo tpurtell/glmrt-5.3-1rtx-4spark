@@ -56,27 +56,27 @@ Build and run both architecture-specific images:
 
 `build.sh` builds the coordinator image locally, builds the ARM expert image
 on the first configured Spark, and distributes it to the other Sparks.
-Release maintainers can publish both current images as `v7` and `latest` with:
+Release maintainers can publish both current images as `v8` and `latest` with:
 
 ```bash
-./push-containers.sh v7
+./push-containers.sh v8
 ```
 
-To use the v7 images from GitHub Container Registry instead:
+To use the v8 images from GitHub Container Registry instead:
 
 ```bash
-docker pull ghcr.io/tpurtell/glmrt-5.3-coordinator:v7
+docker pull ghcr.io/tpurtell/glmrt-5.3-coordinator:v8
 
 for host in spark-a spark-b spark-c spark-d; do
-  ssh "$host" docker pull ghcr.io/tpurtell/glmrt-5.3-spark-expert:v7
+  ssh "$host" docker pull ghcr.io/tpurtell/glmrt-5.3-spark-expert:v8
 done
 ```
 
 Set the images in `glmrt.config` and run:
 
 ```ini
-COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-5.3-coordinator:v7
-SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-5.3-spark-expert:v7
+COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-5.3-coordinator:v8
+SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/glmrt-5.3-spark-expert:v8
 ```
 
 ```bash
@@ -97,6 +97,11 @@ coordinator and four resident DGX Spark expert workers. The target is
 `dd270970a59e6978ddbe14a527b6060e1073fcd1`; DFlash2 is revision
 `425aa615ce320caac34400208b30808c8f14f76c`. Except for the profile comparison,
 every measurement used the balanced profile.
+
+The v8 runtime targets revision
+`47af23347db743b4666d952e2eb48f2b01c3fede`, which corrects the quant's chat
+template. The benchmark figures retain the earlier measured revision above;
+the template-only update did not change the measured engine path.
 
 | Speculation | Weighted decode | Python code | Low entropy | Acceptance |
 |---|---:|---:|---:|---:|
